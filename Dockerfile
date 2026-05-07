@@ -25,10 +25,10 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 # Install Python dependencies
 COPY dependencies/requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt -i http://mirrors.aliyuncs.com/pypi/simple/ --trusted-host mirrors.aliyuncs.com
 
 COPY dependencies/CosyVoice/requirements-cpu.txt /tmp/requirements-cosyvoice.txt
-RUN pip install --no-cache-dir -r /tmp/requirements-cosyvoice.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-cosyvoice.txt -i http://mirrors.aliyuncs.com/pypi/simple/ --trusted-host mirrors.aliyuncs.com
 
 # Clean apt packages and cache
 RUN apt remove -y build-essential && apt autoremove -y \
