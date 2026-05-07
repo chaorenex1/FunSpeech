@@ -33,7 +33,7 @@ RUN python -m pip install --no-cache-dir --upgrade \
     wheel
 
 COPY dependencies/CosyVoice/requirements-cpu.txt /tmp/requirements-cosyvoice.txt
-RUN pip install --no-cache-dir --no-build-isolation -r /tmp/requirements-cosyvoice.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-cosyvoice.txt
 
 # Clean apt packages and cache
 RUN apt remove -y build-essential && apt autoremove -y \
