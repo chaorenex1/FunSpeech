@@ -444,7 +444,7 @@ class AliyunWebSocketTTSService:
 
         # 使用线程池执行流式推理，避免阻塞事件循环
         async for audio_data in run_sync_generator(
-            engine.cosyvoice_sft.inference_sft,
+            engine.inference_sft,
             text, voice, stream=True, speed=speed
         ):
             # 检查连接状态，如果断开则立即停止
@@ -483,7 +483,7 @@ class AliyunWebSocketTTSService:
         # 根据是否有 prompt 选择不同的推理方法
         if prompt:
             # 使用 instruct2 方法，支持自然语言指令控制
-            inference_method = engine.cosyvoice_clone.inference_instruct2
+            inference_method = engine.inference_instruct2
             inference_args = (
                 text,
                 formatted_prompt,  # instruct_text
@@ -496,7 +496,7 @@ class AliyunWebSocketTTSService:
             }
         else:
             # 无 prompt 时使用 zero_shot
-            inference_method = engine.cosyvoice_clone.inference_zero_shot
+            inference_method = engine.inference_zero_shot
             inference_args = (
                 text,
                 "",

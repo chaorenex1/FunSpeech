@@ -7,6 +7,7 @@ import os
 import sys
 import logging
 import threading
+from contextlib import contextmanager
 from typing import List, Dict, Any, Union, Tuple, Optional
 from pathlib import Path
 
@@ -15,6 +16,45 @@ from ...core.exceptions import APIException, DefaultServerErrorException, Invali
 from ...utils.audio import save_audio_array, generate_temp_audio_path
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def torch_device_context(device: str):
+    """Temporarily bind torch CUDA operations to an explicit device."""
+    if not device or not device.startswith("cuda"):
+        yield
+        return
+
+    import torch
+
+    if not torch.cuda.is_available():
+        yield
+        return
+
+    previous_device = torch.cuda.current_device()
+    target_device = torch.device(device)
+    torch.cuda.set_device(target_device)
+    try:
+        yield
+    finally:
+        torch.cuda.set_device(previous_device)
+
+
+def patch_cosyvoice_device(cosyvoice_instance, device: str) -> None:
+    """Patch official CosyVoice model.device after construction for multi-GPU."""
+    if not device or not device.startswith("cuda"):
+        return
+
+    try:
+        import torch
+
+        explicit_device = torch.device(device)
+        model = getattr(cosyvoice_instance, "model", None)
+        if model is not None and hasattr(model, "device"):
+            model.device = explicit_device
+            logger.info("CosyVoice内部模型设备已绑定到 %s", explicit_device)
+    except Exception as e:
+        logger.warning("CosyVoice设备绑定失败，将使用官方默认设备: %s", e)
 
 
 def parse_gpu_config(gpu_str: str) -> Tuple[List[str], str]:
@@ -131,13 +171,14 @@ class CosyVoiceTTSEngine:
             if self._load_sft:
                 try:
                     logger.info(f"正在加载SFT模型（CosyVoice1）到 {self._device}...")
-                    self.cosyvoice_sft = CosyVoice(
-                        settings.SFT_MODEL_ID,
-                        load_jit=load_trt,  # JIT 与 TRT 一起控制
-                        load_trt=load_trt,
-                        fp16=fp16_enabled,
-                        device=self._device,
-                    )
+                    with torch_device_context(self._device):
+                        self.cosyvoice_sft = CosyVoice(
+                            settings.SFT_MODEL_ID,
+                            load_jit=load_trt,  # JIT 与 TRT 一起控制
+                            load_trt=load_trt,
+                            fp16=fp16_enabled,
+                        )
+                    patch_cosyvoice_device(self.cosyvoice_sft, self._device)
                     self._sft_model_loaded = True
                     logger.info(f"SFT模型加载成功，device={self._device}")
                 except Exception as e:
@@ -158,24 +199,26 @@ class CosyVoiceTTSEngine:
                                 "建议设置 TTS_ENABLE_FP16=false"
                             )
                         logger.info(f"正在加载零样本克隆模型（CosyVoice3）到 {self._device}...")
-                        self.cosyvoice_clone = CosyVoice3(
-                            settings.COSYVOICE3_MODEL_ID,
-                            load_trt=load_trt,
-                            load_vllm=False,
-                            fp16=fp16_enabled,
-                            device=self._device,
-                        )
+                        with torch_device_context(self._device):
+                            self.cosyvoice_clone = CosyVoice3(
+                                settings.COSYVOICE3_MODEL_ID,
+                                load_trt=load_trt,
+                                load_vllm=False,
+                                fp16=fp16_enabled,
+                            )
+                        patch_cosyvoice_device(self.cosyvoice_clone, self._device)
                         self._clone_model_version = "cosyvoice3"
                     else:
                         logger.info(f"正在加载零样本克隆模型（CosyVoice2）到 {self._device}...")
-                        self.cosyvoice_clone = CosyVoice2(
-                            settings.CLONE_MODEL_ID,
-                            load_jit=load_trt,  # JIT 与 TRT 一起控制
-                            load_trt=load_trt,
-                            load_vllm=False,
-                            fp16=fp16_enabled,
-                            device=self._device,
-                        )
+                        with torch_device_context(self._device):
+                            self.cosyvoice_clone = CosyVoice2(
+                                settings.CLONE_MODEL_ID,
+                                load_jit=load_trt,  # JIT 与 TRT 一起控制
+                                load_trt=load_trt,
+                                load_vllm=False,
+                                fp16=fp16_enabled,
+                            )
+                        patch_cosyvoice_device(self.cosyvoice_clone, self._device)
                         self._clone_model_version = "cosyvoice2"
                     self._clone_model_loaded = True
                     logger.info(f"零样本克隆模型（{self._clone_model_version}）加载成功，device={self._device}")
@@ -218,6 +261,27 @@ class CosyVoiceTTSEngine:
             )
         except Exception as e:
             logger.warning(f"初始化音色管理器失败: {str(e)}")
+
+    @contextmanager
+    def device_context(self):
+        """Bind inference in this engine to its configured torch device."""
+        with torch_device_context(self._device):
+            yield
+
+    def inference_sft(self, *args, **kwargs):
+        """Run CosyVoice SFT inference on this engine's configured device."""
+        with self.device_context():
+            yield from self.cosyvoice_sft.inference_sft(*args, **kwargs)
+
+    def inference_instruct2(self, *args, **kwargs):
+        """Run CosyVoice instruct inference on this engine's configured device."""
+        with self.device_context():
+            yield from self.cosyvoice_clone.inference_instruct2(*args, **kwargs)
+
+    def inference_zero_shot(self, *args, **kwargs):
+        """Run CosyVoice zero-shot inference on this engine's configured device."""
+        with self.device_context():
+            yield from self.cosyvoice_clone.inference_zero_shot(*args, **kwargs)
 
     def synthesize_speech(
         self,
@@ -297,15 +361,16 @@ class CosyVoiceTTSEngine:
 
         if return_timestamps:
             # 获取CosyVoice的分句结果
-            normalized_texts = self.cosyvoice_sft.frontend.text_normalize(
-                text, split=True, text_frontend=True
-            )
+            with self.device_context():
+                normalized_texts = self.cosyvoice_sft.frontend.text_normalize(
+                    text, split=True, text_frontend=True
+                )
             logger.debug(f"CosyVoice分句结果: {len(normalized_texts)} 个句子")
 
             # 为每个句子生成音频并记录时间戳
             for sentence_text in normalized_texts:
                 sentence_audio_segments = []
-                for audio_data in self.cosyvoice_sft.inference_sft(
+                for audio_data in self.inference_sft(
                     sentence_text, voice, stream=False, speed=speed
                 ):
                     sentence_audio_segments.append(audio_data["tts_speech"].numpy())
@@ -340,7 +405,7 @@ class CosyVoiceTTSEngine:
 
         else:
             # 不需要时间戳，直接合成
-            for audio_data in self.cosyvoice_sft.inference_sft(
+            for audio_data in self.inference_sft(
                 text, voice, stream=False, speed=speed
             ):
                 all_audio_segments.append(audio_data["tts_speech"].numpy())
@@ -431,9 +496,10 @@ class CosyVoiceTTSEngine:
 
             if return_timestamps:
                 # 获取CosyVoice的分句结果
-                normalized_texts = self.cosyvoice_clone.frontend.text_normalize(
-                    text, split=True, text_frontend=True
-                )
+                with self.device_context():
+                    normalized_texts = self.cosyvoice_clone.frontend.text_normalize(
+                        text, split=True, text_frontend=True
+                    )
                 logger.debug(f"CosyVoice分句结果: {len(normalized_texts)} 个句子")
 
                 # 为每个句子生成音频并记录时间戳
@@ -442,7 +508,7 @@ class CosyVoiceTTSEngine:
                     # 根据是否有 prompt 选择不同的推理方法
                     if prompt:
                         # 使用 instruct2 方法，支持自然语言指令控制
-                        inference_gen = self.cosyvoice_clone.inference_instruct2(
+                        inference_gen = self.inference_instruct2(
                             sentence_text,
                             formatted_prompt,  # instruct_text
                             None,  # prompt_wav - 不需要，使用保存的音色
@@ -452,7 +518,7 @@ class CosyVoiceTTSEngine:
                         )
                     else:
                         # 无 prompt 时使用 zero_shot
-                        inference_gen = self.cosyvoice_clone.inference_zero_shot(
+                        inference_gen = self.inference_zero_shot(
                             sentence_text,
                             "",
                             None,
@@ -500,7 +566,7 @@ class CosyVoiceTTSEngine:
                 # 根据是否有 prompt 选择不同的推理方法
                 if prompt:
                     # 使用 instruct2 方法，支持自然语言指令控制
-                    inference_gen = self.cosyvoice_clone.inference_instruct2(
+                    inference_gen = self.inference_instruct2(
                         text,
                         formatted_prompt,  # instruct_text
                         None,  # prompt_wav - 不需要，使用保存的音色
@@ -510,7 +576,7 @@ class CosyVoiceTTSEngine:
                     )
                 else:
                     # 无 prompt 时使用 zero_shot
-                    inference_gen = self.cosyvoice_clone.inference_zero_shot(
+                    inference_gen = self.inference_zero_shot(
                         text,
                         "",
                         None,
