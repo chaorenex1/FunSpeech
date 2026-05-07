@@ -5,17 +5,27 @@ ASR模型管理器
 重构以支持离线和实时模型的分离管理
 """
 
+from __future__ import annotations
+
 import json
-import torch
 import logging
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 
 from ...core.config import settings
 from ...core.exceptions import DefaultServerErrorException, InvalidParameterException
-from .engine import BaseASREngine, FunASREngine, DolphinEngine, MultiGPUASREngine
 
 logger = logging.getLogger(__name__)
+
+
+def _get_torch_cuda():
+    """延迟导入torch，允许未安装模型依赖时仍可导入API层。"""
+    try:
+        import torch
+
+        return torch.cuda
+    except ImportError:
+        return None
 
 
 class ModelConfig:
@@ -29,6 +39,8 @@ class ModelConfig:
         self.languages = config.get("languages", [])
         self.is_default = config.get("default", False)
         self.size = config.get("size")  # 用于Dolphin模型
+        self.family = config.get("family", self.engine)
+        self.streaming_strategy = config.get("streaming_strategy")
         self.supports_realtime = config.get("supports_realtime", False)
 
         # 模型路径结构
@@ -60,7 +72,7 @@ class ModelManager:
 
     def __init__(self):
         self._models_config: Dict[str, ModelConfig] = {}
-        self._loaded_engines: Dict[str, BaseASREngine] = {}
+        self._loaded_engines: Dict[str, Any] = {}
         self._default_model_id: Optional[str] = None
         self._load_models_config()
 
@@ -135,6 +147,8 @@ class ModelManager:
                     "default": config.is_default,
                     "loaded": loaded,
                     "supports_realtime": config.supports_realtime,
+                    "family": config.family,
+                    "streaming_strategy": config.streaming_strategy,
                     "offline_model": (
                         {
                             "path": config.offline_model_path,
@@ -157,7 +171,7 @@ class ModelManager:
 
         return models
 
-    def get_asr_engine(self, model_id: Optional[str] = None) -> BaseASREngine:
+    def get_asr_engine(self, model_id: Optional[str] = None) -> Any:
         """获取ASR引擎，支持缓存"""
         if model_id is None:
             model_id = self._default_model_id
@@ -178,13 +192,15 @@ class ModelManager:
 
         return engine
 
-    def _create_engine(self, config: ModelConfig) -> BaseASREngine:
+    def _create_engine(self, config: ModelConfig) -> Any:
         """根据配置创建ASR引擎（统一使用MultiGPUASREngine支持单/多GPU）"""
         # 统一使用MultiGPUASREngine，它会根据ASR_GPUS配置自动处理单GPU和多GPU场景
         return self._create_multi_gpu_engine(config)
 
-    def _create_multi_gpu_engine(self, config: ModelConfig) -> MultiGPUASREngine:
+    def _create_multi_gpu_engine(self, config: ModelConfig) -> Any:
         """创建多GPU ASR引擎"""
+        from .engine import DolphinEngine, FunASREngine, MultiGPUASREngine
+
         if config.engine.lower() == "funasr":
             engine_factory = FunASREngine
             engine_kwargs = {
@@ -195,6 +211,8 @@ class ModelManager:
                 "punc_model": settings.PUNC_MODEL,
                 "punc_model_revision": settings.PUNC_MODEL_REVISION,
                 "punc_realtime_model": settings.PUNC_REALTIME_MODEL,
+                "family": config.family,
+                "streaming_strategy": config.streaming_strategy,
             }
         elif config.engine.lower() == "dolphin":
             engine_factory = DolphinEngine
@@ -215,8 +233,9 @@ class ModelManager:
         if model_id in self._loaded_engines:
             del self._loaded_engines[model_id]
             # 强制垃圾回收
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            cuda = _get_torch_cuda()
+            if cuda and cuda.is_available():
+                cuda.empty_cache()
             return True
         return False
 
@@ -228,11 +247,12 @@ class ModelManager:
             "asr_model_mode": settings.ASR_MODEL_MODE,
         }
 
-        if torch.cuda.is_available():
+        cuda = _get_torch_cuda()
+        if cuda and cuda.is_available():
             memory_info["gpu_memory"] = {
-                "allocated": f"{torch.cuda.memory_allocated() / 1024**3:.2f}GB",
-                "cached": f"{torch.cuda.memory_reserved() / 1024**3:.2f}GB",
-                "max_allocated": f"{torch.cuda.max_memory_allocated() / 1024**3:.2f}GB",
+                "allocated": f"{cuda.memory_allocated() / 1024**3:.2f}GB",
+                "cached": f"{cuda.memory_reserved() / 1024**3:.2f}GB",
+                "max_allocated": f"{cuda.max_memory_allocated() / 1024**3:.2f}GB",
             }
 
         return memory_info
@@ -240,8 +260,9 @@ class ModelManager:
     def clear_cache(self) -> None:
         """清空模型缓存"""
         self._loaded_engines.clear()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        cuda = _get_torch_cuda()
+        if cuda and cuda.is_available():
+            cuda.empty_cache()
 
     def validate_model_mode_compatibility(self, model_id: str) -> Dict[str, Any]:
         """验证模型与当前ASR_MODEL_MODE的兼容性"""
@@ -254,7 +275,11 @@ class ModelManager:
             errors.append(
                 f"模型 {model_id} 没有离线版本，但 ASR_MODEL_MODE 设置为 offline"
             )
-        elif mode == "realtime" and not config.has_realtime_model:
+        elif (
+            mode == "realtime"
+            and not config.has_realtime_model
+            and config.streaming_strategy != "windowed_offline"
+        ):
             errors.append(
                 f"模型 {model_id} 没有实时版本，但 ASR_MODEL_MODE 设置为 realtime"
             )

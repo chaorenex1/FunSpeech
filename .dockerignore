@@ -33,6 +33,7 @@ logs/
 # 临时文件
 temp/
 tmp/
+dist/
 *.tmp
 
 # 模型文件（这些将通过volume挂载）

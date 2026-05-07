@@ -9,7 +9,6 @@ import logging
 from typing import Optional, AsyncGenerator, Dict, Any
 from enum import IntEnum
 
-import torch
 import numpy as np
 from fastapi import WebSocketDisconnect
 
@@ -31,8 +30,14 @@ from ..utils.common import (
     generate_task_id,
     clean_text_for_tts,
     convert_speech_rate_to_speed,
+    validate_pitch_rate_parameter,
 )
-from ..utils.audio import validate_audio_format, validate_sample_rate, resample_audio_array
+from ..utils.audio import (
+    adjust_audio_pitch,
+    validate_audio_format,
+    validate_sample_rate,
+    resample_audio_array,
+)
 from .tts.engine import get_tts_engine, MultiGPUTTSEngine
 
 logger = logging.getLogger(__name__)
@@ -259,6 +264,8 @@ class AliyunWebSocketTTSService:
                 return None
             if not validate_sample_rate(params["sample_rate"]):
                 return None
+            if not validate_pitch_rate_parameter(params["pitch_rate"])[0]:
+                return None
 
             logger.info(f"[{task_id}] StartSynthesis参数解析成功: {params}")
             return params
@@ -296,6 +303,7 @@ class AliyunWebSocketTTSService:
                 params["format"],
                 params["sample_rate"],
                 params["volume"],
+                params["pitch_rate"],
                 task_id,
                 websocket,  # 传入websocket用于检测连接状态
                 prompt,  # 传入 prompt 参数
@@ -376,6 +384,7 @@ class AliyunWebSocketTTSService:
         format: str,
         sample_rate: int,
         volume: int,
+        pitch_rate: int,
         task_id: str,
         websocket,  # 添加websocket参数用于检测连接状态
         prompt: str = "",  # 自然语言指令控制
@@ -401,7 +410,7 @@ class AliyunWebSocketTTSService:
                 if voice in voice_manager.list_clone_voices():
                     # 使用CosyVoice2/3流式合成（零样本克隆音色）
                     async for chunk in self._stream_clone_voice_with_engine(
-                        text, voice, speed, format, sample_rate, task_id, websocket, single_engine, prompt
+                        text, voice, speed, format, sample_rate, volume, pitch_rate, task_id, websocket, single_engine, prompt
                     ):
                         yield chunk
                     return
@@ -409,7 +418,7 @@ class AliyunWebSocketTTSService:
             # 使用CosyVoice1流式合成（预设音色）
             if single_engine.cosyvoice_sft:
                 async for chunk in self._stream_preset_voice_with_engine(
-                    text, voice, speed, format, sample_rate, task_id, websocket, single_engine
+                    text, voice, speed, format, sample_rate, volume, pitch_rate, task_id, websocket, single_engine
                 ):
                     yield chunk
             else:
@@ -427,7 +436,7 @@ class AliyunWebSocketTTSService:
                 tts_engine._release_engine(engine_index)
 
     async def _stream_preset_voice_with_engine(
-        self, text: str, voice: str, speed: float, format: str, target_sr: int, task_id: str, websocket, engine
+        self, text: str, voice: str, speed: float, format: str, target_sr: int, volume: int, pitch_rate: int, task_id: str, websocket, engine
     ) -> AsyncGenerator[bytes, None]:
         """使用指定引擎的CosyVoice1进行流式合成（预设音色）"""
         logger.debug(f"[{task_id}] 使用CosyVoice1流式合成预设音色: {voice}")
@@ -446,6 +455,7 @@ class AliyunWebSocketTTSService:
             # 将tensor转换为numpy数组，并按需 resample 到目标采样率
             audio_array = audio_data["tts_speech"].numpy()
             audio_array = resample_audio_array(audio_array, model_sr, target_sr)
+            audio_array = adjust_audio_pitch(audio_array, target_sr, pitch_rate)
 
             # 根据格式转换音频数据
             if format.upper() == "PCM":
@@ -460,7 +470,7 @@ class AliyunWebSocketTTSService:
             await asyncio.sleep(0.01)
 
     async def _stream_clone_voice_with_engine(
-        self, text: str, voice: str, speed: float, format: str, target_sr: int, task_id: str, websocket, engine, prompt: str = ""
+        self, text: str, voice: str, speed: float, format: str, target_sr: int, volume: int, pitch_rate: int, task_id: str, websocket, engine, prompt: str = ""
     ) -> AsyncGenerator[bytes, None]:
         """使用指定引擎的 CosyVoice2/3 进行流式合成（零样本克隆音色）"""
         clone_version = engine._clone_model_version if hasattr(engine, '_clone_model_version') else "cosyvoice2"
@@ -512,6 +522,7 @@ class AliyunWebSocketTTSService:
             # 将tensor转换为numpy数组，并按需 resample 到目标采样率
             audio_array = audio_data["tts_speech"].numpy()
             audio_array = resample_audio_array(audio_array, model_sr, target_sr)
+            audio_array = adjust_audio_pitch(audio_array, target_sr, pitch_rate)
 
             # 根据格式转换音频数据
             if format.upper() == "PCM":

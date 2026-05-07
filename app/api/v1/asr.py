@@ -54,6 +54,8 @@ from ...utils.audio import (
     get_audio_duration,
 )
 from ...services.asr.manager import get_model_manager
+from ...services.asr.hotwords import resolve_hotwords
+from ...utils.text_processing import filter_disfluencies
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -132,8 +134,19 @@ async def get_asr_params(request: Request) -> ASRQueryParams:
                 "name": "vocabulary_id",
                 "in": "query",
                 "required": False,
-                "schema": {"type": "string", "maxLength": 32, "example": "vocab_12345"},
-                "description": "热词表ID，用于提高特定词汇的识别准确率",
+                "schema": {"type": "string", "maxLength": 64, "example": "vocab_12345"},
+                "description": "热词表ID，对应data/asr_hotwords/{id}.txt或{id}.json",
+            },
+            {
+                "name": "hotwords",
+                "in": "query",
+                "required": False,
+                "schema": {
+                    "type": "string",
+                    "maxLength": 2048,
+                    "example": "FunSpeech SenseVoice CosyVoice",
+                },
+                "description": "临时热词列表，支持空格、逗号、分号或换行分隔；会与vocabulary_id热词表合并",
             },
             {
                 "name": "customization_id",
@@ -321,8 +334,7 @@ async def asr_transcribe(
         model_manager = get_model_manager()
         asr_engine = model_manager.get_asr_engine(params.customization_id)
 
-        # 准备热词（如果有vocabulary_id，这里可以根据ID查询热词）
-        hotwords = ""  # 实际项目中可以根据vocabulary_id查询对应的热词
+        hotwords = resolve_hotwords(params.vocabulary_id, params.hotwords)
 
         # 使用线程池执行模型推理，避免阻塞事件循环
         result_text = await run_sync(
@@ -339,10 +351,18 @@ async def asr_transcribe(
 
         logger.debug(f"[{task_id}] 识别完成: {result_text}")
 
+        if params.disfluency:
+            result_text = filter_disfluencies(result_text)
+            logger.debug(f"[{task_id}] 语气词过滤完成: {result_text}")
+
         # 返回成功响应
         response_data = {
             "task_id": task_id,
             "result": result_text,
+            "text": result_text,
+            "language": params.dolphin_lang_sym,
+            "duration_ms": int(audio_duration * 1000),
+            "confidence": None,
             "status": 20000000,
             "message": "SUCCESS",
         }

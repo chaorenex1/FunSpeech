@@ -37,6 +37,7 @@ from ...utils.common import (
     validate_text_input,
     validate_speed_parameter,
     validate_speech_rate_parameter,
+    validate_pitch_rate_parameter,
     convert_speech_rate_to_speed,
     validate_voice_parameter,
     clean_text_for_tts,
@@ -187,6 +188,14 @@ def format_tts_response(
                                 "maximum": 100,
                                 "default": 50,
                             },
+                            "pitch_rate": {
+                                "type": "integer",
+                                "description": "语调控制，范围-500~500，0为正常音高，100约等于升高1个半音",
+                                "example": 0,
+                                "minimum": -500,
+                                "maximum": 500,
+                                "default": 0,
+                            },
                             "format": {
                                 "type": "string",
                                 "description": f"输出音频格式。支持: {', '.join(AudioFormat.get_enums())}",
@@ -237,7 +246,7 @@ async def synthesize_speech(
             raise AuthenticationException(content, task_id)
 
         logger.debug(
-            f"[{task_id}] 开始语音合成: 文本='{tts_request.text}', 音色={tts_request.voice}, 语速={tts_request.speech_rate}, 音量={tts_request.volume}, 格式={tts_request.format}, 采样率={tts_request.sample_rate}"
+            f"[{task_id}] 开始语音合成: 文本='{tts_request.text}', 音色={tts_request.voice}, 语速={tts_request.speech_rate}, 音量={tts_request.volume}, 语调={tts_request.pitch_rate}, 格式={tts_request.format}, 采样率={tts_request.sample_rate}"
         )
 
         # 验证format参数
@@ -261,6 +270,10 @@ async def synthesize_speech(
         if not is_valid:
             raise InvalidParameterException(message, task_id)
 
+        is_valid, message = validate_pitch_rate_parameter(tts_request.pitch_rate)
+        if not is_valid:
+            raise InvalidParameterException(message, task_id)
+
         # 将speech_rate转换为内部speed参数
         speed = convert_speech_rate_to_speed(tts_request.speech_rate)
         logger.debug(
@@ -274,13 +287,14 @@ async def synthesize_speech(
         tts_engine = get_tts_engine()
         output_path = await run_sync(
             tts_engine.synthesize_speech,
-            clean_text,
-            tts_request.voice,
-            speed,
-            tts_request.format,
-            tts_request.sample_rate,
-            tts_request.volume,
-            tts_request.prompt or "",
+            text=clean_text,
+            voice=tts_request.voice,
+            speed=speed,
+            format=tts_request.format,
+            sample_rate=tts_request.sample_rate,
+            volume=tts_request.volume,
+            pitch_rate=tts_request.pitch_rate,
+            prompt=tts_request.prompt or "",
         )
 
         logger.debug(f"[{task_id}] 语音合成完成: {output_path}")

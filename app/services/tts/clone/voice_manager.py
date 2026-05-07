@@ -9,6 +9,7 @@ import os
 import sys
 import json
 import logging
+import shutil
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -16,7 +17,7 @@ from typing import Dict, List, Any, Optional, Tuple
 ROOT_DIR = Path(__file__).parent.parent.parent.parent.parent
 sys.path.append(str(ROOT_DIR))
 
-from app.utils.audio import validate_reference_audio
+from app.utils.audio import download_audio_from_url, validate_reference_audio
 
 # 音色文件目录配置
 VOICES_DIR = ROOT_DIR / "voices"
@@ -304,6 +305,63 @@ class VoiceManager:
 
             traceback.print_exc()
             return False
+
+    def register_voice_asset(
+        self,
+        voice_name: str,
+        reference_text: str,
+        audio_bytes: bytes = None,
+        audio_filename: str = None,
+        reference_audio_url: str = None,
+        voice_instruction: str = None,
+        overwrite: bool = False,
+    ) -> Dict[str, Any]:
+        """写入桌面端同步过来的音色资产并装载到voice_manager。"""
+        voice_name = (voice_name or "").strip()
+        reference_text = (reference_text or "").strip()
+        if not voice_name:
+            raise ValueError("voice_name不能为空")
+        if not reference_text:
+            raise ValueError("reference_text不能为空")
+        if any(sep in voice_name for sep in ("/", "\\", "..")):
+            raise ValueError("voice_name不能包含路径字符")
+        if not audio_bytes and not reference_audio_url:
+            raise ValueError("reference_audio或reference_audio_url必须提供一个")
+        if voice_name in self.registry["voices"] and not overwrite:
+            raise ValueError(f"音色已存在: {voice_name}")
+
+        if reference_audio_url and not audio_bytes:
+            audio_bytes = download_audio_from_url(reference_audio_url)
+            audio_filename = Path(reference_audio_url.split("?", 1)[0]).name
+
+        suffix = Path(audio_filename or "").suffix.lower() or ".wav"
+        if suffix not in {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"}:
+            raise ValueError(f"不支持的参考音频格式: {suffix}")
+
+        txt_file = self.voices_dir / f"{voice_name}.txt"
+        wav_file = self.voices_dir / f"{voice_name}{suffix}"
+
+        if overwrite and voice_name in self.registry["voices"]:
+            self.remove_voice(voice_name)
+
+        txt_file.write_text(reference_text, encoding="utf-8")
+        with open(wav_file, "wb") as f:
+            f.write(audio_bytes)
+
+        # add_voice要求同名txt和音频文件；非wav输入交由校验/转换逻辑处理。
+        if suffix != ".wav":
+            wav_target = self.voices_dir / f"{voice_name}.wav"
+            shutil.copyfile(wav_file, wav_target)
+            wav_file = wav_target
+
+        if not self.add_voice(voice_name, txt_file, wav_file):
+            raise ValueError(f"音色装载失败: {voice_name}")
+
+        if voice_instruction:
+            self.registry["voices"][voice_name]["voice_instruction"] = voice_instruction
+            self._save_registry()
+
+        return self.registry["voices"][voice_name]
 
     def remove_voice(self, voice_name: str) -> bool:
         """

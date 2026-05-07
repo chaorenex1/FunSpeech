@@ -10,7 +10,7 @@ from typing import List, Dict, Any, Union, Tuple, Optional
 from pathlib import Path
 
 from ...core.config import settings
-from ...core.exceptions import DefaultServerErrorException
+from ...core.exceptions import APIException, DefaultServerErrorException, InvalidParameterException
 from ...utils.audio import save_audio_array, generate_temp_audio_path
 
 logger = logging.getLogger(__name__)
@@ -217,6 +217,7 @@ class CosyVoiceTTSEngine:
         format: str = "wav",
         sample_rate: int = 22050,
         volume: int = 50,
+        pitch_rate: int = 0,
         prompt: str = "",
         return_timestamps: bool = False,
     ) -> Union[str, Tuple[str, Optional[List[Dict[str, Any]]]]]:
@@ -234,15 +235,21 @@ class CosyVoiceTTSEngine:
                         format,
                         sample_rate,
                         volume,
+                        pitch_rate,
                         prompt,
                         return_timestamps,
                     )
 
+            if voice not in settings.PRESET_VOICES:
+                raise InvalidParameterException(f"voice_name不存在: {voice}")
+
             # 使用预训练音色合成
             return self.synthesize_with_preset_voice(
-                text, voice, speed, format, sample_rate, volume, return_timestamps
+                text, voice, speed, format, sample_rate, volume, pitch_rate, return_timestamps
             )
 
+        except APIException:
+            raise
         except Exception as e:
             raise DefaultServerErrorException(f"语音合成失败: {str(e)}")
 
@@ -254,6 +261,7 @@ class CosyVoiceTTSEngine:
         format: str = "wav",
         sample_rate: int = 22050,
         volume: int = 50,
+        pitch_rate: int = 0,
         return_timestamps: bool = False,
     ) -> Union[str, Tuple[str, Optional[List[Dict[str, Any]]]]]:
         """使用预设音色合成语音"""
@@ -348,6 +356,7 @@ class CosyVoiceTTSEngine:
             format=format,
             original_sr=self.cosyvoice_sft.sample_rate,
             volume=volume,
+            pitch_rate=pitch_rate,
         )
 
         if return_timestamps:
@@ -387,6 +396,7 @@ class CosyVoiceTTSEngine:
         format: str = "wav",
         sample_rate: int = 22050,
         volume: int = 50,
+        pitch_rate: int = 0,
         prompt: str = "",
         return_timestamps: bool = False,
     ) -> Union[str, Tuple[str, Optional[List[Dict[str, Any]]]]]:
@@ -522,6 +532,7 @@ class CosyVoiceTTSEngine:
                 format=format,
                 original_sr=self.cosyvoice_clone.sample_rate,
                 volume=volume,
+                pitch_rate=pitch_rate,
             )
 
             if return_timestamps:
@@ -814,6 +825,7 @@ class MultiGPUTTSEngine:
         format: str = "wav",
         sample_rate: int = 22050,
         volume: int = 50,
+        pitch_rate: int = 0,
         prompt: str = "",
         return_timestamps: bool = False,
     ) -> Union[str, Tuple[str, Optional[List[Dict[str, Any]]]]]:
@@ -828,6 +840,7 @@ class MultiGPUTTSEngine:
                 format=format,
                 sample_rate=sample_rate,
                 volume=volume,
+                pitch_rate=pitch_rate,
                 prompt=prompt,
                 return_timestamps=return_timestamps,
             )
@@ -842,6 +855,7 @@ class MultiGPUTTSEngine:
         format: str = "wav",
         sample_rate: int = 22050,
         volume: int = 50,
+        pitch_rate: int = 0,
         return_timestamps: bool = False,
     ) -> Union[str, Tuple[str, Optional[List[Dict[str, Any]]]]]:
         """使用预设音色合成语音（负载均衡）"""
@@ -855,6 +869,7 @@ class MultiGPUTTSEngine:
                 format=format,
                 sample_rate=sample_rate,
                 volume=volume,
+                pitch_rate=pitch_rate,
                 return_timestamps=return_timestamps,
             )
         finally:

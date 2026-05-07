@@ -7,10 +7,6 @@
 import os
 import tempfile
 import requests
-import librosa
-import soundfile as sf
-import torchaudio
-import torch
 import numpy as np
 import subprocess
 import logging
@@ -146,6 +142,8 @@ def load_audio_file(audio_path: str, target_sr: int = 16000) -> Tuple[np.ndarray
         AudioProcessingException: 加载失败
     """
     try:
+        import librosa
+
         # 使用librosa加载音频
         audio_data, sr = librosa.load(audio_path, sr=target_sr)
         return audio_data, sr
@@ -166,6 +164,8 @@ def get_audio_duration(audio_path: str) -> float:
         AudioProcessingException: 获取时长失败
     """
     try:
+        import librosa
+
         # Load audio and get duration
         y, sr = librosa.load(audio_path, sr=None)
         duration = librosa.get_duration(y=y, sr=sr)
@@ -232,6 +232,8 @@ def resample_audio_array(
         return audio_array
 
     try:
+        import librosa
+
         # 确保是1D数组用于librosa重采样
         if audio_array.ndim > 1:
             # 如果是多声道，取第一个声道
@@ -290,6 +292,55 @@ def adjust_audio_volume(audio_array: np.ndarray, volume: int) -> np.ndarray:
     return adjusted_audio
 
 
+def adjust_audio_pitch(
+    audio_array: np.ndarray,
+    sample_rate: int,
+    pitch_rate: int = 0,
+) -> np.ndarray:
+    """按阿里云pitch_rate语义调节音高，100约等于1个半音。"""
+    if int(pitch_rate) == 0:
+        return audio_array
+
+    if pitch_rate < settings.MIN_PITCH_RATE or pitch_rate > settings.MAX_PITCH_RATE:
+        logger.warning(f"语调值{pitch_rate}超出范围，使用默认值0")
+        return audio_array
+
+    try:
+        import librosa
+
+        n_steps = pitch_rate / 100.0
+        original_ndim = audio_array.ndim
+
+        if original_ndim == 1:
+            shifted = librosa.effects.pitch_shift(
+                audio_array.astype(np.float32),
+                sr=sample_rate,
+                n_steps=n_steps,
+            )
+        else:
+            channels = []
+            channel_first = audio_array.shape[0] <= audio_array.shape[-1]
+            channel_data = audio_array if channel_first else audio_array.T
+            for channel in channel_data:
+                channels.append(
+                    librosa.effects.pitch_shift(
+                        channel.astype(np.float32),
+                        sr=sample_rate,
+                        n_steps=n_steps,
+                    )
+                )
+            shifted = np.stack(channels, axis=0)
+            if not channel_first:
+                shifted = shifted.T
+
+        logger.info(f"音频语调已调节: pitch_rate={pitch_rate}, n_steps={n_steps:.2f}")
+        return shifted.astype(np.float32)
+
+    except Exception as e:
+        logger.warning(f"音频语调调节失败: {str(e)}，使用原始音频")
+        return audio_array
+
+
 def save_audio_array(
     audio_array: np.ndarray,
     output_path: str,
@@ -297,6 +348,7 @@ def save_audio_array(
     format: str = "wav",
     original_sr: int = None,
     volume: int = 50,
+    pitch_rate: int = 0,
 ) -> str:
     """保存音频数组到文件
 
@@ -320,6 +372,7 @@ def save_audio_array(
             audio_array = resample_audio_array(audio_array, original_sr, sample_rate)
 
         # 调节音频音量
+        audio_array = adjust_audio_pitch(audio_array, sample_rate, pitch_rate)
         audio_array = adjust_audio_volume(audio_array, volume)
 
         # 确保音频数据是float32格式
@@ -340,10 +393,15 @@ def save_audio_array(
 
         # 根据格式选择保存方法
         if format.lower() == "wav":
+            import torch
+            import torchaudio
+
             # 使用torchaudio保存WAV格式
             audio_tensor = torch.from_numpy(audio_array)
             torchaudio.save(output_path, audio_tensor, sample_rate)
         else:
+            import soundfile as sf
+
             # 使用soundfile保存其他格式
             # 确保音频数据是单声道
             if audio_array.shape[0] > 1:
@@ -377,6 +435,9 @@ def convert_audio_to_wav(
         output_path = input_path.rsplit(".", 1)[0] + ".wav"
 
     try:
+        import librosa
+        import soundfile as sf
+
         # 使用librosa加载并重采样
         audio_data, sr = librosa.load(input_path, sr=target_sr)
         sf.write(output_path, audio_data, target_sr, format="WAV")
@@ -426,6 +487,8 @@ def normalize_audio_for_asr(audio_path: str, target_sr: int = 16000) -> str:
 
         # 如果已经是WAV格式且采样率正确，直接返回
         if file_ext == ".wav":
+            import librosa
+
             # 检查采样率
             audio_data, sr = librosa.load(audio_path, sr=None)
             if sr == target_sr:

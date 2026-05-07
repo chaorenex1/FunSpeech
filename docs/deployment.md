@@ -277,21 +277,27 @@ export TTS_MODEL_MODE=all
 
 | 环境变量                | 默认值  | 说明                                 | 可选值                  |
 | ----------------------- | ------- | ------------------------------------ | ----------------------- |
-| `ASR_MODEL_MODE`        | `all`   | ASR 模型加载模式                     | `realtime`, `offline`, `all` |
+| `ASR_MODEL_MODE`        | `all`   | ASR 模型加载模式；默认模型为 SenseVoiceSmall | `realtime`, `offline`, `all` |
+| `ASR_STREAMING_STRATEGY` | `windowed_offline` | SenseVoiceSmall WebSocket 实时协议适配策略 | `windowed_offline` |
 | `ASR_ENABLE_REALTIME_PUNC` | `false` | 是否启用实时标点模型(用于中间结果展示) | `true`, `false`         |
+| `ASR_ENABLE_VAD_ENDPOINT` | `true` | 是否使用 FSMN VAD 驱动实时端点检测 | `true`, `false` |
+| `ASR_VAD_CHUNK_SIZE_MS` | `200` | VAD 流式检测块大小 | 正整数 |
+| `ASR_VAD_END_FALLBACK_MS` | `1200` | VAD 漏判句尾时的静音兜底时长 | 正整数 |
 
 **使用示例:**
 
 ```bash
-# 仅加载实时识别模型
+# 使用 SenseVoiceSmall 窗口化伪流式实时识别
 export ASR_MODEL_MODE=realtime
+export ASR_STREAMING_STRATEGY=windowed_offline
 
 # 启用实时标点
 export ASR_ENABLE_REALTIME_PUNC=true
 ```
 
 **影响:**
-- `ASR_MODEL_MODE` 控制加载哪些 ASR 模型
+- `ASR_MODEL_MODE=realtime` 对 SenseVoiceSmall 会加载离线权重，并通过 VAD + 窗口化离线识别提供 WebSocket 实时协议
+- `ASR_ENABLE_VAD_ENDPOINT=true` 会使用 FSMN VAD 的 begin/end 作为主要句子边界
 - `ASR_ENABLE_REALTIME_PUNC=true` 会为实时识别中间结果添加标点(增加内存占用)
 
 ### 流式ASR远场声音过滤配置

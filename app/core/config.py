@@ -52,10 +52,22 @@ class Settings:
     }
     ASR_MODELS_CONFIG: str = BASE_DIR / "app/services/asr/models.json"
     ASR_MODEL_MODE: str = "all"  # ASR模型加载模式: realtime, offline, all
+    ASR_STREAMING_STRATEGY: str = "windowed_offline"  # realtime模型缺省时使用离线窗口伪流式
     ASR_ENABLE_REALTIME_PUNC: bool = False  # 是否启用实时标点模型（用于中间结果展示）
     AUTO_LOAD_CUSTOM_ASR_MODELS: str = (
         ""  # 启动时自动加载的自定义ASR模型列表（逗号分隔，如: dolphin-small,sensevoice-small）
     )
+    SENSEVOICE_LANGUAGE: str = "auto"
+    SENSEVOICE_PARTIAL_DECODE_INTERVAL_MS: int = 800
+    SENSEVOICE_MIN_DECODE_WINDOW_MS: int = 1200
+    SENSEVOICE_MAX_PARTIAL_WINDOW_MS: int = 8000
+    SENSEVOICE_MAX_SENTENCE_MS: int = 30000
+    ASR_ENABLE_VAD_ENDPOINT: bool = True
+    ASR_VAD_CHUNK_SIZE_MS: int = 200
+    ASR_VAD_SPEECH_PAD_MS: int = 300
+    ASR_VAD_END_FALLBACK_MS: int = 1200
+    ASR_VAD_MIN_SPEECH_MS: int = 300
+    ASR_VAD_MAX_SENTENCE_MS: int = 30000
     VAD_MODEL: str = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
     VAD_MODEL_REVISION: str = "v2.0.4"
     PUNC_MODEL: str = "iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch"
@@ -68,6 +80,8 @@ class Settings:
     ASR_ENABLE_NEARFIELD_FILTER: bool = True  # 是否启用远场声音过滤
     ASR_NEARFIELD_RMS_THRESHOLD: float = 0.01  # RMS能量阈值（宽松模式，适合大多数场景）
     ASR_NEARFIELD_FILTER_LOG_ENABLED: bool = True  # 是否记录过滤日志（默认启用）
+    ASR_HOTWORDS_DIR: str = DATA_DIR + "/asr_hotwords"  # ASR热词表目录
+    MAX_ASYNC_ASR_AUDIO_SIZE: int = 500 * 1024 * 1024  # 异步长录音最大500MB
 
     # TTS模型配置
     SFT_MODEL_ID: str = "iic/CosyVoice-300M-SFT"  # 预训练音色模型（CosyVoice）
@@ -103,6 +117,11 @@ class Settings:
     MAX_SPEECH_RATE: int = 500
     DEFAULT_SPEECH_RATE: int = 0
 
+    # 阿里云pitch_rate参数限制
+    MIN_PITCH_RATE: int = -500
+    MAX_PITCH_RATE: int = 500
+    DEFAULT_PITCH_RATE: int = 0
+
     # 参考音频配置
     MAX_REFERENCE_AUDIO_DURATION: int = 30  # 秒
     MIN_REFERENCE_AUDIO_DURATION: float = 1.0  # 秒
@@ -137,11 +156,59 @@ class Settings:
 
         # ASR模型配置
         self.ASR_MODEL_MODE = os.getenv("ASR_MODEL_MODE", self.ASR_MODEL_MODE)
+        self.ASR_STREAMING_STRATEGY = os.getenv(
+            "ASR_STREAMING_STRATEGY", self.ASR_STREAMING_STRATEGY
+        )
         self.ASR_ENABLE_REALTIME_PUNC = (
             os.getenv("ASR_ENABLE_REALTIME_PUNC", "false").lower() == "true"
         )
         self.AUTO_LOAD_CUSTOM_ASR_MODELS = os.getenv(
             "AUTO_LOAD_CUSTOM_ASR_MODELS", self.AUTO_LOAD_CUSTOM_ASR_MODELS
+        )
+        self.SENSEVOICE_LANGUAGE = os.getenv(
+            "SENSEVOICE_LANGUAGE", self.SENSEVOICE_LANGUAGE
+        )
+        self.SENSEVOICE_PARTIAL_DECODE_INTERVAL_MS = int(
+            os.getenv(
+                "SENSEVOICE_PARTIAL_DECODE_INTERVAL_MS",
+                str(self.SENSEVOICE_PARTIAL_DECODE_INTERVAL_MS),
+            )
+        )
+        self.SENSEVOICE_MIN_DECODE_WINDOW_MS = int(
+            os.getenv(
+                "SENSEVOICE_MIN_DECODE_WINDOW_MS",
+                str(self.SENSEVOICE_MIN_DECODE_WINDOW_MS),
+            )
+        )
+        self.SENSEVOICE_MAX_PARTIAL_WINDOW_MS = int(
+            os.getenv(
+                "SENSEVOICE_MAX_PARTIAL_WINDOW_MS",
+                str(self.SENSEVOICE_MAX_PARTIAL_WINDOW_MS),
+            )
+        )
+        self.SENSEVOICE_MAX_SENTENCE_MS = int(
+            os.getenv(
+                "SENSEVOICE_MAX_SENTENCE_MS",
+                str(self.SENSEVOICE_MAX_SENTENCE_MS),
+            )
+        )
+        self.ASR_ENABLE_VAD_ENDPOINT = (
+            os.getenv("ASR_ENABLE_VAD_ENDPOINT", "true").lower() == "true"
+        )
+        self.ASR_VAD_CHUNK_SIZE_MS = int(
+            os.getenv("ASR_VAD_CHUNK_SIZE_MS", str(self.ASR_VAD_CHUNK_SIZE_MS))
+        )
+        self.ASR_VAD_SPEECH_PAD_MS = int(
+            os.getenv("ASR_VAD_SPEECH_PAD_MS", str(self.ASR_VAD_SPEECH_PAD_MS))
+        )
+        self.ASR_VAD_END_FALLBACK_MS = int(
+            os.getenv("ASR_VAD_END_FALLBACK_MS", str(self.ASR_VAD_END_FALLBACK_MS))
+        )
+        self.ASR_VAD_MIN_SPEECH_MS = int(
+            os.getenv("ASR_VAD_MIN_SPEECH_MS", str(self.ASR_VAD_MIN_SPEECH_MS))
+        )
+        self.ASR_VAD_MAX_SENTENCE_MS = int(
+            os.getenv("ASR_VAD_MAX_SENTENCE_MS", str(self.ASR_VAD_MAX_SENTENCE_MS))
         )
 
         # TTS模型配置
@@ -163,11 +230,16 @@ class Settings:
         self.ASR_NEARFIELD_FILTER_LOG_ENABLED = (
             os.getenv("ASR_NEARFIELD_FILTER_LOG_ENABLED", "true").lower() == "true"
         )
+        self.ASR_HOTWORDS_DIR = os.getenv("ASR_HOTWORDS_DIR", self.ASR_HOTWORDS_DIR)
+        self.MAX_ASYNC_ASR_AUDIO_SIZE = int(
+            os.getenv("MAX_ASYNC_ASR_AUDIO_SIZE", str(self.MAX_ASYNC_ASR_AUDIO_SIZE))
+        )
 
     def _ensure_directories(self):
         """确保必需的目录存在"""
         os.makedirs(self.TEMP_DIR, exist_ok=True)
         os.makedirs(self.DATA_DIR, exist_ok=True)
+        os.makedirs(self.ASR_HOTWORDS_DIR, exist_ok=True)
 
     @property
     def models_config_path(self) -> str:

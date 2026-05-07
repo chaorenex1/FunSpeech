@@ -46,13 +46,20 @@ class ASRQueryParams(BaseModel):
         None,
         description="热词表ID，用于提高特定词汇的识别准确率",
         example="vocab_12345",
-        max_length=32,
+        max_length=64,
+    )
+
+    hotwords: Optional[str] = Field(
+        None,
+        description="临时热词列表，支持空格、逗号、分号或换行分隔；会与vocabulary_id热词表合并",
+        example="FunSpeech SenseVoice CosyVoice",
+        max_length=2048,
     )
 
     customization_id: Optional[str] = Field(
-        "paraformer-large",
+        "sensevoice-small",
         description="自定义模型ID，指定使用的ASR模型",
-        example="paraformer-large",
+        example="sensevoice-small",
         max_length=64,
     )
 
@@ -205,6 +212,8 @@ class ASRModelInfo(BaseModel):
     default: bool = Field(False, description="是否为默认模型")
     loaded: bool = Field(False, description="是否已加载")
     supports_realtime: bool = Field(False, description="是否支持实时识别")
+    family: Optional[str] = Field(None, description="模型族")
+    streaming_strategy: Optional[str] = Field(None, description="实时识别策略")
     offline_model: Optional[dict] = Field(None, description="离线模型信息")
     realtime_model: Optional[dict] = Field(None, description="实时模型信息")
     asr_model_mode: str = Field(..., description="当前ASR模型加载模式")

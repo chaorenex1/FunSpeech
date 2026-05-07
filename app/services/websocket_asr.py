@@ -31,7 +31,6 @@ WebSocket ASR 服务 - 阿里云实时语音识别协议实现
 import json
 import logging
 import numpy as np
-import soundfile as sf
 import io
 from typing import Optional, Dict
 from enum import IntEnum
@@ -49,9 +48,18 @@ from ..models.websocket_asr import (
     AliyunASRMessageName,
     AliyunASRStatus,
 )
-from .asr.engine import MultiGPUASREngine
 
 logger = logging.getLogger(__name__)
+
+
+def _is_multi_gpu_asr_engine(asr_engine) -> bool:
+    """延迟识别多GPU引擎，避免API导入时强制加载模型依赖。"""
+    try:
+        from .asr.engine import MultiGPUASREngine
+
+        return isinstance(asr_engine, MultiGPUASREngine)
+    except ImportError:
+        return False
 
 
 class ConnectionState(IntEnum):
@@ -114,6 +122,8 @@ class AliyunWebSocketASRService:
         sentence_texts_raw = []
         empty_result_count = 0
         audio_buffer = np.array([], dtype=np.float32)  # 音频缓冲区，用于累积到完整chunk
+        streaming_session = None
+        streaming_active_index = None
 
         # 多GPU会话级负载均衡
         session_engine = None
@@ -167,11 +177,20 @@ class AliyunWebSocketASRService:
 
                                     # 多GPU会话级负载均衡：在会话开始时选择引擎
                                     asr_engine = self._ensure_asr_engine()
-                                    if isinstance(asr_engine, MultiGPUASREngine):
+                                    if _is_multi_gpu_asr_engine(asr_engine):
                                         session_engine_index, session_engine = asr_engine.get_engine_for_session()
                                         logger.info(f"[{task_id}] 分配会话引擎 {session_engine_index} ({asr_engine._devices[session_engine_index]})")
                                     else:
                                         session_engine = asr_engine
+
+                                    if (
+                                        hasattr(session_engine, "create_streaming_session")
+                                        and getattr(session_engine, "streaming_strategy", "")
+                                        == "windowed_offline"
+                                    ):
+                                        streaming_session = session_engine.create_streaming_session(
+                                            transcription_params
+                                        )
 
                                     await self._send_transcription_started(
                                         websocket, task_id, session_id
@@ -203,6 +222,41 @@ class AliyunWebSocketASRService:
                                         websocket, task_id, "Task ID not match"
                                     )
                                     continue
+
+                                if streaming_session is not None:
+                                    if len(audio_buffer) > 0:
+                                        events = await streaming_session.accept_audio(
+                                            audio_buffer,
+                                            is_final=False,
+                                        )
+                                        audio_buffer = np.array([], dtype=np.float32)
+                                        sentence_index, streaming_active_index = (
+                                            await self._handle_streaming_events(
+                                                websocket,
+                                                task_id,
+                                                events,
+                                                sentence_index,
+                                                streaming_active_index,
+                                                transcription_params,
+                                            )
+                                        )
+                                    events = await streaming_session.flush()
+                                    sentence_index, streaming_active_index = (
+                                        await self._handle_streaming_events(
+                                            websocket,
+                                            task_id,
+                                            events,
+                                            sentence_index,
+                                            streaming_active_index,
+                                            transcription_params,
+                                        )
+                                    )
+                                    await self._send_transcription_completed(
+                                        websocket, task_id
+                                    )
+                                    state = ConnectionState.COMPLETED
+                                    logger.info(f"[{task_id}] 识别完成")
+                                    break
 
                                 # 如果有未完成的句子，直接结束
                                 if sentence_active and sentence_texts_raw:
@@ -311,6 +365,25 @@ class AliyunWebSocketASRService:
                                 # 提取标准大小的chunk
                                 audio_chunk = audio_buffer[:selected_chunk_size]
                                 audio_buffer = audio_buffer[selected_chunk_size:]
+
+                                if streaming_session is not None:
+                                    events = await streaming_session.accept_audio(
+                                        audio_chunk,
+                                        is_final=False,
+                                    )
+                                    sentence_index, streaming_active_index = (
+                                        await self._handle_streaming_events(
+                                            websocket,
+                                            task_id,
+                                            events,
+                                            sentence_index,
+                                            streaming_active_index,
+                                            transcription_params,
+                                        )
+                                    )
+                                    if hasattr(streaming_session, "audio_time_ms"):
+                                        audio_time = streaming_session.audio_time_ms
+                                    continue
 
                                 # ========== 远场声音过滤 ==========
                                 # 动态阈值：句子活跃时降低阈值，避免句子中间音量波动导致丢帧
@@ -555,7 +628,7 @@ class AliyunWebSocketASRService:
             # 释放会话级引擎（多GPU负载均衡）
             if session_engine_index is not None:
                 asr_engine = self._ensure_asr_engine()
-                if isinstance(asr_engine, MultiGPUASREngine):
+                if _is_multi_gpu_asr_engine(asr_engine):
                     asr_engine.release_session_engine(session_engine_index)
                     logger.debug(f"[{task_id}] 释放会话引擎 {session_engine_index}")
 
@@ -576,6 +649,7 @@ class AliyunWebSocketASRService:
                 "enable_inverse_text_normalization": payload.get(
                     "enable_inverse_text_normalization", True
                 ),
+                "enable_voice_detection": payload.get("enable_voice_detection", True),
                 "max_sentence_silence": payload.get("max_sentence_silence", 800),
                 "enable_words": payload.get("enable_words", False),
             }
@@ -586,6 +660,56 @@ class AliyunWebSocketASRService:
         except Exception as e:
             logger.error(f"[{task_id}] 解析StartTranscription失败: {e}")
             return None
+
+    async def _handle_streaming_events(
+        self,
+        websocket,
+        task_id: str,
+        events,
+        sentence_index: int,
+        active_index: Optional[int],
+        transcription_params: dict,
+    ) -> tuple[int, Optional[int]]:
+        """Map model-agnostic streaming events onto the Aliyun-compatible protocol."""
+        for event in events:
+            if event.kind == "begin":
+                active_index = sentence_index + 1
+                await self._send_sentence_begin(
+                    websocket,
+                    task_id,
+                    active_index,
+                    event.time_ms,
+                )
+            elif event.kind == "partial":
+                if not transcription_params.get("enable_intermediate_result", True):
+                    continue
+                current_index = active_index or sentence_index + 1
+                await self._send_transcription_result_changed(
+                    websocket,
+                    task_id,
+                    current_index,
+                    event.time_ms,
+                    event.text,
+                )
+            elif event.kind == "end":
+                current_index = active_index or sentence_index + 1
+                result_text = event.text
+                enable_itn = transcription_params.get(
+                    "enable_inverse_text_normalization", True
+                )
+                await self._send_sentence_end(
+                    websocket,
+                    task_id,
+                    current_index,
+                    event.time_ms,
+                    result_text,
+                    begin_time=event.begin_time_ms,
+                    enable_itn=enable_itn and not getattr(event, "itn_applied", False),
+                )
+                sentence_index = max(sentence_index, current_index)
+                active_index = None
+
+        return sentence_index, active_index
 
     def _is_silence_frame(
         self, audio_array: np.ndarray, threshold: float = 0.001
@@ -648,6 +772,8 @@ class AliyunWebSocketASRService:
                     / 32768.0
                 )
             elif audio_format == "wav":
+                import soundfile as sf
+
                 audio_io = io.BytesIO(audio_bytes)
                 audio_array, sr = sf.read(audio_io)
                 if sr != sample_rate:
@@ -834,6 +960,8 @@ class AliyunWebSocketASRService:
                 / 32768.0
             )
         elif audio_format == "wav":
+            import soundfile as sf
+
             audio_io = io.BytesIO(audio_bytes)
             audio_array, sr = sf.read(audio_io)
             if sr != sample_rate:
@@ -907,6 +1035,11 @@ class AliyunWebSocketASRService:
                 "index": index,
                 "time": time,
                 "result": result,
+                "task_id": task_id,
+                "text": result,
+                "is_final": False,
+                "confidence": None,
+                "duration_ms": time,
             },
         }
         try:
@@ -945,6 +1078,11 @@ class AliyunWebSocketASRService:
                 "time": time,
                 "result": result,
                 "begin_time": begin_time,
+                "task_id": task_id,
+                "text": result,
+                "is_final": True,
+                "confidence": None,
+                "duration_ms": max(0, time - begin_time),
             },
         }
         try:

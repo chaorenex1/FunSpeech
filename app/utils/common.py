@@ -93,6 +93,17 @@ def validate_speech_rate_parameter(speech_rate: float) -> Tuple[bool, str]:
     return True, "验证通过"
 
 
+def validate_pitch_rate_parameter(pitch_rate: float) -> Tuple[bool, str]:
+    """验证阿里云pitch_rate参数。"""
+    if pitch_rate < settings.MIN_PITCH_RATE:
+        return False, f"语调过低，最小值为{settings.MIN_PITCH_RATE}"
+
+    if pitch_rate > settings.MAX_PITCH_RATE:
+        return False, f"语调过高，最大值为{settings.MAX_PITCH_RATE}"
+
+    return True, "验证通过"
+
+
 def convert_speech_rate_to_speed(speech_rate: float) -> float:
     """将阿里云speech_rate参数转换为内部speed参数
 

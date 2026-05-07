@@ -97,14 +97,15 @@ def _process_async_tasks():
 
                     # 合成语音并获取句子时间戳
                     result = tts_engine.synthesize_speech(
-                        clean_text,
-                        task['voice'],
-                        1.0,  # 默认语速
-                        task['format'],
-                        task['sample_rate'],
-                        50,   # 默认音量
-                        "",   # 默认prompt
-                        task['enable_subtitle']  # 返回时间戳
+                        text=clean_text,
+                        voice=task['voice'],
+                        speed=1.0,  # 默认语速
+                        format=task['format'],
+                        sample_rate=task['sample_rate'],
+                        volume=50,  # 默认音量
+                        pitch_rate=0,
+                        prompt="",  # 默认prompt
+                        return_timestamps=task['enable_subtitle'],
                     )
 
                     # 解析返回结果

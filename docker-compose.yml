@@ -26,15 +26,21 @@ services:
       # - ASR_GPUS=0          # ASR使用的GPU（默认自动检测）
 
       # ASR 模型按需加载配置（可选，默认为 all）
-      # - ASR_MODEL_MODE=all          # 加载默认模型的离线和实时版本（默认）
+      # - ASR_MODEL_MODE=all          # 加载默认 SenseVoiceSmall（默认）
       # - ASR_MODEL_MODE=offline      # 仅加载离线模型
-      # - ASR_MODEL_MODE=realtime     # 仅加载实时流式模型
+      # - ASR_MODEL_MODE=realtime     # 加载 SenseVoiceSmall 并使用窗口化伪流式
+      # - ASR_STREAMING_STRATEGY=windowed_offline  # SenseVoiceSmall 实时协议适配策略
 
       # ASR 自定义模型预加载（可选，默认为空）
       # 配置后在启动时自动加载指定的自定义模型，避免首次调用时的等待
-      # 可用模型: sensevoice-small, dolphin-small
-      # - AUTO_LOAD_CUSTOM_ASR_MODELS=sensevoice-small              # 单个模型
-      # - AUTO_LOAD_CUSTOM_ASR_MODELS=sensevoice-small,dolphin-small  # 多个模型（逗号分隔）
+      # 可用模型: paraformer-large, dolphin-small
+      # - AUTO_LOAD_CUSTOM_ASR_MODELS=paraformer-large              # 单个模型
+      # - AUTO_LOAD_CUSTOM_ASR_MODELS=paraformer-large,dolphin-small  # 多个模型（逗号分隔）
+
+      # ASR VAD 端点检测配置（可选，默认启用）
+      # - ASR_ENABLE_VAD_ENDPOINT=true
+      # - ASR_VAD_CHUNK_SIZE_MS=200
+      # - ASR_VAD_END_FALLBACK_MS=1200
 
       # ASR 实时标点符号模型（可选，默认为 false）
       # - ASR_ENABLE_REALTIME_PUNC=true  # 启用实时标点符号模型（用于流式识别中间结果）

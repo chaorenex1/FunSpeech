@@ -78,6 +78,14 @@ class TTSRequest(BaseModel):
         le=100,
     )
 
+    pitch_rate: int = Field(
+        0,
+        description="语调控制，范围-500~500，0为正常音高，100约等于升高1个半音",
+        example=0,
+        ge=-500,
+        le=500,
+    )
+
     format: Optional[AudioFormat] = Field(
         "wav",
         description=f"输出音频格式。支持: {', '.join(AudioFormat.get_enums())}",

@@ -7,6 +7,7 @@ import torch
 import numpy as np
 import logging
 import threading
+import tempfile
 from typing import Optional, Dict, Any, List, Tuple, Union
 from abc import ABC, abstractmethod
 from enum import Enum
@@ -147,6 +148,8 @@ class FunASREngine(RealTimeASREngine):
         punc_model: str = None,
         punc_model_revision: str = "v2.0.4",
         punc_realtime_model: str = None,
+        family: str = "funasr",
+        streaming_strategy: Optional[str] = None,
     ):
         self.offline_model: Optional[AutoModel] = None
         self.realtime_model: Optional[AutoModel] = None
@@ -157,6 +160,10 @@ class FunASREngine(RealTimeASREngine):
         # 模型路径配置
         self.offline_model_path = offline_model_path
         self.realtime_model_path = realtime_model_path
+        self.family = (family or "funasr").lower()
+        self.streaming_strategy = (
+            streaming_strategy or settings.ASR_STREAMING_STRATEGY
+        ).lower()
 
         # 辅助模型配置
         self.vad_model = vad_model or settings.VAD_MODEL
@@ -187,6 +194,9 @@ class FunASREngine(RealTimeASREngine):
             # 只加载实时模型
             if self.realtime_model_path:
                 self._load_realtime_model()
+            elif self.streaming_strategy == "windowed_offline" and self.offline_model_path:
+                logger.info("ASR_MODEL_MODE=realtime，使用离线模型加载窗口化伪流式ASR")
+                self._load_offline_model()
             else:
                 logger.warning("ASR_MODEL_MODE设置为realtime，但未提供实时模型路径")
         else:
@@ -251,6 +261,15 @@ class FunASREngine(RealTimeASREngine):
             )
 
         try:
+            if self.family == "sensevoice":
+                return self._transcribe_sensevoice_file(
+                    audio_path=audio_path,
+                    hotwords=hotwords,
+                    enable_itn=enable_itn,
+                    enable_vad=enable_vad,
+                    sample_rate=sample_rate,
+                )
+
             # 根据参数决定是否需要VAD/PUNC
             need_vad = enable_vad
             need_punc = enable_punctuation
@@ -346,6 +365,96 @@ class FunASREngine(RealTimeASREngine):
         except Exception as e:
             raise DefaultServerErrorException(f"语音识别失败: {str(e)}")
 
+    def _postprocess_sensevoice_text(self, text: str) -> str:
+        """清理SenseVoice rich transcription标签并返回纯文本。"""
+        if not text:
+            return ""
+
+        try:
+            from funasr.utils.postprocess_utils import rich_transcription_postprocess
+
+            return rich_transcription_postprocess(text).strip()
+        except Exception as e:
+            logger.debug(f"SenseVoice后处理不可用，使用基础清理: {e}")
+            import re
+
+            return re.sub(r"<\|.*?\|>", "", text).strip()
+
+    def _transcribe_sensevoice_file(
+        self,
+        audio_path: str,
+        hotwords: str = "",
+        enable_itn: bool = False,
+        enable_vad: bool = False,
+        sample_rate: int = 16000,
+    ) -> str:
+        """使用SenseVoiceSmall转录音频文件。"""
+        result = self.offline_model.generate(
+            input=audio_path,
+            language=settings.SENSEVOICE_LANGUAGE,
+            use_itn=enable_itn,
+            batch_size_s=60,
+            merge_vad=enable_vad,
+            hotword=hotwords if hotwords else None,
+            cache={},
+        )
+
+        if not result:
+            return ""
+
+        text = result[0].get("text", "").strip()
+        text = self._postprocess_sensevoice_text(text)
+
+        if enable_itn and text:
+            # SenseVoice use_itn已优先处理；这里仅复用现有轻量规则兜底。
+            text = apply_itn_to_text(text)
+
+        return text
+
+    def transcribe_array(
+        self,
+        audio_array: np.ndarray,
+        sample_rate: int = 16000,
+        enable_itn: bool = False,
+        enable_vad: bool = False,
+    ) -> str:
+        """转录内存中的float32音频，供窗口化伪流式会话使用。"""
+        if not self.offline_model:
+            raise DefaultServerErrorException("离线模型未加载，无法转录音频窗口")
+
+        import soundfile as sf
+
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+                temp_path = temp_file.name
+            sf.write(temp_path, audio_array, sample_rate)
+            return self.transcribe_file(
+                temp_path,
+                enable_itn=enable_itn,
+                enable_vad=enable_vad,
+                sample_rate=sample_rate,
+            )
+        finally:
+            if temp_path:
+                cleanup_temp_file(temp_path)
+
+    def create_streaming_session(self, params: Dict[str, Any]):
+        """创建ASR流式会话，隐藏模型族差异。"""
+        if self.family == "sensevoice" or self.streaming_strategy == "windowed_offline":
+            if not self.offline_model:
+                raise DefaultServerErrorException("SenseVoice流式会话需要离线模型")
+            from .streaming import SenseVoiceWindowedStreamingSession
+
+            return SenseVoiceWindowedStreamingSession(self, params)
+
+        if self.realtime_model:
+            from .streaming import ParaformerStreamingSession
+
+            return ParaformerStreamingSession(self, params)
+
+        raise DefaultServerErrorException("当前ASR引擎不支持实时识别")
+
     def transcribe_websocket(
         self,
         audio_chunk: bytes,
@@ -371,6 +480,14 @@ class FunASREngine(RealTimeASREngine):
     def device(self) -> str:
         """获取设备信息"""
         return self._device
+
+    @property
+    def supports_realtime(self) -> bool:
+        """原生流式或窗口化离线适配都可支撑WebSocket实时协议。"""
+        return self.realtime_model is not None or (
+            self.streaming_strategy == "windowed_offline"
+            and self.offline_model is not None
+        )
 
 
 class DolphinEngine(BaseASREngine):

@@ -7,7 +7,9 @@
             "languages": [
                 "zh"
             ],
-            "default": true,
+            "default": false,
+            "family": "paraformer",
+            "streaming_strategy": "native_online",
             "supports_realtime": true,
             "models": {
                 "offline": "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
@@ -22,7 +24,10 @@
                 "zh",
                 "en"
             ],
-            "supports_realtime": false,
+            "default": true,
+            "family": "sensevoice",
+            "streaming_strategy": "windowed_offline",
+            "supports_realtime": true,
             "models": {
                 "offline": "iic/SenseVoiceSmall"
             }

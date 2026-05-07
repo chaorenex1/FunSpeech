@@ -108,6 +108,8 @@ def create_app() -> FastAPI:
             "description": settings.APP_DESCRIPTION,
             "endpoints": {
                 "asr": "/stream/v1/asr",
+                "async_asr_submit": "/rest/v1/asr/async",
+                "async_asr_query": "/rest/v1/asr/async",
                 "asr_models": "/stream/v1/asr/models",
                 "asr_health": "/stream/v1/asr/health",
                 "tts": "/stream/v1/tts",
@@ -120,6 +122,13 @@ def create_app() -> FastAPI:
                 "async_tts_query": "/rest/v1/tts/async",
                 "ws_tts": "/ws/v1/tts",
                 "ws_tts_test": "/ws/v1/tts/test",
+                "ws_realtime_voice": "/ws/v1/realtime/voice",
+                "voice_design": "/voices/v1/voice-design",
+                "voices_list": "/voices/v1/list",
+                "voices_register": "/voices/v1/register",
+                "voices_update": "/voices/v1/update",
+                "voices_delete": "/voices/v1/delete",
+                "voices_refresh": "/voices/v1/refresh",
                 "docs": settings.docs_url or "禁用",
             },
         }

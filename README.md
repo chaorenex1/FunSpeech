@@ -48,6 +48,31 @@ docker-compose up -d
 
 > 💡 详细部署说明(包括 CPU/GPU 版本区别、环境变量配置)请查看 [部署指南](./docs/deployment.md)
 
+### 服务器本地构建/打包
+
+在服务器源码目录中可直接用脚本构建镜像并导出 `tar.gz` 包:
+
+```bash
+# CPU 镜像: funspeech:latest -> dist/funspeech-latest.tar.gz
+bash scripts/build-docker.sh cpu
+
+# GPU 镜像: funspeech:gpu-latest -> dist/funspeech-gpu-latest.tar.gz
+bash scripts/build-docker.sh gpu
+
+# 同时构建 CPU + GPU
+bash scripts/build-docker.sh all
+```
+
+常用参数:
+
+```bash
+# 指定镜像名/版本并推送到镜像仓库
+bash scripts/build-docker.sh all --image docker.cnb.cool/nexa/funspeech --tag v1.0.0 --gpu-tag gpu-v1.0.0 --push
+
+# 只构建镜像,不导出 tar.gz
+bash scripts/build-docker.sh cpu --no-save
+```
+
 ### 数据持久化
 
 FunSpeech 会在以下目录存储持久化数据:
@@ -300,24 +325,24 @@ curl -X POST "http://localhost:8000/stream/v1/tts" \
 
 | 模型名称                    | 加载模式           | 大小  | 说明                               | ModelScope 链接                                                                                         |
 | --------------------------- | ------------------ | ----- | ---------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| **Paraformer Large (离线)** | `offline` / `all`  | 848MB | 高精度中文离线识别,默认模型        | https://www.modelscope.cn/models/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch |
-| **Paraformer Large (流式)** | `realtime` / `all` | 848MB | 高精度中文实时流式识别             | https://www.modelscope.cn/models/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online  |
-| **SenseVoice Small**        | 按需加载           | 897MB | 多语言识别、情感辨识、音频事件检测 | https://www.modelscope.cn/models/iic/SenseVoiceSmall                                                    |
+| **SenseVoice Small**        | `offline` / `realtime` / `all` | 897MB | 默认模型；离线识别 + VAD 驱动窗口化伪流式实时识别 | https://www.modelscope.cn/models/iic/SenseVoiceSmall                                                    |
+| **Paraformer Large (离线)** | 按需加载  | 848MB | 兼容的中文离线识别模型        | https://www.modelscope.cn/models/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch |
+| **Paraformer Large (流式)** | 按需加载 | 848MB | 兼容的中文实时流式识别             | https://www.modelscope.cn/models/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online  |
 | **Dolphin Small**           | 按需加载           | 600MB | 轻量级多语言识别模型               | https://www.modelscope.cn/models/DataoceanAI/dolphin-small                                              |
 
 **模式说明:**
 
-- `ASR_MODEL_MODE=realtime` - 仅加载实时流式模型 (~848MB)
-- `ASR_MODEL_MODE=offline` - 仅加载离线模型 (~848MB,默认 Paraformer Large)
-- `ASR_MODEL_MODE=all` - 加载全部模型 (~1.7GB,包含离线+流式)
+- `ASR_MODEL_MODE=realtime` - 默认加载 SenseVoiceSmall 离线模型，并通过 `ASR_STREAMING_STRATEGY=windowed_offline` 提供 WebSocket 实时协议
+- `ASR_MODEL_MODE=offline` - 仅加载离线模型 (~897MB,默认 SenseVoiceSmall)
+- `ASR_MODEL_MODE=all` - 加载默认模型可用形态；SenseVoiceSmall 没有独立 realtime 权重
 
 **自定义模型预加载:**
 
-默认情况下，Paraformer Large 会在启动时自动加载。如果需要在启动时预加载其他模型（如 SenseVoice、Dolphin），可以使用 `AUTO_LOAD_CUSTOM_ASR_MODELS` 环境变量：
+默认情况下，SenseVoiceSmall 会在启动时自动加载。如果需要在启动时预加载其他模型（如 Paraformer、Dolphin），可以使用 `AUTO_LOAD_CUSTOM_ASR_MODELS` 环境变量：
 
 ```bash
 # 预加载单个自定义模型
-export AUTO_LOAD_CUSTOM_ASR_MODELS="sensevoice-small"
+export AUTO_LOAD_CUSTOM_ASR_MODELS="paraformer-large"
 
 # 预加载多个自定义模型（逗号分隔）
 export AUTO_LOAD_CUSTOM_ASR_MODELS="sensevoice-small,dolphin-small"
@@ -358,11 +383,11 @@ modelscope download --model iic/CosyVoice2-0.5B
 **下载 ASR 模型:**
 
 ```bash
-# 离线模型 (ASR_MODEL_MODE=offline 或 all)
-modelscope download --model iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch
+# 默认离线/实时协议模型
 modelscope download --model iic/SenseVoiceSmall
 
-# 流式模型 (ASR_MODEL_MODE=realtime 或 all)
+# 可选兼容模型
+modelscope download --model iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch
 modelscope download --model iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online
 ```
 
@@ -387,8 +412,8 @@ modelscope download --model iic/speech_fsmn_vad_zh-cn-16k-common-pytorch
 
 | 场景           | 环境变量配置                                             | 所需模型                   | 总大小 |
 | -------------- | -------------------------------------------------------- | -------------------------- | ------ |
-| **最小部署**   | `TTS_MODEL_MODE=sft`<br>`ASR_MODEL_MODE=offline`  | 1 个 TTS + 离线 ASR + 辅助 | ~7GB   |
-| **实时流式**   | `TTS_MODEL_MODE=sft`<br>`ASR_MODEL_MODE=realtime` | 1 个 TTS + 流式 ASR + 辅助 | ~7GB   |
+| **最小部署**   | `TTS_MODEL_MODE=sft`<br>`ASR_MODEL_MODE=offline`  | 1 个 TTS + SenseVoiceSmall + 辅助 | ~7GB   |
+| **实时流式**   | `TTS_MODEL_MODE=sft`<br>`ASR_MODEL_MODE=realtime` | 1 个 TTS + SenseVoiceSmall + FSMN VAD + 辅助 | ~7GB   |
 | **完整 TTS**   | `TTS_MODEL_MODE=all`<br>`ASR_MODEL_MODE=offline`         | 2 个 TTS + 离线 ASR + 辅助 | ~12GB  |
 | **全功能部署** | `TTS_MODEL_MODE=all`<br>`ASR_MODEL_MODE=all`             | 全部模型                   | ~14GB  |
 

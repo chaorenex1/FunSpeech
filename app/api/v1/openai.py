@@ -107,13 +107,14 @@ async def openai_compatible_tts(request_body: OpenAITTSRequest, request: Request
         # 统一语音合成（使用线程池执行，避免阻塞事件循环）
         output_path = await run_sync(
             tts_engine.synthesize_speech,
-            clean_text,
-            request_body.voice,
-            request_body.speed,
-            request_body.response_format,
-            sample_rate,
-            50,  # 默认音量
-            request_body.instructions or "",  # 将instructions映射到prompt
+            text=clean_text,
+            voice=request_body.voice,
+            speed=request_body.speed,
+            format=request_body.response_format,
+            sample_rate=sample_rate,
+            volume=50,  # 默认音量
+            pitch_rate=0,
+            prompt=request_body.instructions or "",  # 将instructions映射到prompt
         )
 
         logger.debug(f"[{task_id}] OpenAI兼容接口合成完成: {output_path}")

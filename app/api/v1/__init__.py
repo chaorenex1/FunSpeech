@@ -8,6 +8,9 @@ from .openai import router as openai_router
 from .websocket_tts import router as websocket_tts_router
 from .websocket_asr import router as websocket_asr_router
 from .async_tts import router as async_tts_router
+from .async_asr import router as async_asr_router
+from .voices import router as voices_router
+from .realtime_voice import router as realtime_voice_router
 
 api_router = APIRouter()
 
@@ -17,3 +20,6 @@ api_router.include_router(openai_router)
 api_router.include_router(websocket_tts_router)
 api_router.include_router(websocket_asr_router)
 api_router.include_router(async_tts_router)
+api_router.include_router(async_asr_router)
+api_router.include_router(voices_router)
+api_router.include_router(realtime_voice_router)
