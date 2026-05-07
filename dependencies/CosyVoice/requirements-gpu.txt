@@ -34,6 +34,6 @@ wget==3.2
 # tqdm==4.67.1
 
 # GPU推理依赖
-tensorrt-cu12==10.13.3.9
-tensorrt-cu12-bindings==10.13.3.9
-tensorrt-cu12-libs==10.13.3.9
+tensorrt-cu12==10.0.1
+tensorrt-cu12-bindings==10.0.1
+tensorrt-cu12-libs==10.0.1
