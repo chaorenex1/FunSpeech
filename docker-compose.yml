@@ -1,6 +1,6 @@
 services:
   funspeech:
-    image: docker.cnb.cool/nexa/funspeech:latest
+    image: funspeech:latest
     container_name: funspeech
     ports:
       - "8000:8000"
