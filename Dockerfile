@@ -49,7 +49,8 @@ RUN git clone --depth 1 https://github.com/FunAudioLLM/CosyVoice.git "$COSYVOICE
     done
 
 COPY dependencies/CosyVoice/requirements-cpu.txt /tmp/requirements-cosyvoice.txt
-RUN pip install --no-cache-dir --no-build-isolation -r /tmp/requirements-cosyvoice.txt
+RUN pip install --no-cache-dir --no-build-isolation -r /tmp/requirements-cosyvoice.txt \
+    && python -c "import ruamel.yaml; from hyperpyyaml import load_hyperpyyaml; from cosyvoice.cli.cosyvoice import CosyVoice, CosyVoice2, CosyVoice3; print('CosyVoice import smoke ok')"
 
 # Clean apt packages and cache
 RUN apt remove -y build-essential git && apt autoremove -y \
