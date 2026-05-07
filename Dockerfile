@@ -27,8 +27,13 @@ RUN pip install --no-cache-dir --upgrade pip \
 COPY dependencies/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
+RUN python -m pip install --no-cache-dir --upgrade \
+    "pip<25" \
+    "setuptools==80.9.0" \
+    wheel
+
 COPY dependencies/CosyVoice/requirements-cpu.txt /tmp/requirements-cosyvoice.txt
-RUN pip install --no-cache-dir -r /tmp/requirements-cosyvoice.txt
+RUN pip install --no-cache-dir --no-build-isolation -r /tmp/requirements-cosyvoice.txt
 
 # Clean apt packages and cache
 RUN apt remove -y build-essential && apt autoremove -y \
