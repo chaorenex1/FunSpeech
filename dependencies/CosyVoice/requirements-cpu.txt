@@ -1,5 +1,6 @@
 # CosyVoice 推理运行时依赖
-
+setuptools==80.9.0
+wheel
 # 核心模型加载与配置
 conformer==0.3.2
 diffusers==0.29.0
