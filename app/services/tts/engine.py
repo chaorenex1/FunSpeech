@@ -3,6 +3,7 @@
 TTS引擎模块
 """
 
+import os
 import sys
 import logging
 import threading
@@ -95,15 +96,24 @@ class CosyVoiceTTSEngine:
 
     def _setup_paths(self):
         """设置第三方库路径"""
-        # 添加CosyVoice路径到Python路径
-        cosyvoice_path = Path(__file__).parent / "third_party" / "CosyVoice"
-        if cosyvoice_path.exists():
-            sys.path.insert(0, str(cosyvoice_path))
+        candidate_paths = [
+            Path(p)
+            for p in (
+                settings.BASE_DIR / "app" / "services" / "tts" / "third_party" / "CosyVoice",
+                Path(os.getenv("COSYVOICE_HOME", "/opt/CosyVoice")),
+            )
+        ]
 
-        # 添加Matcha-TTS路径到Python路径
-        matcha_path = cosyvoice_path / "third_party" / "Matcha-TTS"
-        if matcha_path.exists():
-            sys.path.insert(0, str(matcha_path))
+        for cosyvoice_path in candidate_paths:
+            if cosyvoice_path.exists():
+                sys.path.insert(0, str(cosyvoice_path))
+
+                matcha_path = cosyvoice_path / "third_party" / "Matcha-TTS"
+                if matcha_path.exists():
+                    sys.path.insert(0, str(matcha_path))
+                return
+
+        logger.warning("未找到CosyVoice源码目录，后续导入cosyvoice可能失败")
 
     def _load_models(self):
         """加载TTS模型"""

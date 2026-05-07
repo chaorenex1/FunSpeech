@@ -6,14 +6,12 @@ usage() {
 Usage:
   scripts/build-docker.sh [cpu|gpu|all] [options]
 
-Build FunSpeech Docker images on a server and optionally export them as tarballs.
+Build FunSpeech Docker images on a server.
 
 Options:
   --image NAME      Image repository/name. Default: funspeech
   --tag TAG         CPU image tag. Default: latest
   --gpu-tag TAG     GPU image tag. Default: gpu-latest
-  --output DIR      Tarball output directory. Default: dist
-  --no-save         Only build images; do not write docker save tarballs
   --push            Push built images after build
   --no-cache        Build without Docker layer cache
   -h, --help        Show this help
@@ -21,7 +19,7 @@ Options:
 Examples:
   scripts/build-docker.sh cpu
   scripts/build-docker.sh gpu --image docker.cnb.cool/nexa/funspeech --push
-  TAG=v1.2.0 scripts/build-docker.sh all --output /tmp/funspeech-images
+  TAG=v1.2.0 scripts/build-docker.sh all
 EOF
 }
 
@@ -29,8 +27,6 @@ variant="cpu"
 image_name="${IMAGE_NAME:-funspeech}"
 cpu_tag="${TAG:-latest}"
 gpu_tag="${GPU_TAG:-gpu-latest}"
-output_dir="${OUTPUT_DIR:-dist}"
-save_image="${SAVE_IMAGE:-1}"
 push_image="${PUSH_IMAGE:-0}"
 no_cache="${NO_CACHE:-0}"
 
@@ -52,14 +48,6 @@ while [[ $# -gt 0 ]]; do
     --gpu-tag)
       gpu_tag="${2:?--gpu-tag requires a value}"
       shift 2
-      ;;
-    --output)
-      output_dir="${2:?--output requires a value}"
-      shift 2
-      ;;
-    --no-save)
-      save_image="0"
-      shift
       ;;
     --push)
       push_image="1"
@@ -101,9 +89,6 @@ if [[ "$no_cache" == "1" ]]; then
   build_args+=(--no-cache)
 fi
 
-safe_name="${image_name//\//_}"
-safe_name="${safe_name//:/_}"
-
 build_one() {
   local label="$1"
   local dockerfile="$2"
@@ -112,13 +97,6 @@ build_one() {
 
   echo "==> Building ${label} image: ${image_ref}"
   docker build "${build_args[@]}" -t "$image_ref" -f "$dockerfile" .
-
-  if [[ "$save_image" == "1" ]]; then
-    mkdir -p "$output_dir"
-    local tarball="${output_dir}/${safe_name}-${tag}.tar.gz"
-    echo "==> Saving ${image_ref} to ${tarball}"
-    docker save "$image_ref" | gzip -c > "$tarball"
-  fi
 
   if [[ "$push_image" == "1" ]]; then
     echo "==> Pushing ${image_ref}"
