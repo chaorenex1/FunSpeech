@@ -35,8 +35,7 @@ RUN python -m pip install --no-cache-dir --upgrade \
     "pip<25" \
     "setuptools==80.9.0" \
     wheel \
-    packaging \
-    nvidia-stub
+    packaging
 
 # CosyVoice is not distributed as a normal PyPI package; install its source tree
 # into PYTHONPATH so `from cosyvoice...` works at runtime.
