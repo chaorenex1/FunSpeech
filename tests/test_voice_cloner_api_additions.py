@@ -394,6 +394,61 @@ def test_realtime_voice_websocket_supports_internal_asr_tts_pipeline(monkeypatch
         assert completed["event"] == "tts_completed"
 
 
+def test_realtime_voice_session_pins_multigpu_asr_session_engine(monkeypatch):
+    import app.api.v1.realtime_voice as realtime_voice_api
+
+    class FakeStreamingSession:
+        pass
+
+    class FakeSingleASREngine:
+        def __init__(self):
+            self.params = None
+
+        def create_streaming_session(self, params):
+            self.params = params
+            return FakeStreamingSession()
+
+    class FakeMultiASREngine:
+        def __init__(self):
+            self.engine = FakeSingleASREngine()
+            self.released = []
+
+        def get_engine_for_session(self):
+            return 2, self.engine
+
+        def release_session_engine(self, index):
+            self.released.append(index)
+
+    class FakeASRService:
+        def __init__(self, engine):
+            self.engine = engine
+
+        def _ensure_asr_engine(self):
+            return self.engine
+
+    fake_multi_engine = FakeMultiASREngine()
+    monkeypatch.setattr(
+        realtime_voice_api,
+        "get_aliyun_websocket_asr_service",
+        lambda: FakeASRService(fake_multi_engine),
+    )
+    monkeypatch.setattr(
+        realtime_voice_api,
+        "get_aliyun_websocket_tts_service",
+        lambda: object(),
+    )
+
+    session = realtime_voice_api.RealtimeVoiceAsrTtsSession("desktop_voice")
+
+    assert isinstance(session.streaming_session, FakeStreamingSession)
+    assert session.session_asr_engine is fake_multi_engine.engine
+    assert fake_multi_engine.engine.params["sample_rate"] == 16000
+
+    session.close()
+    session.close()
+    assert fake_multi_engine.released == [2]
+
+
 def test_websocket_asr_messages_include_voice_cloner_fields():
     service = AliyunWebSocketASRService()
     sent = []

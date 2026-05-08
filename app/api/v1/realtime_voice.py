@@ -54,15 +54,39 @@ class RealtimeVoiceAsrTtsSession:
             "enable_voice_detection": True,
         }
         asr_engine = self.asr_service._ensure_asr_engine()
-        if hasattr(asr_engine, "create_streaming_session"):
-            self.streaming_session = asr_engine.create_streaming_session(self.asr_params)
+        self.asr_engine = asr_engine
+        self.asr_engine_index = None
+        if hasattr(asr_engine, "get_engine_for_session") and hasattr(
+            asr_engine, "release_session_engine"
+        ):
+            self.asr_engine_index, self.session_asr_engine = (
+                asr_engine.get_engine_for_session()
+            )
+        else:
+            self.session_asr_engine = asr_engine
+
+        if hasattr(self.session_asr_engine, "create_streaming_session"):
+            self.streaming_session = self.session_asr_engine.create_streaming_session(
+                self.asr_params
+            )
         else:
             self.streaming_session = None
+        self._closed = False
         self.audio_buffer = np.array([], dtype=np.float32)
         self.audio_cache = {}
         self.punc_cache = {}
         self.audio_time = 0
         self.last_text = ""
+
+    def close(self):
+        """Release a session-pinned ASR engine selected from a multi-GPU wrapper."""
+        if self._closed:
+            return
+        self._closed = True
+        if self.asr_engine_index is not None and hasattr(
+            self.asr_engine, "release_session_engine"
+        ):
+            self.asr_engine.release_session_engine(self.asr_engine_index)
 
     async def process_audio(self, websocket: WebSocket, task_id: str, audio: bytes) -> bool:
         """Process one audio chunk and emit ASR/TTS events.
@@ -148,6 +172,7 @@ class RealtimeVoiceAsrTtsSession:
             self.audio_time,
             task_id,
             is_final=False,
+            session_engine=self.session_asr_engine,
         )
         return (result_text or "").strip()
 
@@ -242,6 +267,8 @@ async def realtime_voice_endpoint(websocket: WebSocket):
                 pipeline = data.get("pipeline") or data.get("mode") or "asr_tts"
                 if pipeline == "passthrough":
                     pipeline = "asr_tts"
+                if asr_tts_session is not None and hasattr(asr_tts_session, "close"):
+                    asr_tts_session.close()
                 asr_tts_session = RealtimeVoiceAsrTtsSession(
                     voice_name=voice_name,
                     audio_format=data.get("format", "pcm"),
@@ -289,6 +316,8 @@ async def realtime_voice_endpoint(websocket: WebSocket):
         except Exception:
             pass
     finally:
+        if asr_tts_session is not None and hasattr(asr_tts_session, "close"):
+            asr_tts_session.close()
         try:
             await websocket.close()
         except Exception:
