@@ -17,6 +17,7 @@ from ...services.websocket_asr import get_aliyun_websocket_asr_service
 from ...services.websocket_tts import get_aliyun_websocket_tts_service
 from ...services.realtime_voice.audio_pacer import AudioPacer
 from ...services.realtime_voice.backpressure import BoundedAudioQueue, TtsJobQueue
+from ...services.realtime_voice.events import RealtimeVoiceEventBuilder
 from ...services.realtime_voice.text_commit import StableTextCommitter
 from ...services.realtime_voice.types import AudioFrame, AsrHypothesis, TtsJob
 
@@ -25,14 +26,24 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/ws/v1/realtime", tags=["Realtime Voice"])
 
 
-async def _send_error(websocket: WebSocket, task_id: str, message: str):
+async def _send_error(
+    websocket: WebSocket,
+    task_id: str,
+    message: str,
+    event_builder: RealtimeVoiceEventBuilder | None = None,
+):
+    if event_builder is not None:
+        await websocket.send_json(
+            event_builder.build(
+                "session.error",
+                status=40000003,
+                payload={"message": message},
+                message=message,
+            )
+        )
+        return
     await websocket.send_json(
-        {
-            "event": "error",
-            "task_id": task_id,
-            "status": 40000003,
-            "message": message,
-        }
+        {"event": "error", "task_id": task_id, "status": 40000003, "message": message}
     )
 
 
@@ -45,6 +56,7 @@ class RealtimeVoiceAsrTtsSession:
         audio_format: str = "pcm",
         sample_rate: int = 16000,
         parameters: dict | None = None,
+        event_builder: RealtimeVoiceEventBuilder | None = None,
     ):
         self.voice_name = voice_name
         self.audio_format = (audio_format or "pcm").lower()
@@ -99,8 +111,13 @@ class RealtimeVoiceAsrTtsSession:
         self._tasks: list[asyncio.Task] = []
         self._websocket: WebSocket | None = None
         self._task_id: str | None = None
+        self._event_builder = event_builder
         self._send_lock = asyncio.Lock()
         self._started = False
+        self._utterance_index = 1
+        self._hypothesis_index = 0
+        self._audio_chunk_index = 0
+        self.config_version = 1
 
     def close(self):
         """Cancel workers and release a session-pinned ASR engine."""
@@ -128,10 +145,18 @@ class RealtimeVoiceAsrTtsSession:
         self._started = True
         self._websocket = websocket
         self._task_id = task_id
+        if self._event_builder is None:
+            self._event_builder = RealtimeVoiceEventBuilder(task_id)
         self._tasks = [
             asyncio.create_task(self._audio_worker(), name=f"{task_id}:realtime-asr"),
             asyncio.create_task(self._tts_worker(), name=f"{task_id}:realtime-tts"),
         ]
+
+    def update_parameters(self, parameters: dict) -> int:
+        """Update runtime parameters and return the new config version."""
+        self.parameters.update(parameters)
+        self.config_version += 1
+        return self.config_version
 
     async def accept_audio(self, audio: bytes) -> bool:
         """Queue audio for async ASR/TTS processing without blocking reception."""
@@ -141,14 +166,22 @@ class RealtimeVoiceAsrTtsSession:
         frame = self._build_audio_frame(audio)
         for event in await self.audio_queue.put(frame):
             await self._send_json(
-                {
-                    "event": "backpressure",
-                    "type": event.type,
-                    "task_id": self._task_id,
-                    "queue_ms": event.queue_ms,
-                    "dropped_ms": event.dropped_ms,
-                    "message": event.message,
-                }
+                self._event(
+                    "backpressure.applied",
+                    payload={
+                        "scope": "input",
+                        "level": "warning",
+                        "reason": event.type,
+                        "queue_ms": event.queue_ms,
+                        "dropped_ms": event.dropped_ms,
+                        "action": event.type,
+                        "message": event.message,
+                    },
+                    type=event.type,
+                    queue_ms=event.queue_ms,
+                    dropped_ms=event.dropped_ms,
+                    message=event.message,
+                )
             )
         return True
 
@@ -167,12 +200,16 @@ class RealtimeVoiceAsrTtsSession:
         while not self._closed:
             frame = await self.audio_queue.get()
             await self._send_json(
-                {
-                    "event": "pipeline_stage",
-                    "stage": "asr_receiving_audio",
-                    "task_id": self._task_id,
-                    "queue_ms": self.audio_queue.queued_ms,
-                }
+                self._event(
+                    "input.audio_dequeued",
+                    payload={
+                        "queue_ms": self.audio_queue.queued_ms,
+                        "duration_ms": frame.duration_ms,
+                        "is_silence": frame.is_silence,
+                    },
+                    stage="asr_receiving_audio",
+                    queue_ms=self.audio_queue.queued_ms,
+                )
             )
             events = await self._transcribe_events(frame.payload, self._task_id)
             for asr_event in events:
@@ -182,17 +219,52 @@ class RealtimeVoiceAsrTtsSession:
         assert self._task_id is not None
         if not hypothesis.text:
             return
+        self._hypothesis_index += 1
+        utterance_id = self._current_utterance_id()
+        hypothesis_id = f"{utterance_id}_hyp_{self._hypothesis_index}"
         await self._send_json(
-            {
-                "event": "asr_result",
-                "stage": "asr_text_received",
-                "task_id": self._task_id,
-                "text": hypothesis.text,
-                "is_final": hypothesis.is_final,
-            }
+            self._event(
+                "asr.hypothesis",
+                payload={
+                    "utterance_id": utterance_id,
+                    "hypothesis_id": hypothesis_id,
+                    "text": hypothesis.text,
+                    "is_final": hypothesis.is_final,
+                    "time_ms": hypothesis.time_ms,
+                },
+            )
+        )
+        await self._send_json(
+            self._event(
+                "asr_result",
+                payload={
+                    "protocol_event": "asr.hypothesis",
+                    "utterance_id": utterance_id,
+                    "hypothesis_id": hypothesis_id,
+                    "text": hypothesis.text,
+                    "is_final": hypothesis.is_final,
+                },
+                stage="asr_text_received",
+                text=hypothesis.text,
+                is_final=hypothesis.is_final,
+            )
         )
         committed = self.text_committer.update(hypothesis)
         if committed:
+            tts_job_id = f"tts_{committed.revision_id}"
+            await self._send_json(
+                self._event(
+                    "asr.text_committed",
+                    payload={
+                        "utterance_id": utterance_id,
+                        "revision_id": committed.revision_id,
+                        "delta_text": committed.text,
+                        "full_text": committed.full_text,
+                        "is_final": committed.is_final,
+                        "tts_job_id": tts_job_id,
+                    },
+                )
+            )
             job = TtsJob(
                 revision_id=committed.revision_id,
                 text=committed.text,
@@ -202,31 +274,67 @@ class RealtimeVoiceAsrTtsSession:
             )
             for event in await self.tts_jobs.put(job):
                 await self._send_json(
-                    {
-                        "event": "backpressure",
-                        "type": event.type,
-                        "task_id": self._task_id,
-                        "message": event.message,
-                    }
+                    self._event(
+                        "backpressure.applied",
+                        payload={
+                            "scope": "tts",
+                            "level": "warning",
+                            "reason": event.type,
+                            "action": event.type,
+                            "message": event.message,
+                        },
+                        type=event.type,
+                        message=event.message,
+                    )
                 )
+            await self._send_json(
+                self._event(
+                    "tts.job_queued",
+                    payload={
+                        "tts_job_id": tts_job_id,
+                        "revision_id": committed.revision_id,
+                        "utterance_id": utterance_id,
+                        "text": committed.text,
+                        "voice_name": self.voice_name,
+                        "config_version": self.config_version,
+                        "priority": job.priority,
+                    },
+                )
+            )
         if hypothesis.is_final:
+            await self._send_json(
+                self._event(
+                    "asr.sentence_finalized",
+                    payload={"utterance_id": utterance_id, "text": hypothesis.text},
+                )
+            )
             self.text_committer.reset_sentence()
+            self._utterance_index += 1
 
     async def _tts_worker(self) -> None:
         assert self._websocket is not None
         assert self._task_id is not None
         while not self._closed:
             job = await self.tts_jobs.get()
+            tts_job_id = f"tts_{job.revision_id}"
             await self._send_json(
-                {
-                    "event": "pipeline_stage",
-                    "stage": "tts_synthesizing",
-                    "task_id": self._task_id,
-                    "text": job.text,
-                    "revision_id": job.revision_id,
-                }
+                self._event(
+                    "tts.job_started",
+                    payload={
+                        "tts_job_id": tts_job_id,
+                        "revision_id": job.revision_id,
+                        "text": job.text,
+                        "voice_name": job.voice_name,
+                        "config_version": self.config_version,
+                        "priority": job.priority,
+                    },
+                    stage="tts_synthesizing",
+                    text=job.text,
+                    revision_id=job.revision_id,
+                )
             )
             emitted = False
+            first_audio_sent = False
             async for chunk in self._synthesize(
                 job.text,
                 self._websocket,
@@ -237,19 +345,84 @@ class RealtimeVoiceAsrTtsSession:
                 if not chunk:
                     continue
                 async for frame in self.audio_pacer.iter_frames(chunk):
+                    self._audio_chunk_index += 1
+                    if not first_audio_sent:
+                        await self._send_json(
+                            self._event(
+                                "tts.first_audio",
+                                payload={
+                                    "tts_job_id": tts_job_id,
+                                    "revision_id": job.revision_id,
+                                    "audio_chunk_index": self._audio_chunk_index,
+                                },
+                            )
+                        )
+                        first_audio_sent = True
+                    await self._send_json(
+                        self._event(
+                            "tts.audio_chunk",
+                            payload={
+                                "tts_job_id": tts_job_id,
+                                "revision_id": job.revision_id,
+                                "audio_chunk_index": self._audio_chunk_index,
+                                "bytes": len(frame),
+                                "sample_rate": self.sample_rate,
+                                "format": "PCM",
+                            },
+                        )
+                    )
                     await self._send_bytes(frame)
                     emitted = True
             async for frame in self.audio_pacer.flush():
+                self._audio_chunk_index += 1
+                if not first_audio_sent:
+                    await self._send_json(
+                        self._event(
+                            "tts.first_audio",
+                            payload={
+                                "tts_job_id": tts_job_id,
+                                "revision_id": job.revision_id,
+                                "audio_chunk_index": self._audio_chunk_index,
+                            },
+                        )
+                    )
+                    first_audio_sent = True
+                await self._send_json(
+                    self._event(
+                        "tts.audio_chunk",
+                        payload={
+                            "tts_job_id": tts_job_id,
+                            "revision_id": job.revision_id,
+                            "audio_chunk_index": self._audio_chunk_index,
+                            "bytes": len(frame),
+                            "sample_rate": self.sample_rate,
+                            "format": "PCM",
+                        },
+                    )
+                )
                 await self._send_bytes(frame)
                 emitted = True
             if emitted:
                 await self._send_json(
-                    {
-                        "event": "tts_completed",
-                        "stage": "tts_audio_sent",
-                        "task_id": self._task_id,
-                        "revision_id": job.revision_id,
-                    }
+                    self._event(
+                        "tts.job_completed",
+                        payload={
+                            "tts_job_id": tts_job_id,
+                            "revision_id": job.revision_id,
+                        },
+                    )
+                )
+                await self._send_json(
+                    self._event(
+                        "tts_completed",
+                        payload={
+                            "protocol_event": "tts.job_completed",
+                            "tts_job_id": tts_job_id,
+                            "revision_id": job.revision_id,
+                        },
+                        stage="tts_audio_sent",
+                        revision_id=job.revision_id,
+                    )
                 )
 
     async def _transcribe(self, audio: bytes, task_id: str) -> str:
@@ -369,6 +542,15 @@ class RealtimeVoiceAsrTtsSession:
         async with self._send_lock:
             await self._websocket.send_bytes(payload)
 
+    def _event(self, event: str, *, payload: dict | None = None, **fields) -> dict:
+        if self._event_builder is None:
+            assert self._task_id is not None
+            self._event_builder = RealtimeVoiceEventBuilder(self._task_id)
+        return self._event_builder.build(event, payload=payload, **fields)
+
+    def _current_utterance_id(self) -> str:
+        return f"utt_{self._utterance_index}"
+
 
 @router.websocket("/voice")
 async def realtime_voice_endpoint(websocket: WebSocket):
@@ -378,20 +560,26 @@ async def realtime_voice_endpoint(websocket: WebSocket):
     """
     await websocket.accept()
     task_id = generate_task_id("realtime_voice")
+    event_builder = RealtimeVoiceEventBuilder(task_id)
     voice_name = ""
     parameters = {}
     pipeline = "passthrough"
     asr_tts_session = None
 
     await websocket.send_json(
-        {
-            "event": "session_started",
-            "task_id": task_id,
-            "status": 20000000,
-            "audio_mode": "asr_tts_pipeline",
-            "supported_pipelines": ["asr_tts"],
-            "pipeline_aliases": {"passthrough": "asr_tts"},
-        }
+        event_builder.build(
+            "session_started",
+            payload={
+                "protocol_event": "session.started",
+                "audio_mode": "asr_tts_pipeline",
+                "supported_pipelines": ["asr_tts"],
+                "pipeline_aliases": {"passthrough": "asr_tts"},
+            },
+            protocol_event="session.started",
+            audio_mode="asr_tts_pipeline",
+            supported_pipelines=["asr_tts"],
+            pipeline_aliases={"passthrough": "asr_tts"},
+        )
     )
 
     try:
@@ -402,10 +590,12 @@ async def realtime_voice_endpoint(websocket: WebSocket):
 
             if "bytes" in message and message["bytes"] is not None:
                 if not voice_name:
-                    await _send_error(websocket, task_id, "请先发送configure事件设置voice_name")
+                    await _send_error(
+                        websocket, task_id, "请先发送configure事件设置voice_name", event_builder
+                    )
                     continue
                 if asr_tts_session is None:
-                    await _send_error(websocket, task_id, "ASR->TTS会话未初始化")
+                    await _send_error(websocket, task_id, "ASR->TTS会话未初始化", event_builder)
                     continue
                 if hasattr(asr_tts_session, "accept_audio"):
                     if hasattr(asr_tts_session, "start"):
@@ -421,7 +611,7 @@ async def realtime_voice_endpoint(websocket: WebSocket):
             try:
                 data = json.loads(message["text"])
             except json.JSONDecodeError:
-                await _send_error(websocket, task_id, "消息必须是JSON")
+                await _send_error(websocket, task_id, "消息必须是JSON", event_builder)
                 continue
 
             event = data.get("event") or data.get("type")
@@ -435,12 +625,14 @@ async def realtime_voice_endpoint(websocket: WebSocket):
             if event in {"configure", "switch_voice"}:
                 next_voice = (data.get("voice_name") or data.get("voiceName") or "").strip()
                 if not next_voice:
-                    await _send_error(websocket, task_id, "voice_name不能为空")
+                    await _send_error(websocket, task_id, "voice_name不能为空", event_builder)
                     continue
                 tts_engine = get_tts_engine()
                 voices = tts_engine.get_voices() if hasattr(tts_engine, "get_voices") else []
                 if next_voice not in voices:
-                    await _send_error(websocket, task_id, f"voice_name不存在: {next_voice}")
+                    await _send_error(
+                        websocket, task_id, f"voice_name不存在: {next_voice}", event_builder
+                    )
                     continue
 
                 voice_name = next_voice
@@ -452,52 +644,89 @@ async def realtime_voice_endpoint(websocket: WebSocket):
                     await asr_tts_session.aclose()
                 elif asr_tts_session is not None and hasattr(asr_tts_session, "close"):
                     asr_tts_session.close()
-                asr_tts_session = RealtimeVoiceAsrTtsSession(
-                    voice_name=voice_name,
-                    audio_format=data.get("format", "pcm"),
-                    sample_rate=data.get("sample_rate", data.get("sampleRate", 16000)),
-                    parameters=parameters,
-                )
+                session_kwargs = {
+                    "voice_name": voice_name,
+                    "audio_format": data.get("format", "pcm"),
+                    "sample_rate": data.get("sample_rate", data.get("sampleRate", 16000)),
+                    "parameters": parameters,
+                }
+                try:
+                    asr_tts_session = RealtimeVoiceAsrTtsSession(
+                        **session_kwargs, event_builder=event_builder
+                    )
+                except TypeError as exc:
+                    if "event_builder" not in str(exc):
+                        raise
+                    asr_tts_session = RealtimeVoiceAsrTtsSession(**session_kwargs)
                 if hasattr(asr_tts_session, "start"):
                     asr_tts_session.start(websocket, task_id)
+                config_version = getattr(asr_tts_session, "config_version", None)
                 await websocket.send_json(
-                    {
-                        "event": "configured" if event == "configure" else "voice_switched",
-                        "task_id": task_id,
-                        "voice_name": voice_name,
-                        "format": data.get("format", "pcm"),
-                        "sample_rate": data.get("sample_rate", data.get("sampleRate", 16000)),
-                        "pipeline": pipeline,
-                        "audio_mode": "asr_tts_pipeline",
-                        "status": 20000000,
-                    }
+                    event_builder.build(
+                        "configured" if event == "configure" else "voice_switched",
+                        payload={
+                            "protocol_event": "session.configured"
+                            if event == "configure"
+                            else "session.voice_switched",
+                            "voice_name": voice_name,
+                            "format": data.get("format", "pcm"),
+                            "sample_rate": data.get("sample_rate", data.get("sampleRate", 16000)),
+                            "pipeline": pipeline,
+                            "audio_mode": "asr_tts_pipeline",
+                            "config_version": config_version,
+                        },
+                        protocol_event="session.configured"
+                        if event == "configure"
+                        else "session.voice_switched",
+                        voice_name=voice_name,
+                        format=data.get("format", "pcm"),
+                        sample_rate=data.get("sample_rate", data.get("sampleRate", 16000)),
+                        pipeline=pipeline,
+                        audio_mode="asr_tts_pipeline",
+                        config_version=config_version,
+                    )
                 )
             elif event == "update":
-                parameters.update(data.get("parameters") or data.get("params") or {})
+                next_parameters = data.get("parameters") or data.get("params") or {}
+                parameters.update(next_parameters)
+                config_version = None
                 if asr_tts_session is not None:
-                    asr_tts_session.parameters.update(data.get("parameters") or data.get("params") or {})
+                    if hasattr(asr_tts_session, "update_parameters"):
+                        config_version = asr_tts_session.update_parameters(next_parameters)
+                    else:
+                        asr_tts_session.parameters.update(next_parameters)
                 await websocket.send_json(
-                    {
-                        "event": "parameters_updated",
-                        "task_id": task_id,
-                        "voice_name": voice_name,
-                        "parameters": parameters,
-                        "status": 20000000,
-                    }
+                    event_builder.build(
+                        "parameters_updated",
+                        payload={
+                            "protocol_event": "session.parameters_updated",
+                            "voice_name": voice_name,
+                            "parameters": parameters,
+                            "config_version": config_version,
+                        },
+                        protocol_event="session.parameters_updated",
+                        voice_name=voice_name,
+                        parameters=parameters,
+                        config_version=config_version,
+                    )
                 )
             elif event in {"close", "stop"}:
                 await websocket.send_json(
-                    {"event": "session_completed", "task_id": task_id, "status": 20000000}
+                    event_builder.build(
+                        "session_completed",
+                        payload={"protocol_event": "session.completed"},
+                        protocol_event="session.completed",
+                    )
                 )
                 break
             else:
-                await _send_error(websocket, task_id, f"不支持的事件: {event}")
+                await _send_error(websocket, task_id, f"不支持的事件: {event}", event_builder)
     except WebSocketDisconnect:
         logger.info("[%s] 实时变声客户端断开", task_id)
     except Exception as exc:
         logger.error("[%s] 实时变声处理异常: %s", task_id, exc)
         try:
-            await _send_error(websocket, task_id, f"实时变声处理失败: {exc}")
+            await _send_error(websocket, task_id, f"实时变声处理失败: {exc}", event_builder)
         except Exception:
             pass
     finally:
