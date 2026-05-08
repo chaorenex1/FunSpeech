@@ -473,7 +473,7 @@ class AliyunWebSocketTTSService:
         self, text: str, voice: str, speed: float, format: str, target_sr: int, volume: int, pitch_rate: int, task_id: str, websocket, engine, prompt: str = ""
     ) -> AsyncGenerator[bytes, None]:
         """使用指定引擎的 CosyVoice2/3 进行流式合成（零样本克隆音色）"""
-        clone_version = engine._clone_model_version if hasattr(engine, '_clone_model_version') else "cosyvoice2"
+        clone_version = engine._clone_model_version if hasattr(engine, '_clone_model_version') else "cosyvoice3"
         logger.debug(f"[{task_id}] 使用 {clone_version} 流式合成零样本克隆音色: {voice}, prompt: {prompt}")
         model_sr = engine.cosyvoice_clone.sample_rate
 

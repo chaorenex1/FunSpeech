@@ -19,14 +19,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/ws/v1/realtime", tags=["Realtime Voice"])
 
 
-def _voice_available(voice_name: str) -> bool:
-    if voice_name in settings.PRESET_VOICES:
-        return True
-    tts_engine = get_tts_engine()
-    voices = tts_engine.get_voices() if hasattr(tts_engine, "get_voices") else []
-    return voice_name in voices
-
-
 async def _send_error(websocket: WebSocket, task_id: str, message: str):
     await websocket.send_json(
         {
@@ -230,10 +222,7 @@ async def realtime_voice_endpoint(websocket: WebSocket):
                 if not next_voice:
                     await _send_error(websocket, task_id, "voice_name不能为空")
                     continue
-                if not _voice_available(next_voice):
-                    await _send_error(websocket, task_id, f"voice_name不存在: {next_voice}")
-                    continue
-
+                
                 voice_name = next_voice
                 parameters.update(data.get("parameters") or {})
                 pipeline = (data.get("pipeline") or data.get("mode") or "passthrough").strip()
