@@ -187,14 +187,17 @@ async def realtime_voice_endpoint(websocket: WebSocket):
             "event": "session_started",
             "task_id": task_id,
             "status": 20000000,
-            "audio_mode": "passthrough",
-            "supported_pipelines": ["passthrough", "asr_tts"],
+            "audio_mode": "asr_tts_pipeline",
+            "supported_pipelines": ["asr_tts"],
+            "pipeline_aliases": {"passthrough": "asr_tts"},
         }
     )
 
     try:
         while True:
             message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                raise WebSocketDisconnect()
 
             if "bytes" in message and message["bytes"] is not None:
                 if not voice_name:
@@ -215,9 +218,16 @@ async def realtime_voice_endpoint(websocket: WebSocket):
                 await _send_error(websocket, task_id, "消息必须是JSON")
                 continue
 
-            event = data.get("event")
+            event = data.get("event") or data.get("type")
+            if event == "start":
+                event = "configure"
+            elif event == "update_params":
+                event = "update"
+            elif event == "update_voice":
+                event = "switch_voice"
+
             if event in {"configure", "switch_voice"}:
-                next_voice = (data.get("voice_name") or "").strip()
+                next_voice = (data.get("voice_name") or data.get("voiceName") or "").strip()
                 if not next_voice:
                     await _send_error(websocket, task_id, "voice_name不能为空")
                     continue
@@ -228,12 +238,14 @@ async def realtime_voice_endpoint(websocket: WebSocket):
                     continue
 
                 voice_name = next_voice
-                parameters.update(data.get("parameters") or {})
-                pipeline = (data.get("pipeline") or data.get("mode"))
+                parameters.update(data.get("parameters") or data.get("params") or {})
+                pipeline = data.get("pipeline") or data.get("mode") or "asr_tts"
+                if pipeline == "passthrough":
+                    pipeline = "asr_tts"
                 asr_tts_session = RealtimeVoiceAsrTtsSession(
                     voice_name=voice_name,
                     audio_format=data.get("format", "pcm"),
-                    sample_rate=data.get("sample_rate", 16000),
+                    sample_rate=data.get("sample_rate", data.get("sampleRate", 16000)),
                     parameters=parameters,
                 )
                 await websocket.send_json(
@@ -242,16 +254,16 @@ async def realtime_voice_endpoint(websocket: WebSocket):
                         "task_id": task_id,
                         "voice_name": voice_name,
                         "format": data.get("format", "pcm"),
-                        "sample_rate": data.get("sample_rate", 16000),
+                        "sample_rate": data.get("sample_rate", data.get("sampleRate", 16000)),
                         "pipeline": pipeline,
                         "audio_mode": "asr_tts_pipeline",
                         "status": 20000000,
                     }
                 )
             elif event == "update":
-                parameters.update(data.get("parameters") or {})
+                parameters.update(data.get("parameters") or data.get("params") or {})
                 if asr_tts_session is not None:
-                    asr_tts_session.parameters.update(data.get("parameters") or {})
+                    asr_tts_session.parameters.update(data.get("parameters") or data.get("params") or {})
                 await websocket.send_json(
                     {
                         "event": "parameters_updated",

@@ -15,6 +15,37 @@ from app.services.websocket_tts import AliyunWebSocketTTSService
 client = TestClient(app)
 
 
+def _patch_voice_manager_paths(monkeypatch, tmp_path):
+    import app.services.tts.clone.voice_manager as voice_manager_module
+
+    voices_dir = tmp_path / "voices"
+    spk_dir = voices_dir / "spk"
+    monkeypatch.setattr(voice_manager_module, "VOICES_DIR", voices_dir)
+    monkeypatch.setattr(
+        voice_manager_module,
+        "VOICE_REGISTRY_CONFIG",
+        voices_dir / "voice_registry.json",
+    )
+    monkeypatch.setattr(voice_manager_module, "SPK_DIR", spk_dir)
+    monkeypatch.setattr(voice_manager_module, "SPKINFO_FILE", spk_dir / "spk2info.pt")
+    return voices_dir
+
+
+class FakeCosyVoiceForRegistry:
+    def __init__(self, existing_voices=None):
+        self.frontend = type("Frontend", (), {"spk2info": dict(existing_voices or {})})()
+
+    def add_zero_shot_spk(self, reference_text, wav_file, voice_name):
+        self.frontend.spk2info[voice_name] = {
+            "reference_text": reference_text,
+            "wav_file": wav_file,
+        }
+        return True
+
+    def save_spkinfo(self):
+        pass
+
+
 class DummyVoiceManager:
     def __init__(self):
         self.voices = {
@@ -115,6 +146,52 @@ def patch_voice_engine(monkeypatch):
     return engine
 
 
+def test_voice_manager_refresh_repairs_registry_when_spkinfo_already_has_voice(
+    monkeypatch,
+    tmp_path,
+):
+    from app.services.tts.clone import VoiceManager
+
+    voices_dir = _patch_voice_manager_paths(monkeypatch, tmp_path)
+    voices_dir.mkdir(parents=True, exist_ok=True)
+    (voices_dir / "shenhenjp2.txt").write_text("参考文本", encoding="utf-8")
+    (voices_dir / "shenhenjp2.wav").write_bytes(b"fake-wav")
+    monkeypatch.setattr(VoiceManager, "_get_audio_duration", lambda *_: 2.0)
+
+    manager = VoiceManager(FakeCosyVoiceForRegistry({"shenhenjp2": {}}))
+    success, total = manager.refresh_voices()
+
+    assert (success, total) == (1, 1)
+    assert "shenhenjp2" in manager.list_clone_voices()
+    registry = json.loads(
+        (voices_dir / "voice_registry.json").read_text(encoding="utf-8")
+    )
+    assert registry["voices"]["shenhenjp2"]["audio_file"] == "shenhenjp2.wav"
+    assert registry["voices"]["shenhenjp2"]["text_file"] == "shenhenjp2.txt"
+
+
+def test_voice_manager_add_voice_persists_registry(monkeypatch, tmp_path):
+    from app.services.tts.clone import VoiceManager
+
+    voices_dir = _patch_voice_manager_paths(monkeypatch, tmp_path)
+    voices_dir.mkdir(parents=True, exist_ok=True)
+    txt_file = voices_dir / "new_voice.txt"
+    wav_file = voices_dir / "new_voice.wav"
+    txt_file.write_text("新增音色参考文本", encoding="utf-8")
+    wav_file.write_bytes(b"fake-wav")
+    monkeypatch.setattr(VoiceManager, "_validate_and_prepare_audio", lambda *_: True)
+    monkeypatch.setattr(VoiceManager, "_get_audio_duration", lambda *_: 2.0)
+
+    manager = VoiceManager(FakeCosyVoiceForRegistry())
+    manager.cosyvoice.save_spkinfo = lambda: None
+
+    assert manager.add_voice("new_voice", txt_file, wav_file) is True
+    registry = json.loads(
+        (voices_dir / "voice_registry.json").read_text(encoding="utf-8")
+    )
+    assert "new_voice" in registry["voices"]
+
+
 def test_voice_manager_sync_endpoints(monkeypatch):
     engine = patch_voice_engine(monkeypatch)
 
@@ -207,10 +284,30 @@ def test_voice_design_endpoint_returns_generated_audio_url(monkeypatch, tmp_path
 def test_realtime_voice_websocket_supports_config_update_and_audio_stream(monkeypatch):
     patch_voice_engine(monkeypatch)
 
+    class FakeRealtimeVoiceAsrTtsSession:
+        def __init__(self, voice_name, audio_format="pcm", sample_rate=16000, parameters=None):
+            self.voice_name = voice_name
+            self.audio_format = audio_format
+            self.sample_rate = sample_rate
+            self.parameters = parameters or {}
+
+        async def process_audio(self, websocket, task_id, audio):
+            await websocket.send_bytes(b"tts-audio")
+            return True
+
+    import app.api.v1.realtime_voice as realtime_voice_api
+
+    monkeypatch.setattr(
+        realtime_voice_api,
+        "RealtimeVoiceAsrTtsSession",
+        FakeRealtimeVoiceAsrTtsSession,
+    )
+
     with client.websocket_connect("/ws/v1/realtime/voice") as websocket:
         started = websocket.receive_json()
         assert started["event"] == "session_started"
         assert started["task_id"]
+        assert started["audio_mode"] == "asr_tts_pipeline"
 
         websocket.send_json(
             {
@@ -223,6 +320,8 @@ def test_realtime_voice_websocket_supports_config_update_and_audio_stream(monkey
         configured = websocket.receive_json()
         assert configured["event"] == "configured"
         assert configured["voice_name"] == "desktop_voice"
+        assert configured["pipeline"] == "asr_tts"
+        assert configured["audio_mode"] == "asr_tts_pipeline"
 
         websocket.send_json({"event": "update", "parameters": {"pitch": 1.1}})
         updated = websocket.receive_json()
@@ -230,7 +329,7 @@ def test_realtime_voice_websocket_supports_config_update_and_audio_stream(monkey
         assert updated["parameters"]["pitch"] == 1.1
 
         websocket.send_bytes(b"\x00\x01\x02\x03")
-        assert websocket.receive_bytes() == b"\x00\x01\x02\x03"
+        assert websocket.receive_bytes() == b"tts-audio"
 
 
 def test_realtime_voice_websocket_supports_internal_asr_tts_pipeline(monkeypatch):

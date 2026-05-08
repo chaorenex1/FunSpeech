@@ -8,6 +8,7 @@
 import os
 import sys
 import json
+import datetime
 import logging
 import shutil
 from pathlib import Path
@@ -211,6 +212,47 @@ class VoiceManager:
 
         return True
 
+    def _get_audio_duration(self, wav_file: Path) -> Optional[float]:
+        """读取音频时长，失败时返回None以避免阻断registry修复。"""
+        try:
+            import torchaudio
+
+            audio_info = torchaudio.info(str(wav_file))
+            return audio_info.num_frames / audio_info.sample_rate
+        except Exception as e:
+            logger.warning(f"无法读取音频文件时长 {wav_file}: {e}")
+            return None
+
+    def _build_registry_entry(
+        self, voice_name: str, txt_file: Path, wav_file: Path
+    ) -> Optional[Dict[str, Any]]:
+        """从已有音色文件重建registry条目。"""
+        try:
+            reference_text = txt_file.read_text(encoding="utf-8").strip()
+        except Exception as e:
+            logger.error(f"读取音色文本失败 {txt_file}: {e}")
+            return None
+
+        if not reference_text:
+            logger.error(f"音色 {voice_name} 的文本文件为空")
+            return None
+
+        entry = {
+            "name": voice_name,
+            "reference_text": reference_text,
+            "audio_file": str(wav_file.name),
+            "text_file": str(txt_file.name),
+            "file_size": os.path.getsize(wav_file),
+            "added_at": datetime.datetime.now().isoformat(),
+            "status": "active",
+        }
+
+        audio_duration = self._get_audio_duration(wav_file)
+        if audio_duration is not None:
+            entry["audio_duration"] = audio_duration
+
+        return entry
+
     def add_voice(self, voice_name: str, txt_file: Path, wav_file: Path) -> bool:
         """
         添加单个音色到模型中
@@ -244,12 +286,12 @@ class VoiceManager:
             cosyvoice = self._get_cosyvoice()
 
             # 检查音频文件基本信息
-            import torchaudio
+            audio_duration = self._get_audio_duration(wav_file)
             try:
-                audio_info = torchaudio.info(str(wav_file))
-                audio_duration = audio_info.num_frames / audio_info.sample_rate
+                if audio_duration is None:
+                    return False
                 logger.info(
-                    f"  音频信息: 采样率={audio_info.sample_rate}, 长度={audio_duration:.2f}秒"
+                    f"  音频信息: 长度={audio_duration:.2f}秒"
                 )
 
                 # 检查音频长度
@@ -283,18 +325,11 @@ class VoiceManager:
             logger.info(f"音色 {voice_name} 已保存到spkinfo文件中")
 
             # 更新注册表
-            import datetime
-
-            self.registry["voices"][voice_name] = {
-                "name": voice_name,
-                "reference_text": reference_text,
-                "audio_file": str(wav_file.name),
-                "text_file": str(txt_file.name),
-                "file_size": os.path.getsize(wav_file),
-                "audio_duration": audio_duration,
-                "added_at": datetime.datetime.now().isoformat(),
-                "status": "active",
-            }
+            entry = self._build_registry_entry(voice_name, txt_file, wav_file)
+            if entry is None:
+                return False
+            self.registry["voices"][voice_name] = entry
+            self._save_registry()
 
             logger.info(f"音色 {voice_name} 添加成功")
             return True
@@ -426,7 +461,16 @@ class VoiceManager:
             # 检查是否已经存在
             cosyvoice = self._get_cosyvoice()
             if voice_name in cosyvoice.frontend.spk2info:
-                logger.info(f"音色 {voice_name} 已存在，跳过")
+                if voice_name not in self.registry["voices"]:
+                    entry = self._build_registry_entry(voice_name, txt_file, wav_file)
+                    if entry is None:
+                        logger.warning(f"音色 {voice_name} 已加载但registry修复失败")
+                        continue
+                    self.registry["voices"][voice_name] = entry
+                    success_count += 1
+                    logger.info(f"音色 {voice_name} 已存在于模型，已修复registry")
+                else:
+                    logger.info(f"音色 {voice_name} 已存在，跳过")
                 continue
 
             # 添加音色
@@ -436,7 +480,7 @@ class VoiceManager:
         # 保存注册表
         if success_count > 0:
             self._save_registry()
-            logger.info(f"成功添加 {success_count}/{total_count} 个音色")
+            logger.info(f"成功添加或修复 {success_count}/{total_count} 个音色")
         else:
             logger.info("没有新的音色被添加")
 
