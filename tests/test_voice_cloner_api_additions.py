@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.services.websocket_asr import AliyunWebSocketASRService
+from app.services.websocket_tts import AliyunWebSocketTTSService
 
 
 client = TestClient(app)
@@ -272,12 +273,13 @@ def test_realtime_voice_websocket_supports_internal_asr_tts_pipeline(monkeypatch
         assert "asr_tts" in started["supported_pipelines"]
 
         websocket.send_json(
-            {
-                "event": "configure",
-                "voice_name": "desktop_voice",
-                "format": "pcm",
-                "sample_rate": 16000,
-                "parameters": {"pitch": 1.1},
+                {
+                    "event": "configure",
+                    "voice_name": "desktop_voice",
+                    "pipeline": "asr_tts",
+                    "format": "pcm",
+                    "sample_rate": 16000,
+                    "parameters": {"pitch": 1.1},
             }
         )
         configured = websocket.receive_json()
@@ -322,3 +324,103 @@ def test_websocket_asr_messages_include_voice_cloner_fields():
     assert final["text"] == "最终结果"
     assert final["is_final"] is True
     assert final["duration_ms"] == 320
+
+
+def test_websocket_tts_refreshes_registered_clone_voice_before_synthesis(monkeypatch):
+    service = AliyunWebSocketTTSService()
+
+    class FakeVoiceManager:
+        def __init__(self):
+            self.loaded = False
+            self.refresh_count = 0
+
+        def list_clone_voices(self):
+            return ["shenhenjp2"]
+
+        def is_voice_available(self, voice_name):
+            return voice_name == "shenhenjp2" and self.loaded
+
+        def refresh_voices(self):
+            self.refresh_count += 1
+            self.loaded = True
+            return 1, 1
+
+    class FakeEngine:
+        def __init__(self):
+            self._voice_manager = FakeVoiceManager()
+
+    class FakeWebSocket:
+        class State:
+            name = "CONNECTED"
+
+        client_state = State()
+
+    async def fake_stream_clone_voice_with_engine(*args, **kwargs):
+        yield b"tts-audio"
+
+    fake_engine = FakeEngine()
+    service.tts_engine = fake_engine
+    monkeypatch.setattr(
+        service,
+        "_stream_clone_voice_with_engine",
+        fake_stream_clone_voice_with_engine,
+    )
+
+    async def run():
+        chunks = []
+        async for chunk in service._synthesize_streaming_audio(
+            "你好",
+            "shenhenjp2",
+            1.0,
+            "PCM",
+            16000,
+            50,
+            0,
+            "task-1",
+            FakeWebSocket(),
+        ):
+            chunks.append(chunk)
+        return chunks
+
+    chunks = asyncio.run(run())
+
+    assert chunks == [b"tts-audio"]
+    assert fake_engine._voice_manager.refresh_count == 1
+
+
+def test_websocket_tts_rejects_unknown_non_preset_voice_before_sft_keyerror():
+    service = AliyunWebSocketTTSService()
+
+    class FakeEngine:
+        _voice_manager = None
+        cosyvoice_sft = object()
+
+    class FakeWebSocket:
+        class State:
+            name = "CONNECTED"
+
+        client_state = State()
+
+    service.tts_engine = FakeEngine()
+
+    async def run():
+        chunks = []
+        async for chunk in service._synthesize_streaming_audio(
+            "你好",
+            "missing_voice",
+            1.0,
+            "PCM",
+            16000,
+            50,
+            0,
+            "task-1",
+            FakeWebSocket(),
+        ):
+            chunks.append(chunk)
+
+    try:
+        asyncio.run(run())
+    except Exception as exc:
+        assert "voice_name不存在或未同步到FunSpeech" in str(exc)
+    else:
+        raise AssertionError("unknown voice should be rejected before SFT inference")

@@ -173,8 +173,7 @@ class RealtimeVoiceAsrTtsSession:
 async def realtime_voice_endpoint(websocket: WebSocket):
     """实时变声会话。
 
-    当前落地稳定WebSocket会话、运行中参数更新和连续音频流返回；实际变声DSP/模型可在
-    transform_audio_chunk处替换，默认保持字节流透传，避免伪造不可用的模型能力。
+    在 FunSpeech 内部执行 ASR -> TTS。
     """
     await websocket.accept()
     task_id = generate_task_id("realtime_voice")
@@ -222,22 +221,21 @@ async def realtime_voice_endpoint(websocket: WebSocket):
                 if not next_voice:
                     await _send_error(websocket, task_id, "voice_name不能为空")
                     continue
-                
+                tts_engine = get_tts_engine()
+                voices = tts_engine.get_voices() if hasattr(tts_engine, "get_voices") else []
+                if next_voice not in voices:
+                    await _send_error(websocket, task_id, f"voice_name不存在: {next_voice}")
+                    continue
+
                 voice_name = next_voice
                 parameters.update(data.get("parameters") or {})
-                pipeline = (data.get("pipeline") or data.get("mode") or "passthrough").strip()
-                if pipeline not in {"passthrough", "asr_tts"}:
-                    await _send_error(websocket, task_id, f"不支持的pipeline: {pipeline}")
-                    continue
-                if pipeline == "asr_tts":
-                    asr_tts_session = RealtimeVoiceAsrTtsSession(
-                        voice_name=voice_name,
-                        audio_format=data.get("format", "pcm"),
-                        sample_rate=data.get("sample_rate", 16000),
-                        parameters=parameters,
-                    )
-                else:
-                    asr_tts_session = None
+                pipeline = (data.get("pipeline") or data.get("mode"))
+                asr_tts_session = RealtimeVoiceAsrTtsSession(
+                    voice_name=voice_name,
+                    audio_format=data.get("format", "pcm"),
+                    sample_rate=data.get("sample_rate", 16000),
+                    parameters=parameters,
+                )
                 await websocket.send_json(
                     {
                         "event": "configured" if event == "configure" else "voice_switched",
@@ -246,7 +244,7 @@ async def realtime_voice_endpoint(websocket: WebSocket):
                         "format": data.get("format", "pcm"),
                         "sample_rate": data.get("sample_rate", 16000),
                         "pipeline": pipeline,
-                        "audio_mode": "asr_tts_pipeline" if pipeline == "asr_tts" else "passthrough",
+                        "audio_mode": "asr_tts_pipeline",
                         "status": 20000000,
                     }
                 )

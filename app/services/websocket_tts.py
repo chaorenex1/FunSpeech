@@ -401,21 +401,28 @@ class AliyunWebSocketTTSService:
             else:
                 single_engine = tts_engine
 
-            # 检查是否为零样本克隆音色
+            # 检查是否为零样本克隆音色。registry 中存在但 spk2info 尚未加载时，
+            # 先刷新一次，避免后续误走 SFT 预设音色并在 CosyVoice 内部 KeyError。
             voice_manager = single_engine._voice_manager if hasattr(single_engine, '_voice_manager') else None
-            if (
-                voice_manager
-                and voice_manager.is_voice_available(voice)
-            ):
-                if voice in voice_manager.list_clone_voices():
+            clone_voices = voice_manager.list_clone_voices() if voice_manager else []
+            if voice_manager and voice in clone_voices:
+                if not voice_manager.is_voice_available(voice):
+                    logger.warning(
+                        f"[{task_id}] 克隆音色 {voice} 存在于registry但未加载到模型，尝试刷新voice_manager"
+                    )
+                    voice_manager.refresh_voices()
+                if voice_manager.is_voice_available(voice):
                     # 使用CosyVoice2/3流式合成（零样本克隆音色）
                     async for chunk in self._stream_clone_voice_with_engine(
                         text, voice, speed, format, sample_rate, volume, pitch_rate, task_id, websocket, single_engine, prompt
                     ):
                         yield chunk
                     return
+                raise Exception(f"克隆音色未加载到TTS模型: {voice}，请重新同步或刷新音色运行时")
 
             # 使用CosyVoice1流式合成（预设音色）
+            if voice not in settings.PRESET_VOICES:
+                raise Exception(f"voice_name不存在或未同步到FunSpeech: {voice}")
             if single_engine.cosyvoice_sft:
                 async for chunk in self._stream_preset_voice_with_engine(
                     text, voice, speed, format, sample_rate, volume, pitch_rate, task_id, websocket, single_engine
