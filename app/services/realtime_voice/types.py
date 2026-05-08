@@ -1,0 +1,59 @@
+# -*- coding: utf-8 -*-
+"""Typed payloads for the realtime voice pipeline."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from time import monotonic
+from typing import Literal
+
+
+@dataclass(frozen=True)
+class AudioFrame:
+    """A client audio chunk with enough metadata for queue budgeting."""
+
+    payload: bytes
+    duration_ms: int
+    is_silence: bool
+    created_at: float = field(default_factory=monotonic)
+
+
+@dataclass(frozen=True)
+class BackpressureEvent:
+    """Observable backpressure decision."""
+
+    type: str
+    queue_ms: int = 0
+    dropped_ms: int = 0
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class AsrHypothesis:
+    """ASR text hypothesis emitted by the ASR stage."""
+
+    text: str
+    is_final: bool = False
+    time_ms: int = 0
+
+
+@dataclass(frozen=True)
+class CommittedText:
+    """Text that is stable enough to synthesize."""
+
+    revision_id: int
+    text: str
+    full_text: str
+    is_final: bool = False
+
+
+@dataclass(frozen=True)
+class TtsJob:
+    """A cancellable TTS unit."""
+
+    revision_id: int
+    text: str
+    voice_name: str
+    parameters: dict
+    priority: Literal["stable", "final"] = "stable"
+

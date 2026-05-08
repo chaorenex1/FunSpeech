@@ -487,9 +487,11 @@ class AliyunWebSocketTTSService:
         # 格式化 prompt（CosyVoice3 需要特殊前缀，CosyVoice2 需要后缀）
         formatted_prompt = self._format_prompt_text(prompt, clone_version)
 
-        # 根据是否有 prompt 选择不同的推理方法
-        if prompt:
-            # 使用 instruct2 方法，支持自然语言指令控制
+        use_instruct = bool(prompt) or clone_version == "cosyvoice3"
+
+        # CosyVoice3 的 LLM 输入必须包含 <|endofprompt|>，即使调用方没有传 prompt
+        # 也要走 instruct2 并注入默认 prompt，避免模型线程断言失败。
+        if use_instruct:
             inference_method = engine.inference_instruct2
             inference_args = (
                 text,

@@ -74,7 +74,7 @@ class SenseVoiceWindowedStreamingSession:
 
         if self.sentence_active:
             if await self._should_emit_partial(chunk_end_ms):
-                text = await self._decode_current_sentence()
+                text = await self._decode_current_sentence(partial=True)
                 if self._should_emit_text(text):
                     self.last_emitted_text = text
                     events.append(
@@ -117,7 +117,7 @@ class SenseVoiceWindowedStreamingSession:
         self.pre_speech_audio = np.array([], dtype=np.float32)
 
     async def _end_sentence(self, end_time_ms: int) -> StreamingASREvent:
-        text = await self._decode_current_sentence()
+        text = await self._decode_current_sentence(partial=False)
         event = StreamingASREvent(
             kind="end",
             time_ms=max(end_time_ms, self.sentence_begin_time_ms),
@@ -138,12 +138,19 @@ class SenseVoiceWindowedStreamingSession:
         self.last_partial_decode_ms = chunk_end_ms
         return True
 
-    async def _decode_current_sentence(self) -> str:
+    async def _decode_current_sentence(self, partial: bool = False) -> str:
         if len(self.current_sentence_audio) == 0:
             return ""
+        audio = self.current_sentence_audio
+        if partial:
+            max_partial_samples = int(
+                self.sample_rate * settings.SENSEVOICE_MAX_PARTIAL_WINDOW_MS / 1000
+            )
+            if max_partial_samples > 0 and len(audio) > max_partial_samples:
+                audio = audio[-max_partial_samples:]
         return await run_sync(
             self.engine.transcribe_array,
-            self.current_sentence_audio,
+            audio,
             sample_rate=self.sample_rate,
             enable_itn=self.enable_itn,
             enable_vad=False,

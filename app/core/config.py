@@ -126,6 +126,15 @@ class Settings:
     MAX_REFERENCE_AUDIO_DURATION: int = 30  # 秒
     MIN_REFERENCE_AUDIO_DURATION: float = 1.0  # 秒
 
+    # Realtime Voice 流水线配置
+    REALTIME_AUDIO_INPUT_HIGH_WATERMARK_MS: int = 600
+    REALTIME_AUDIO_INPUT_MAX_MS: int = 900
+    REALTIME_TTS_JOB_QUEUE_SIZE: int = 2
+    REALTIME_TEXT_STABLE_HYPOTHESES: int = 2
+    REALTIME_TEXT_MIN_COMMIT_CHARS: int = 8
+    REALTIME_TEXT_MAX_COMMIT_WAIT_MS: int = 400
+    REALTIME_PACER_FRAME_MS: int = 20
+
     def __init__(self):
         """从环境变量读取配置"""
         self._load_from_env()
@@ -233,6 +242,47 @@ class Settings:
         self.ASR_HOTWORDS_DIR = os.getenv("ASR_HOTWORDS_DIR", self.ASR_HOTWORDS_DIR)
         self.MAX_ASYNC_ASR_AUDIO_SIZE = int(
             os.getenv("MAX_ASYNC_ASR_AUDIO_SIZE", str(self.MAX_ASYNC_ASR_AUDIO_SIZE))
+        )
+
+        # Realtime Voice配置
+        self.REALTIME_AUDIO_INPUT_HIGH_WATERMARK_MS = int(
+            os.getenv(
+                "REALTIME_AUDIO_INPUT_HIGH_WATERMARK_MS",
+                str(self.REALTIME_AUDIO_INPUT_HIGH_WATERMARK_MS),
+            )
+        )
+        self.REALTIME_AUDIO_INPUT_MAX_MS = int(
+            os.getenv(
+                "REALTIME_AUDIO_INPUT_MAX_MS",
+                str(self.REALTIME_AUDIO_INPUT_MAX_MS),
+            )
+        )
+        self.REALTIME_TTS_JOB_QUEUE_SIZE = int(
+            os.getenv(
+                "REALTIME_TTS_JOB_QUEUE_SIZE",
+                str(self.REALTIME_TTS_JOB_QUEUE_SIZE),
+            )
+        )
+        self.REALTIME_TEXT_STABLE_HYPOTHESES = int(
+            os.getenv(
+                "REALTIME_TEXT_STABLE_HYPOTHESES",
+                str(self.REALTIME_TEXT_STABLE_HYPOTHESES),
+            )
+        )
+        self.REALTIME_TEXT_MIN_COMMIT_CHARS = int(
+            os.getenv(
+                "REALTIME_TEXT_MIN_COMMIT_CHARS",
+                str(self.REALTIME_TEXT_MIN_COMMIT_CHARS),
+            )
+        )
+        self.REALTIME_TEXT_MAX_COMMIT_WAIT_MS = int(
+            os.getenv(
+                "REALTIME_TEXT_MAX_COMMIT_WAIT_MS",
+                str(self.REALTIME_TEXT_MAX_COMMIT_WAIT_MS),
+            )
+        )
+        self.REALTIME_PACER_FRAME_MS = int(
+            os.getenv("REALTIME_PACER_FRAME_MS", str(self.REALTIME_PACER_FRAME_MS))
         )
 
     def _ensure_directories(self):

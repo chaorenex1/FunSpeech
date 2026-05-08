@@ -192,6 +192,37 @@ def test_voice_manager_add_voice_persists_registry(monkeypatch, tmp_path):
     assert "new_voice" in registry["voices"]
 
 
+def test_voice_manager_remove_voice_deletes_assets_and_prevents_refresh(
+    monkeypatch,
+    tmp_path,
+):
+    from app.services.tts.clone import VoiceManager
+
+    voices_dir = _patch_voice_manager_paths(monkeypatch, tmp_path)
+    voices_dir.mkdir(parents=True, exist_ok=True)
+    txt_file = voices_dir / "delete_me.txt"
+    wav_file = voices_dir / "delete_me.wav"
+    txt_file.write_text("待删除音色参考文本", encoding="utf-8")
+    wav_file.write_bytes(b"fake-wav")
+    monkeypatch.setattr(VoiceManager, "_validate_and_prepare_audio", lambda *_: True)
+    monkeypatch.setattr(VoiceManager, "_get_audio_duration", lambda *_: 2.0)
+
+    manager = VoiceManager(FakeCosyVoiceForRegistry())
+    manager.cosyvoice.save_spkinfo = lambda: None
+
+    assert manager.add_voice("delete_me", txt_file, wav_file) is True
+    assert txt_file.exists()
+    assert wav_file.exists()
+
+    assert manager.remove_voice("delete_me") is True
+
+    assert "delete_me" not in manager.list_clone_voices()
+    assert not txt_file.exists()
+    assert not wav_file.exists()
+    assert manager.refresh_voices() == (0, 0)
+    assert "delete_me" not in manager.list_clone_voices()
+
+
 def test_voice_manager_sync_endpoints(monkeypatch):
     engine = patch_voice_engine(monkeypatch)
 

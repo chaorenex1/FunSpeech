@@ -409,6 +409,8 @@ class VoiceManager:
             bool: 是否成功移除
         """
         try:
+            registry_entry = self.registry["voices"].get(voice_name, {})
+
             # 获取CosyVoice实例
             cosyvoice = self._get_cosyvoice()
 
@@ -430,11 +432,52 @@ class VoiceManager:
                 self._save_registry()
                 logger.info(f"音色 {voice_name} 已从注册表中移除")
 
+            deleted_assets = self._delete_voice_assets(voice_name, registry_entry)
+            if deleted_assets:
+                logger.info(
+                    "音色 %s 已删除本地资产: %s",
+                    voice_name,
+                    ", ".join(str(path.name) for path in deleted_assets),
+                )
+
             return True
 
         except Exception as e:
             logger.error(f"移除音色失败 {voice_name}: {str(e)}")
             return False
+
+    def _delete_voice_assets(self, voice_name: str, registry_entry: Dict[str, Any]) -> List[Path]:
+        """删除音色对应的参考文本与音频文件，避免refresh后重新加载。"""
+        candidates = {
+            self.voices_dir / f"{voice_name}.txt",
+            self.voices_dir / f"{voice_name}.wav",
+        }
+
+        for key in ("text_file", "audio_file"):
+            value = registry_entry.get(key)
+            if value:
+                candidates.add(self.voices_dir / Path(str(value)).name)
+
+        for suffix in (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"):
+            candidates.add(self.voices_dir / f"{voice_name}{suffix}")
+
+        deleted = []
+        voices_dir = self.voices_dir.resolve()
+        for path in candidates:
+            try:
+                resolved = path.resolve()
+            except OSError:
+                logger.warning(f"无法解析待删除音色资产路径: {path}")
+                continue
+            if voices_dir not in (resolved, *resolved.parents):
+                logger.warning(f"跳过voices目录外的音色资产路径: {resolved}")
+                continue
+            if not resolved.exists() or not resolved.is_file():
+                continue
+            resolved.unlink()
+            deleted.append(resolved)
+
+        return deleted
 
     def add_all_voices(self) -> Tuple[int, int]:
         """
