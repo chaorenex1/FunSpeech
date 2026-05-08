@@ -232,6 +232,67 @@ def test_realtime_voice_websocket_supports_config_update_and_audio_stream(monkey
         assert websocket.receive_bytes() == b"\x00\x01\x02\x03"
 
 
+def test_realtime_voice_websocket_supports_internal_asr_tts_pipeline(monkeypatch):
+    patch_voice_engine(monkeypatch)
+
+    class FakeRealtimeVoiceAsrTtsSession:
+        def __init__(self, voice_name, audio_format="pcm", sample_rate=16000, parameters=None):
+            self.voice_name = voice_name
+            self.audio_format = audio_format
+            self.sample_rate = sample_rate
+            self.parameters = parameters or {}
+
+        async def process_audio(self, websocket, task_id, audio):
+            await websocket.send_json(
+                {
+                    "event": "asr_result",
+                    "stage": "asr_text_received",
+                    "task_id": task_id,
+                    "text": "你好",
+                    "is_final": False,
+                }
+            )
+            await websocket.send_bytes(b"tts-audio")
+            await websocket.send_json(
+                {"event": "tts_completed", "stage": "tts_audio_sent", "task_id": task_id}
+            )
+            return True
+
+    import app.api.v1.realtime_voice as realtime_voice_api
+
+    monkeypatch.setattr(
+        realtime_voice_api,
+        "RealtimeVoiceAsrTtsSession",
+        FakeRealtimeVoiceAsrTtsSession,
+    )
+
+    with client.websocket_connect("/ws/v1/realtime/voice") as websocket:
+        started = websocket.receive_json()
+        assert started["event"] == "session_started"
+        assert "asr_tts" in started["supported_pipelines"]
+
+        websocket.send_json(
+            {
+                "event": "configure",
+                "voice_name": "desktop_voice",
+                "format": "pcm",
+                "sample_rate": 16000,
+                "parameters": {"pitch": 1.1},
+            }
+        )
+        configured = websocket.receive_json()
+        assert configured["event"] == "configured"
+        assert configured["audio_mode"] == "asr_tts_pipeline"
+
+        websocket.send_bytes(b"\x00\x01\x02\x03")
+        asr_result = websocket.receive_json()
+        assert asr_result["event"] == "asr_result"
+        assert asr_result["text"] == "你好"
+        assert websocket.receive_bytes() == b"tts-audio"
+        completed = websocket.receive_json()
+        assert completed["event"] == "tts_completed"
+
+
 def test_websocket_asr_messages_include_voice_cloner_fields():
     service = AliyunWebSocketASRService()
     sent = []
