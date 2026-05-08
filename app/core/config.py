@@ -130,6 +130,11 @@ class Settings:
     REALTIME_AUDIO_INPUT_HIGH_WATERMARK_MS: int = 600
     REALTIME_AUDIO_INPUT_MAX_MS: int = 900
     REALTIME_TTS_JOB_QUEUE_SIZE: int = 2
+    REALTIME_TTS_GLOBAL_MAX_INFLIGHT: int = 1
+    REALTIME_TTS_GLOBAL_QUEUE_SIZE: int = 8
+    REALTIME_TTS_QUEUE_TIMEOUT_MS: int = 3000
+    REALTIME_TTS_AUDIO_QUEUE_SIZE: int = 8
+    REALTIME_TTS_GENERATOR_QUEUE_SIZE: int = 4
     REALTIME_TEXT_STABLE_HYPOTHESES: int = 2
     REALTIME_TEXT_MIN_COMMIT_CHARS: int = 8
     REALTIME_TEXT_MAX_COMMIT_WAIT_MS: int = 400
@@ -261,6 +266,36 @@ class Settings:
             os.getenv(
                 "REALTIME_TTS_JOB_QUEUE_SIZE",
                 str(self.REALTIME_TTS_JOB_QUEUE_SIZE),
+            )
+        )
+        self.REALTIME_TTS_GLOBAL_MAX_INFLIGHT = int(
+            os.getenv(
+                "REALTIME_TTS_GLOBAL_MAX_INFLIGHT",
+                str(self.REALTIME_TTS_GLOBAL_MAX_INFLIGHT),
+            )
+        )
+        self.REALTIME_TTS_GLOBAL_QUEUE_SIZE = int(
+            os.getenv(
+                "REALTIME_TTS_GLOBAL_QUEUE_SIZE",
+                str(self.REALTIME_TTS_GLOBAL_QUEUE_SIZE),
+            )
+        )
+        self.REALTIME_TTS_QUEUE_TIMEOUT_MS = int(
+            os.getenv(
+                "REALTIME_TTS_QUEUE_TIMEOUT_MS",
+                str(self.REALTIME_TTS_QUEUE_TIMEOUT_MS),
+            )
+        )
+        self.REALTIME_TTS_AUDIO_QUEUE_SIZE = int(
+            os.getenv(
+                "REALTIME_TTS_AUDIO_QUEUE_SIZE",
+                str(self.REALTIME_TTS_AUDIO_QUEUE_SIZE),
+            )
+        )
+        self.REALTIME_TTS_GENERATOR_QUEUE_SIZE = int(
+            os.getenv(
+                "REALTIME_TTS_GENERATOR_QUEUE_SIZE",
+                str(self.REALTIME_TTS_GENERATOR_QUEUE_SIZE),
             )
         )
         self.REALTIME_TEXT_STABLE_HYPOTHESES = int(

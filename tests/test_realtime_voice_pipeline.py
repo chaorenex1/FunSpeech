@@ -4,6 +4,7 @@ import asyncio
 
 from app.services.realtime_voice.backpressure import BoundedAudioQueue, TtsJobQueue
 from app.services.realtime_voice.text_commit import StableTextCommitter
+from app.services.realtime_voice.tts_dispatcher import RealtimeTTSDispatcher
 from app.services.realtime_voice.types import AudioFrame, AsrHypothesis, TtsJob
 
 
@@ -72,5 +73,46 @@ def test_tts_job_queue_drops_stale_stable_jobs_and_prefers_final():
         assert first.priority == "final"
         assert first.text == "最终"
         assert second.revision_id == 2
+
+    asyncio.run(run())
+
+
+def test_realtime_tts_dispatcher_rejects_when_global_queue_is_full():
+    async def run():
+        dispatcher = RealtimeTTSDispatcher(
+            max_inflight=1,
+            max_queue_size=0,
+            queue_timeout_ms=50,
+        )
+        lease = await dispatcher.acquire()
+        assert lease.admission.accepted is True
+
+        rejected = await dispatcher.acquire()
+        assert rejected.accepted is False
+        assert rejected.reason == "global_tts_queue_full"
+        assert rejected.active == 1
+
+        await lease.release()
+        next_lease = await dispatcher.acquire()
+        assert next_lease.admission.accepted is True
+        await next_lease.release()
+
+    asyncio.run(run())
+
+
+def test_realtime_tts_dispatcher_times_out_waiting_for_slot():
+    async def run():
+        dispatcher = RealtimeTTSDispatcher(
+            max_inflight=1,
+            max_queue_size=1,
+            queue_timeout_ms=10,
+        )
+        lease = await dispatcher.acquire()
+        rejected = await dispatcher.acquire()
+
+        assert rejected.accepted is False
+        assert rejected.reason == "global_tts_queue_timeout"
+        assert rejected.queue_wait_ms >= 0
+        await lease.release()
 
     asyncio.run(run())

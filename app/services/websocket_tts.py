@@ -452,7 +452,11 @@ class AliyunWebSocketTTSService:
         # 使用线程池执行流式推理，避免阻塞事件循环
         async for audio_data in run_sync_generator(
             engine.inference_sft,
-            text, voice, stream=True, speed=speed
+            text,
+            voice,
+            stream=True,
+            speed=speed,
+            max_queue_size=settings.REALTIME_TTS_GENERATOR_QUEUE_SIZE,
         ):
             # 检查连接状态，如果断开则立即停止
             if websocket.client_state.name != "CONNECTED":
@@ -521,6 +525,7 @@ class AliyunWebSocketTTSService:
         async for audio_data in run_sync_generator(
             inference_method,
             *inference_args,
+            max_queue_size=settings.REALTIME_TTS_GENERATOR_QUEUE_SIZE,
             **inference_kwargs,
         ):
             # 检查连接状态，如果断开则立即停止

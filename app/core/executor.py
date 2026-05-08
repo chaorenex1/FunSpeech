@@ -20,7 +20,9 @@
 import os
 import asyncio
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any, Callable, TypeVar, Generator, AsyncGenerator
 from functools import partial
 
@@ -88,6 +90,8 @@ async def run_sync(func: Callable[..., T], *args, **kwargs) -> T:
 async def run_sync_generator(
     generator_func: Callable[..., Generator[T, None, None]],
     *args,
+    max_queue_size: int = 0,
+    cancel_event: threading.Event | None = None,
     **kwargs
 ) -> AsyncGenerator[T, None]:
     """
@@ -109,25 +113,48 @@ async def run_sync_generator(
     """
     loop = asyncio.get_running_loop()
     executor = get_executor()
-    queue: asyncio.Queue = asyncio.Queue()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=max(0, int(max_queue_size or 0)))
+    stop_event = cancel_event or threading.Event()
 
     # 标记生成器结束的哨兵值
     _SENTINEL = object()
 
     def producer():
         """在线程中运行生成器，将结果放入队列"""
+        gen = None
+
+        def enqueue(item) -> bool:
+            if stop_event.is_set():
+                return False
+            future = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+            while not stop_event.is_set():
+                try:
+                    future.result(timeout=0.1)
+                    return True
+                except FutureTimeoutError:
+                    continue
+                except RuntimeError:
+                    return False
+            future.cancel()
+            return False
+
         try:
             gen = generator_func(*args, **kwargs)
             for item in gen:
-                # 使用 call_soon_threadsafe 安全地将结果放入队列
-                loop.call_soon_threadsafe(queue.put_nowait, item)
+                if stop_event.is_set() or not enqueue(item):
+                    break
         except BaseException as e:
             # 发生异常时，记录日志并将异常放入队列
             logger.error(f"生成器执行异常: {type(e).__name__}: {e}")
-            loop.call_soon_threadsafe(queue.put_nowait, e)
+            enqueue(e)
         finally:
+            if stop_event.is_set() and gen is not None and hasattr(gen, "close"):
+                try:
+                    gen.close()
+                except Exception as e:
+                    logger.debug("关闭生成器失败: %s", e)
             # 发送结束标记
-            loop.call_soon_threadsafe(queue.put_nowait, _SENTINEL)
+            enqueue(_SENTINEL)
 
     # 在线程池中启动生产者
     future = executor.submit(producer)
@@ -145,6 +172,7 @@ async def run_sync_generator(
 
             yield item
     finally:
+        stop_event.set()
         # 确保检查线程是否有未捕获的异常
         if future.done():
             try:

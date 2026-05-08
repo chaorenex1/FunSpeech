@@ -19,6 +19,7 @@ from ...services.realtime_voice.audio_pacer import AudioPacer
 from ...services.realtime_voice.backpressure import BoundedAudioQueue, TtsJobQueue
 from ...services.realtime_voice.events import RealtimeVoiceEventBuilder
 from ...services.realtime_voice.text_commit import StableTextCommitter
+from ...services.realtime_voice.tts_dispatcher import get_realtime_tts_dispatcher
 from ...services.realtime_voice.types import AudioFrame, AsrHypothesis, TtsJob
 
 
@@ -314,9 +315,72 @@ class RealtimeVoiceAsrTtsSession:
     async def _tts_worker(self) -> None:
         assert self._websocket is not None
         assert self._task_id is not None
+        dispatcher = get_realtime_tts_dispatcher()
         while not self._closed:
             job = await self.tts_jobs.get()
             tts_job_id = f"tts_{job.revision_id}"
+            await self._send_json(
+                self._event(
+                    "tts.job_waiting",
+                    payload={
+                        "tts_job_id": tts_job_id,
+                        "revision_id": job.revision_id,
+                        "text": job.text,
+                        "voice_name": job.voice_name,
+                        "config_version": self.config_version,
+                        "priority": job.priority,
+                        "global_active": dispatcher.active,
+                        "global_waiting": dispatcher.waiting,
+                    },
+                )
+            )
+            lease_or_rejection = await dispatcher.acquire()
+            if not getattr(lease_or_rejection, "admission", lease_or_rejection).accepted:
+                rejection = lease_or_rejection
+                await self._send_json(
+                    self._event(
+                        "tts.job_dropped",
+                        payload={
+                            "tts_job_id": tts_job_id,
+                            "revision_id": job.revision_id,
+                            "reason": rejection.reason,
+                            "queue_wait_ms": rejection.queue_wait_ms,
+                            "global_active": rejection.active,
+                            "global_waiting": rejection.waiting,
+                            "priority": job.priority,
+                        },
+                    )
+                )
+                await self._send_json(
+                    self._event(
+                        "backpressure.applied",
+                        payload={
+                            "scope": "tts",
+                            "level": "warning",
+                            "reason": rejection.reason,
+                            "action": "drop_tts_job",
+                            "message": f"revision={job.revision_id}",
+                        },
+                        type=rejection.reason,
+                        message=f"revision={job.revision_id}",
+                    )
+                )
+                continue
+
+            lease = lease_or_rejection
+            admission = lease.admission
+            await self._send_json(
+                self._event(
+                    "tts.job_admitted",
+                    payload={
+                        "tts_job_id": tts_job_id,
+                        "revision_id": job.revision_id,
+                        "queue_wait_ms": admission.queue_wait_ms,
+                        "global_active": admission.active,
+                        "global_waiting": admission.waiting,
+                    },
+                )
+            )
             await self._send_json(
                 self._event(
                     "tts.job_started",
@@ -335,44 +399,64 @@ class RealtimeVoiceAsrTtsSession:
             )
             emitted = False
             first_audio_sent = False
-            async for chunk in self._synthesize(
-                job.text,
-                self._websocket,
-                self._task_id,
-                voice_name=job.voice_name,
-                parameters=job.parameters,
-            ):
-                if not chunk:
-                    continue
-                async for frame in self.audio_pacer.iter_frames(chunk):
-                    self._audio_chunk_index += 1
-                    if not first_audio_sent:
-                        await self._send_json(
-                            self._event(
-                                "tts.first_audio",
-                                payload={
-                                    "tts_job_id": tts_job_id,
-                                    "revision_id": job.revision_id,
-                                    "audio_chunk_index": self._audio_chunk_index,
-                                },
+            tts_audio_queue: asyncio.Queue = asyncio.Queue(
+                maxsize=max(1, settings.REALTIME_TTS_AUDIO_QUEUE_SIZE)
+            )
+            synth_done = object()
+
+            async def synthesize_job_audio() -> None:
+                try:
+                    async with lease:
+                        async for chunk in self._synthesize(
+                            job.text,
+                            self._websocket,
+                            self._task_id,
+                            voice_name=job.voice_name,
+                            parameters=job.parameters,
+                        ):
+                            if chunk:
+                                await tts_audio_queue.put(chunk)
+                except BaseException as exc:
+                    await tts_audio_queue.put(exc)
+                finally:
+                    await tts_audio_queue.put(synth_done)
+
+            synth_task = asyncio.create_task(
+                synthesize_job_audio(),
+                name=f"{self._task_id}:tts-synth:{job.revision_id}",
+            )
+            try:
+                while True:
+                    chunk = await tts_audio_queue.get()
+                    if chunk is synth_done:
+                        break
+                    if isinstance(chunk, BaseException):
+                        raise chunk
+                    async for frame in self.audio_pacer.iter_frames(chunk):
+                        self._audio_chunk_index += 1
+                        if not first_audio_sent:
+                            await self._send_json(
+                                self._event(
+                                    "tts.first_audio",
+                                    payload={
+                                        "tts_job_id": tts_job_id,
+                                        "revision_id": job.revision_id,
+                                        "audio_chunk_index": self._audio_chunk_index,
+                                    },
+                                )
                             )
+                            first_audio_sent = True
+                        await self._send_audio_frame(
+                            tts_job_id=tts_job_id,
+                            revision_id=job.revision_id,
+                            frame=frame,
                         )
-                        first_audio_sent = True
-                    await self._send_json(
-                        self._event(
-                            "tts.audio_chunk",
-                            payload={
-                                "tts_job_id": tts_job_id,
-                                "revision_id": job.revision_id,
-                                "audio_chunk_index": self._audio_chunk_index,
-                                "bytes": len(frame),
-                                "sample_rate": self.sample_rate,
-                                "format": "PCM",
-                            },
-                        )
-                    )
-                    await self._send_bytes(frame)
-                    emitted = True
+                        emitted = True
+            finally:
+                if not synth_task.done():
+                    synth_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await synth_task
             async for frame in self.audio_pacer.flush():
                 self._audio_chunk_index += 1
                 if not first_audio_sent:
@@ -387,20 +471,11 @@ class RealtimeVoiceAsrTtsSession:
                         )
                     )
                     first_audio_sent = True
-                await self._send_json(
-                    self._event(
-                        "tts.audio_chunk",
-                        payload={
-                            "tts_job_id": tts_job_id,
-                            "revision_id": job.revision_id,
-                            "audio_chunk_index": self._audio_chunk_index,
-                            "bytes": len(frame),
-                            "sample_rate": self.sample_rate,
-                            "format": "PCM",
-                        },
-                    )
+                await self._send_audio_frame(
+                    tts_job_id=tts_job_id,
+                    revision_id=job.revision_id,
+                    frame=frame,
                 )
-                await self._send_bytes(frame)
                 emitted = True
             if emitted:
                 await self._send_json(
@@ -541,6 +616,32 @@ class RealtimeVoiceAsrTtsSession:
             return
         async with self._send_lock:
             await self._websocket.send_bytes(payload)
+
+    async def _send_audio_frame(
+        self,
+        *,
+        tts_job_id: str,
+        revision_id: int,
+        frame: bytes,
+    ) -> None:
+        """Send audio metadata and binary bytes without interleaving events."""
+        if self._websocket is None:
+            return
+        async with self._send_lock:
+            await self._websocket.send_json(
+                self._event(
+                    "tts.audio_chunk",
+                    payload={
+                        "tts_job_id": tts_job_id,
+                        "revision_id": revision_id,
+                        "audio_chunk_index": self._audio_chunk_index,
+                        "bytes": len(frame),
+                        "sample_rate": self.sample_rate,
+                        "format": "PCM",
+                    },
+                )
+            )
+            await self._websocket.send_bytes(frame)
 
     def _event(self, event: str, *, payload: dict | None = None, **fields) -> dict:
         if self._event_builder is None:
