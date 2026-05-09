@@ -69,6 +69,15 @@ services:
       # 用于实现多路并发推理，每个请求的模型推理在独���线程中执行
       # - INFERENCE_THREAD_POOL_SIZE=8
 
+      # Realtime Voice 压测调优配置（默认已按 1/2/4/8 并发压测结果调整）
+      # - REALTIME_AUDIO_INPUT_HIGH_WATERMARK_MS=1200
+      # - REALTIME_AUDIO_INPUT_MAX_MS=1800
+      # - REALTIME_TTS_GLOBAL_MAX_INFLIGHT=2
+      # - REALTIME_TTS_GLOBAL_QUEUE_SIZE=16
+      # - REALTIME_TTS_QUEUE_TIMEOUT_MS=12000
+      # - REALTIME_TTS_AUDIO_QUEUE_SIZE=12
+      # - REALTIME_TTS_GENERATOR_QUEUE_SIZE=4
+
       # Worker 进程数配置（可选，默认为 1）
       # 多 Worker 可实现真正的并行计算，但每个 Worker 都会加载独立的模型副本
       # 注意：会成倍增加内存/显存占用，请确保资源充足
