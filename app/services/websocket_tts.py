@@ -507,6 +507,18 @@ class AliyunWebSocketTTSService:
         formatted_prompt = self._format_prompt_text(effective_prompt, clone_version)
 
         use_instruct = bool(effective_prompt) or clone_version == "cosyvoice3"
+        if clone_version == "cosyvoice3":
+            voice_manager = getattr(engine, "_voice_manager", None)
+            ensure_compatible = (
+                getattr(voice_manager, "ensure_cosyvoice3_voice_compatible", None)
+                if voice_manager
+                else None
+            )
+            if callable(ensure_compatible) and not ensure_compatible(voice):
+                raise Exception(
+                    f"克隆音色 {voice} 的CosyVoice3 prompt_text不兼容，"
+                    "请重新同步或刷新音色运行时"
+                )
 
         # CosyVoice3 的 LLM 输入必须包含 <|endofprompt|>，即使调用方没有传 prompt
         # 也要走 instruct2 并注入默认 prompt，避免模型线程断言失败。

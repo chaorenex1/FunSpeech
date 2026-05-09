@@ -28,6 +28,10 @@ SPKINFO_FILE = SPK_DIR / "spk2info.pt"
 
 logger = logging.getLogger(__name__)
 
+COSYVOICE3_END_OF_PROMPT = "<|endofprompt|>"
+COSYVOICE3_END_OF_PROMPT_TOKEN = 151646
+COSYVOICE3_SYSTEM_PROMPT = "You are a helpful assistant."
+
 
 class VoiceManager:
     """音色管理器 - 基于CosyVoice2官方API"""
@@ -125,10 +129,162 @@ class VoiceManager:
                     self.cosyvoice.frontend, "spk2info"
                 ):
                     self.cosyvoice.frontend.spk2info.update(existing_spkinfo)
+                    repaired = self.repair_cosyvoice3_spkinfo(save=False)
+                    if repaired:
+                        self.cosyvoice.save_spkinfo()
                     logger.info(f"已加载 {len(existing_spkinfo)} 个保存的音色")
 
             except Exception as e:
                 logger.warning(f"加载已保存的spkinfo失败: {e}")
+
+    def _is_cosyvoice3(self) -> bool:
+        """当前克隆模型是否按 CosyVoice3 规则运行。"""
+        try:
+            from app.core.config import settings
+
+            return settings.CLONE_MODEL_VERSION.lower() == "cosyvoice3"
+        except Exception:
+            return False
+
+    @staticmethod
+    def _format_cosyvoice3_prompt_text(prompt_text: str = "") -> str:
+        """格式化写入 spk2info 的 CosyVoice3 prompt_text。"""
+        prompt_text = (prompt_text or "").strip()
+        if prompt_text.endswith(COSYVOICE3_END_OF_PROMPT):
+            if prompt_text.startswith("You are"):
+                return prompt_text
+            return f"{COSYVOICE3_SYSTEM_PROMPT} {prompt_text}"
+        if not prompt_text or prompt_text == COSYVOICE3_SYSTEM_PROMPT:
+            return f"{COSYVOICE3_SYSTEM_PROMPT}{COSYVOICE3_END_OF_PROMPT}"
+        if prompt_text.startswith("You are"):
+            return f"{prompt_text}{COSYVOICE3_END_OF_PROMPT}"
+        return f"{COSYVOICE3_SYSTEM_PROMPT} {prompt_text}{COSYVOICE3_END_OF_PROMPT}"
+
+    @staticmethod
+    def _tensor_contains_endofprompt(value: Any) -> bool:
+        """兼容 tensor/list/tuple，检查 prompt token 是否含 CosyVoice3 终止标记。"""
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return COSYVOICE3_END_OF_PROMPT in value
+        try:
+            if hasattr(value, "detach"):
+                values = value.detach().cpu().flatten().tolist()
+            elif hasattr(value, "flatten") and hasattr(value, "tolist"):
+                values = value.flatten().tolist()
+            elif isinstance(value, (list, tuple)):
+                values = list(value)
+            else:
+                return False
+            return COSYVOICE3_END_OF_PROMPT_TOKEN in values
+        except Exception:
+            return False
+
+    @staticmethod
+    def _find_prompt_string(value: Any) -> Optional[str]:
+        """从旧版 spk2info 结构中尽量找出可作为参考文本的字符串。"""
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        if isinstance(value, dict):
+            preferred_keys = (
+                "reference_text",
+                "prompt_text",
+                "text",
+            )
+            for key in preferred_keys:
+                found = VoiceManager._find_prompt_string(value.get(key))
+                if found:
+                    return found
+            for item in value.values():
+                found = VoiceManager._find_prompt_string(item)
+                if found:
+                    return found
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                found = VoiceManager._find_prompt_string(item)
+                if found:
+                    return found
+        return None
+
+    def _get_voice_reference_text(
+        self, voice_name: str, entry: Dict[str, Any], reference_text: Optional[str] = None
+    ) -> str:
+        """优先使用 registry/显式参考文本，避免从 token 字段误取无关字符串。"""
+        if reference_text and reference_text.strip():
+            return reference_text.strip()
+        registry_entry = self.registry.get("voices", {}).get(voice_name, {})
+        registry_text = (registry_entry.get("reference_text") or "").strip()
+        if registry_text:
+            return registry_text
+        return self._find_prompt_string(entry) or ""
+
+    def _set_cosyvoice3_prompt_tokens(
+        self, entry: Dict[str, Any], formatted_prompt: str
+    ) -> bool:
+        """写入 CosyVoice3 可校验的 prompt_text token。"""
+        frontend = getattr(self.cosyvoice, "frontend", None)
+        extract_text_token = getattr(frontend, "_extract_text_token", None)
+        if callable(extract_text_token):
+            prompt_text, prompt_text_len = extract_text_token(formatted_prompt)
+            entry["prompt_text"] = prompt_text
+            entry["prompt_text_len"] = prompt_text_len
+            return self._tensor_contains_endofprompt(prompt_text)
+
+        logger.error("CosyVoice3 frontend缺少_extract_text_token，无法修复prompt_text")
+        return False
+
+    def ensure_cosyvoice3_voice_compatible(
+        self, voice_name: str, reference_text: Optional[str] = None, save: bool = True
+    ) -> bool:
+        """确保保存音色的 prompt_text 符合 CosyVoice3 的 <|endofprompt|> 断言。"""
+        if not self._is_cosyvoice3():
+            return True
+
+        cosyvoice = self._get_cosyvoice()
+        spk2info = getattr(getattr(cosyvoice, "frontend", None), "spk2info", None)
+        if not isinstance(spk2info, dict) or voice_name not in spk2info:
+            logger.error(f"CosyVoice3音色未加载到spk2info: {voice_name}")
+            return False
+
+        entry = spk2info[voice_name]
+        if not isinstance(entry, dict):
+            logger.error(f"CosyVoice3音色spk2info结构异常: {voice_name}")
+            return False
+
+        if self._tensor_contains_endofprompt(entry.get("prompt_text")):
+            return True
+
+        prompt_source = self._get_voice_reference_text(voice_name, entry, reference_text)
+        formatted_prompt = self._format_cosyvoice3_prompt_text(prompt_source)
+        if not self._set_cosyvoice3_prompt_tokens(entry, formatted_prompt):
+            logger.error(
+                "CosyVoice3音色 %s 的prompt_text修复失败，未检测到%s token",
+                voice_name,
+                COSYVOICE3_END_OF_PROMPT,
+            )
+            return False
+
+        logger.info(f"已修复CosyVoice3音色 {voice_name} 的prompt_text")
+        if save:
+            cosyvoice.save_spkinfo()
+        return True
+
+    def repair_cosyvoice3_spkinfo(self, save: bool = True) -> int:
+        """批量修复registry中的克隆音色，返回修复/已兼容数量。"""
+        if not self._is_cosyvoice3():
+            return 0
+        repaired = 0
+        for voice_name, info in self.registry.get("voices", {}).items():
+            if self.ensure_cosyvoice3_voice_compatible(
+                voice_name,
+                reference_text=info.get("reference_text"),
+                save=False,
+            ):
+                repaired += 1
+        if repaired and save:
+            self._get_cosyvoice().save_spkinfo()
+        return repaired
 
     def _get_cosyvoice(self):
         """获取CosyVoice实例"""
@@ -318,6 +474,12 @@ class VoiceManager:
 
             if not success:
                 logger.error(f"添加音色失败: {voice_name}")
+                return False
+
+            if not self.ensure_cosyvoice3_voice_compatible(
+                voice_name, reference_text=reference_text, save=False
+            ):
+                logger.error(f"CosyVoice3音色prompt_text修复失败: {voice_name}")
                 return False
 
             # 保存模型的spkinfo到自定义目录
@@ -514,6 +676,12 @@ class VoiceManager:
                     logger.info(f"音色 {voice_name} 已存在于模型，已修复registry")
                 else:
                     logger.info(f"音色 {voice_name} 已存在，跳过")
+                if not self.ensure_cosyvoice3_voice_compatible(
+                    voice_name,
+                    reference_text=self.registry["voices"].get(voice_name, {}).get("reference_text"),
+                    save=True,
+                ):
+                    logger.warning(f"音色 {voice_name} CosyVoice3 prompt_text修复失败")
                 continue
 
             # 添加音色

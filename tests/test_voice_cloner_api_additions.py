@@ -12,6 +12,9 @@ from app.services.websocket_asr import AliyunWebSocketASRService
 from app.services.websocket_tts import AliyunWebSocketTTSService
 
 
+END_OF_PROMPT_TOKEN = 151646
+
+
 client = TestClient(app)
 
 
@@ -33,7 +36,16 @@ def _patch_voice_manager_paths(monkeypatch, tmp_path):
 
 class FakeCosyVoiceForRegistry:
     def __init__(self, existing_voices=None):
-        self.frontend = type("Frontend", (), {"spk2info": dict(existing_voices or {})})()
+        class Frontend:
+            def __init__(self, spk2info):
+                self.spk2info = spk2info
+                self.extracted_texts = []
+
+            def _extract_text_token(self, text):
+                self.extracted_texts.append(text)
+                return [END_OF_PROMPT_TOKEN], [len(text)]
+
+        self.frontend = Frontend(dict(existing_voices or {}))
 
     def add_zero_shot_spk(self, reference_text, wav_file, voice_name):
         self.frontend.spk2info[voice_name] = {
@@ -150,9 +162,11 @@ def test_voice_manager_refresh_repairs_registry_when_spkinfo_already_has_voice(
     monkeypatch,
     tmp_path,
 ):
+    from app.core.config import settings
     from app.services.tts.clone import VoiceManager
 
     voices_dir = _patch_voice_manager_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(settings, "CLONE_MODEL_VERSION", "cosyvoice2")
     voices_dir.mkdir(parents=True, exist_ok=True)
     (voices_dir / "shenhenjp2.txt").write_text("参考文本", encoding="utf-8")
     (voices_dir / "shenhenjp2.wav").write_bytes(b"fake-wav")
@@ -190,6 +204,49 @@ def test_voice_manager_add_voice_persists_registry(monkeypatch, tmp_path):
         (voices_dir / "voice_registry.json").read_text(encoding="utf-8")
     )
     assert "new_voice" in registry["voices"]
+
+
+def test_voice_manager_repairs_cosyvoice3_prompt_text_tokens(monkeypatch, tmp_path):
+    from app.core.config import settings
+    from app.services.tts.clone import VoiceManager
+
+    _patch_voice_manager_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(settings, "CLONE_MODEL_VERSION", "cosyvoice3")
+
+    manager = VoiceManager(FakeCosyVoiceForRegistry({"old_voice": {"prompt_text": [1, 2, 3]}}))
+    manager.registry["voices"]["old_voice"] = {
+        "name": "old_voice",
+        "reference_text": "旧音色参考文本",
+    }
+
+    assert manager.ensure_cosyvoice3_voice_compatible("old_voice", save=False) is True
+    entry = manager.cosyvoice.frontend.spk2info["old_voice"]
+    assert entry["prompt_text"] == [END_OF_PROMPT_TOKEN]
+    assert manager.cosyvoice.frontend.extracted_texts[-1] == (
+        "You are a helpful assistant. 旧音色参考文本<|endofprompt|>"
+    )
+
+
+def test_voice_manager_repairs_cosyvoice3_prompt_from_registry_when_no_strings(
+    monkeypatch,
+    tmp_path,
+):
+    from app.core.config import settings
+    from app.services.tts.clone import VoiceManager
+
+    _patch_voice_manager_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(settings, "CLONE_MODEL_VERSION", "cosyvoice3")
+
+    manager = VoiceManager(FakeCosyVoiceForRegistry({"no_text_voice": {"prompt_text": [7]}}))
+    manager.registry["voices"]["no_text_voice"] = {
+        "name": "no_text_voice",
+        "reference_text": "来自registry的参考文本",
+    }
+
+    assert manager.ensure_cosyvoice3_voice_compatible("no_text_voice", save=False)
+    entry = manager.cosyvoice.frontend.spk2info["no_text_voice"]
+    assert entry["prompt_text"] == [END_OF_PROMPT_TOKEN]
+    assert "来自registry的参考文本" in manager.cosyvoice.frontend.extracted_texts[-1]
 
 
 def test_voice_manager_remove_voice_deletes_assets_and_prevents_refresh(
