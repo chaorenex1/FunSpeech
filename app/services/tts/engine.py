@@ -14,7 +14,7 @@ from pathlib import Path
 from ...core.config import settings
 from ...core.exceptions import APIException, DefaultServerErrorException, InvalidParameterException
 from ...utils.audio import save_audio_array, generate_temp_audio_path
-from ...utils.emotion import compose_emotion_prompt
+from ...utils.emotion import compose_emotion_prompt, format_cosyvoice_instruction_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -452,23 +452,7 @@ class CosyVoiceTTSEngine:
         CosyVoice3 需要 'You are a helpful assistant.<|endofprompt|>' 前缀
         CosyVoice2 需要 '<|endofprompt|>' 后缀
         """
-        if self._clone_model_version == "cosyvoice3":
-            if prompt_text and not prompt_text.startswith("You are"):
-                return f"You are a helpful assistant. {prompt_text}<|endofprompt|>"
-            elif not prompt_text:
-                return "You are a helpful assistant.<|endofprompt|>"
-            else:
-                # 已经有前缀，确保有后缀
-                if not prompt_text.endswith("<|endofprompt|>"):
-                    return f"{prompt_text}<|endofprompt|>"
-                return prompt_text
-        else:
-            # CosyVoice2
-            if prompt_text:
-                if not prompt_text.endswith("<|endofprompt|>"):
-                    return f"{prompt_text}<|endofprompt|>"
-                return prompt_text
-        return prompt_text
+        return format_cosyvoice_instruction_prompt(prompt_text, self._clone_model_version)
 
     def _synthesize_with_saved_voice(
         self,

@@ -38,7 +38,11 @@ from ..utils.audio import (
     validate_sample_rate,
     resample_audio_array,
 )
-from ..utils.emotion import compose_emotion_prompt, normalize_emotion
+from ..utils.emotion import (
+    compose_emotion_prompt,
+    format_cosyvoice_instruction_prompt,
+    normalize_emotion,
+)
 from .tts.engine import get_tts_engine, MultiGPUTTSEngine
 
 logger = logging.getLogger(__name__)
@@ -366,23 +370,7 @@ class AliyunWebSocketTTSService:
         CosyVoice3 需要 'You are a helpful assistant.<|endofprompt|>' 前缀
         CosyVoice2 需要 '<|endofprompt|>' 后缀
         """
-        if clone_version == "cosyvoice3":
-            if prompt_text and not prompt_text.startswith("You are"):
-                return f"You are a helpful assistant. {prompt_text}<|endofprompt|>"
-            elif not prompt_text:
-                return "You are a helpful assistant.<|endofprompt|>"
-            else:
-                # 已经有前缀，确保有后缀
-                if not prompt_text.endswith("<|endofprompt|>"):
-                    return f"{prompt_text}<|endofprompt|>"
-                return prompt_text
-        else:
-            # CosyVoice2
-            if prompt_text:
-                if not prompt_text.endswith("<|endofprompt|>"):
-                    return f"{prompt_text}<|endofprompt|>"
-                return prompt_text
-        return prompt_text
+        return format_cosyvoice_instruction_prompt(prompt_text, clone_version)
 
     async def _synthesize_streaming_audio(
         self,

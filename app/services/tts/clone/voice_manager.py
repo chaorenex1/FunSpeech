@@ -148,17 +148,37 @@ class VoiceManager:
 
     @staticmethod
     def _format_cosyvoice3_prompt_text(prompt_text: str = "") -> str:
-        """格式化写入 spk2info 的 CosyVoice3 prompt_text。"""
+        """格式化写入 spk2info 的 CosyVoice3 zero-shot prompt_text。
+
+        CosyVoice3 zero-shot 的 prompt_text 语义是:
+        ``You are a helpful assistant.<|endofprompt|>{reference_text}``
+        这里的 ``<|endofprompt|>`` 是系统 prompt 和参考文本的分隔符，
+        不是追加到参考文本末尾的后缀。
+        """
         prompt_text = (prompt_text or "").strip()
-        if prompt_text.endswith(COSYVOICE3_END_OF_PROMPT):
-            if prompt_text.startswith("You are"):
-                return prompt_text
-            return f"{COSYVOICE3_SYSTEM_PROMPT} {prompt_text}"
         if not prompt_text or prompt_text == COSYVOICE3_SYSTEM_PROMPT:
             return f"{COSYVOICE3_SYSTEM_PROMPT}{COSYVOICE3_END_OF_PROMPT}"
+
+        if COSYVOICE3_END_OF_PROMPT in prompt_text:
+            before, after = prompt_text.split(COSYVOICE3_END_OF_PROMPT, 1)
+            before = before.strip()
+            after = after.lstrip()
+            if before == COSYVOICE3_SYSTEM_PROMPT:
+                return f"{COSYVOICE3_SYSTEM_PROMPT}{COSYVOICE3_END_OF_PROMPT}{after}"
+            if before.startswith(f"{COSYVOICE3_SYSTEM_PROMPT} ") and not after:
+                reference_text = before[len(COSYVOICE3_SYSTEM_PROMPT) :].strip()
+                return f"{COSYVOICE3_SYSTEM_PROMPT}{COSYVOICE3_END_OF_PROMPT}{reference_text}"
+            if before.startswith("You are"):
+                return f"{before}{COSYVOICE3_END_OF_PROMPT}{after}"
+            reference_text = after or before
+            return f"{COSYVOICE3_SYSTEM_PROMPT}{COSYVOICE3_END_OF_PROMPT}{reference_text}"
+
+        if prompt_text.startswith(f"{COSYVOICE3_SYSTEM_PROMPT} "):
+            reference_text = prompt_text[len(COSYVOICE3_SYSTEM_PROMPT) :].strip()
+            return f"{COSYVOICE3_SYSTEM_PROMPT}{COSYVOICE3_END_OF_PROMPT}{reference_text}"
         if prompt_text.startswith("You are"):
             return f"{prompt_text}{COSYVOICE3_END_OF_PROMPT}"
-        return f"{COSYVOICE3_SYSTEM_PROMPT} {prompt_text}{COSYVOICE3_END_OF_PROMPT}"
+        return f"{COSYVOICE3_SYSTEM_PROMPT}{COSYVOICE3_END_OF_PROMPT}{prompt_text}"
 
     @staticmethod
     def _tensor_contains_endofprompt(value: Any) -> bool:
@@ -235,7 +255,11 @@ class VoiceManager:
         return False
 
     def ensure_cosyvoice3_voice_compatible(
-        self, voice_name: str, reference_text: Optional[str] = None, save: bool = True
+        self,
+        voice_name: str,
+        reference_text: Optional[str] = None,
+        save: bool = True,
+        force: bool = False,
     ) -> bool:
         """确保保存音色的 prompt_text 符合 CosyVoice3 的 <|endofprompt|> 断言。"""
         if not self._is_cosyvoice3():
@@ -252,7 +276,7 @@ class VoiceManager:
             logger.error(f"CosyVoice3音色spk2info结构异常: {voice_name}")
             return False
 
-        if self._tensor_contains_endofprompt(entry.get("prompt_text")):
+        if not force and self._tensor_contains_endofprompt(entry.get("prompt_text")):
             return True
 
         prompt_source = self._get_voice_reference_text(voice_name, entry, reference_text)
@@ -280,6 +304,7 @@ class VoiceManager:
                 voice_name,
                 reference_text=info.get("reference_text"),
                 save=False,
+                force=True,
             ):
                 repaired += 1
         if repaired and save:
@@ -477,7 +502,7 @@ class VoiceManager:
                 return False
 
             if not self.ensure_cosyvoice3_voice_compatible(
-                voice_name, reference_text=reference_text, save=False
+                voice_name, reference_text=reference_text, save=False, force=True
             ):
                 logger.error(f"CosyVoice3音色prompt_text修复失败: {voice_name}")
                 return False
@@ -680,6 +705,7 @@ class VoiceManager:
                     voice_name,
                     reference_text=self.registry["voices"].get(voice_name, {}).get("reference_text"),
                     save=True,
+                    force=True,
                 ):
                     logger.warning(f"音色 {voice_name} CosyVoice3 prompt_text修复失败")
                 continue

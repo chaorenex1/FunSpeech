@@ -110,3 +110,49 @@ def test_websocket_tts_emotion_tag_maps_to_instruct_prompt():
     instruct_args, _ = engine.instruct_calls[0]
     assert "开心" in instruct_args[1]
     assert "像客服一样亲切" in instruct_args[1]
+
+
+def test_websocket_tts_preformatted_prompt_does_not_append_second_endofprompt():
+    service = AliyunWebSocketTTSService()
+
+    class FakeEngine:
+        _clone_model_version = "cosyvoice3"
+        cosyvoice_clone = type("Clone", (), {"sample_rate": 16000})()
+
+        def __init__(self):
+            self.instruct_calls = []
+
+        def inference_instruct2(self, *args, **kwargs):
+            self.instruct_calls.append((args, kwargs))
+            yield {"tts_speech": _FakeSpeech()}
+
+    engine = FakeEngine()
+    prompt = (
+        "You are a helpful assistant.<|endofprompt|>"
+        "希望你以后能够做的比我还好呦。"
+    )
+
+    async def run():
+        chunks = []
+        async for chunk in service._stream_clone_voice_with_engine(
+            "你好",
+            "desktop_voice",
+            1.0,
+            "PCM",
+            16000,
+            50,
+            0,
+            "task-1",
+            _FakeWebSocket(),
+            engine,
+            prompt=prompt,
+        ):
+            chunks.append(chunk)
+        return chunks
+
+    chunks = asyncio.run(run())
+
+    assert chunks
+    instruct_args, _ = engine.instruct_calls[0]
+    assert instruct_args[1] == prompt
+    assert instruct_args[1].count("<|endofprompt|>") == 1

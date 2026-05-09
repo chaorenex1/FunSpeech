@@ -38,6 +38,8 @@ EMOTION_PROMPTS = {
     "neutral": "请用自然平静的语气说这句话。",
 }
 
+COSYVOICE_END_OF_PROMPT = "<|endofprompt|>"
+COSYVOICE3_SYSTEM_PROMPT = "You are a helpful assistant."
 _RICH_TAG_RE = re.compile(r"<\|([^|<>]+)\|>")
 
 
@@ -130,4 +132,47 @@ def compose_emotion_prompt(
         elif intensity <= 0.35 and normalized != "neutral":
             emotion_prompt = emotion_prompt.replace("请用", "请用稍微")
 
+    if not user_prompt:
+        return emotion_prompt
+
+    if COSYVOICE_END_OF_PROMPT in user_prompt:
+        before, after = user_prompt.split(COSYVOICE_END_OF_PROMPT, 1)
+        before = before.strip()
+        after = after.lstrip()
+        if before == COSYVOICE3_SYSTEM_PROMPT:
+            before = f"{COSYVOICE3_SYSTEM_PROMPT} {emotion_prompt}"
+        elif before.startswith(f"{COSYVOICE3_SYSTEM_PROMPT} "):
+            instruction = before[len(COSYVOICE3_SYSTEM_PROMPT) :].strip()
+            before = f"{COSYVOICE3_SYSTEM_PROMPT} {emotion_prompt} {instruction}".strip()
+        else:
+            before = f"{emotion_prompt} {before}".strip()
+        return f"{before}{COSYVOICE_END_OF_PROMPT}{after}"
+
     return f"{emotion_prompt} {user_prompt}".strip()
+
+
+def format_cosyvoice_instruction_prompt(
+    prompt_text: Optional[str],
+    clone_version: str,
+) -> str:
+    """Format runtime instruct_text for CosyVoice clone inference.
+
+    CosyVoice3 instruct prompts use ``You are ... <|endofprompt|>`` as the
+    instruction boundary. If callers already supplied a full prompt containing
+    the boundary, keep it intact instead of appending a second terminator.
+    """
+    prompt_text = (prompt_text or "").strip()
+    if (clone_version or "").lower() == "cosyvoice3":
+        if not prompt_text:
+            return f"{COSYVOICE3_SYSTEM_PROMPT}{COSYVOICE_END_OF_PROMPT}"
+        if COSYVOICE_END_OF_PROMPT in prompt_text:
+            if prompt_text.startswith("You are"):
+                return prompt_text
+            return f"{COSYVOICE3_SYSTEM_PROMPT} {prompt_text}"
+        if prompt_text.startswith("You are"):
+            return f"{prompt_text}{COSYVOICE_END_OF_PROMPT}"
+        return f"{COSYVOICE3_SYSTEM_PROMPT} {prompt_text}{COSYVOICE_END_OF_PROMPT}"
+
+    if prompt_text and COSYVOICE_END_OF_PROMPT not in prompt_text:
+        return f"{prompt_text}{COSYVOICE_END_OF_PROMPT}"
+    return prompt_text

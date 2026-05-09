@@ -223,7 +223,7 @@ def test_voice_manager_repairs_cosyvoice3_prompt_text_tokens(monkeypatch, tmp_pa
     entry = manager.cosyvoice.frontend.spk2info["old_voice"]
     assert entry["prompt_text"] == [END_OF_PROMPT_TOKEN]
     assert manager.cosyvoice.frontend.extracted_texts[-1] == (
-        "You are a helpful assistant. 旧音色参考文本<|endofprompt|>"
+        "You are a helpful assistant.<|endofprompt|>旧音色参考文本"
     )
 
 
@@ -247,6 +247,16 @@ def test_voice_manager_repairs_cosyvoice3_prompt_from_registry_when_no_strings(
     entry = manager.cosyvoice.frontend.spk2info["no_text_voice"]
     assert entry["prompt_text"] == [END_OF_PROMPT_TOKEN]
     assert "来自registry的参考文本" in manager.cosyvoice.frontend.extracted_texts[-1]
+
+
+def test_voice_manager_normalizes_old_cosyvoice3_suffix_prompt_shape():
+    from app.services.tts.clone import VoiceManager
+
+    old_prompt = "You are a helpful assistant. 旧音色参考文本<|endofprompt|>"
+
+    assert VoiceManager._format_cosyvoice3_prompt_text(old_prompt) == (
+        "You are a helpful assistant.<|endofprompt|>旧音色参考文本"
+    )
 
 
 def test_voice_manager_remove_voice_deletes_assets_and_prevents_refresh(
