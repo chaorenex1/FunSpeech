@@ -488,15 +488,6 @@ class CosyVoiceTTSEngine:
             # Emotion tags are converted to a natural-language instruct prompt for CosyVoice.
             effective_prompt = compose_emotion_prompt(prompt, emotion, emotion_intensity)
             formatted_prompt = self._format_prompt_text(effective_prompt)
-            if self._clone_model_version == "cosyvoice3" and self._voice_manager:
-                ensure_compatible = getattr(
-                    self._voice_manager, "ensure_cosyvoice3_voice_compatible", None
-                )
-                if callable(ensure_compatible) and not ensure_compatible(voice):
-                    raise DefaultServerErrorException(
-                        f"克隆音色 {voice} 的CosyVoice3 prompt_text不兼容，"
-                        "请重新同步或刷新音色运行时"
-                    )
 
             if return_timestamps:
                 # 获取CosyVoice的分句结果
