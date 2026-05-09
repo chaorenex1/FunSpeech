@@ -5,6 +5,7 @@ import asyncio
 import numpy as np
 
 from app.api.v1.realtime_voice import SlidingVadSegmenter
+from app.services.realtime_voice.audio_pacer import AudioPacer
 from app.services.realtime_voice.backpressure import AsrSegmentQueue, BoundedAudioQueue, TtsJobQueue
 from app.services.realtime_voice.text_commit import StableTextCommitter
 from app.services.realtime_voice.tts_dispatcher import RealtimeTTSDispatcher
@@ -331,5 +332,19 @@ def test_realtime_tts_dispatcher_times_out_waiting_for_slot():
         assert rejected.reason == "global_tts_queue_timeout"
         assert rejected.queue_wait_ms >= 0
         await lease.release()
+
+    asyncio.run(run())
+
+
+def test_audio_pacer_can_burst_initial_frames_to_seed_client_jitter_buffer():
+    async def run():
+        pacer = AudioPacer(sample_rate=1000, frame_ms=20, burst_ms=100)
+        audio = b"\x01\x00" * 100
+        started = asyncio.get_running_loop().time()
+        frames = [frame async for frame in pacer.iter_frames(audio)]
+        elapsed_ms = int((asyncio.get_running_loop().time() - started) * 1000)
+
+        assert len(frames) == 5
+        assert elapsed_ms < 50
 
     asyncio.run(run())

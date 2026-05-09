@@ -7,13 +7,16 @@ import asyncio
 from time import monotonic
 from typing import AsyncIterator
 
+from ...core.config import settings
+
 
 class AudioPacer:
     """Split PCM chunks into fixed-duration frames and send them by audio clock."""
 
-    def __init__(self, sample_rate: int, frame_ms: int = 20):
+    def __init__(self, sample_rate: int, frame_ms: int = 20, burst_ms: int | None = None):
         self.sample_rate = int(sample_rate or 16000)
         self.frame_ms = max(10, int(frame_ms or 20))
+        self.burst_ms = max(0, int(settings.REALTIME_PACER_BURST_MS if burst_ms is None else burst_ms))
         self.bytes_per_frame = max(2, int(self.sample_rate * self.frame_ms / 1000) * 2)
         self._pending = b""
         self._next_send_at: float | None = None
@@ -37,10 +40,10 @@ class AudioPacer:
 
     async def _pace(self) -> None:
         now = monotonic()
-        if self._next_send_at is None or self._next_send_at < now - 0.2:
-            self._next_send_at = now
+        burst_seconds = self.burst_ms / 1000
+        if self._next_send_at is None or self._next_send_at < now - burst_seconds:
+            self._next_send_at = now - burst_seconds
         delay = self._next_send_at - now
         if delay > 0:
             await asyncio.sleep(delay)
         self._next_send_at += self.frame_ms / 1000
-

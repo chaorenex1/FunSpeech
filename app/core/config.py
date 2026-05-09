@@ -58,9 +58,9 @@ class Settings:
         ""  # 启动时自动加载的自定义ASR模型列表（逗号分隔，如: dolphin-small,sensevoice-small）
     )
     SENSEVOICE_LANGUAGE: str = "auto"
-    SENSEVOICE_PARTIAL_DECODE_INTERVAL_MS: int = 800
-    SENSEVOICE_MIN_DECODE_WINDOW_MS: int = 1200
-    SENSEVOICE_MAX_PARTIAL_WINDOW_MS: int = 8000
+    SENSEVOICE_PARTIAL_DECODE_INTERVAL_MS: int = 500
+    SENSEVOICE_MIN_DECODE_WINDOW_MS: int = 800
+    SENSEVOICE_MAX_PARTIAL_WINDOW_MS: int = 4000
     SENSEVOICE_MAX_SENTENCE_MS: int = 30000
     ASR_ENABLE_VAD_ENDPOINT: bool = True
     ASR_VAD_CHUNK_SIZE_MS: int = 200
@@ -129,16 +129,17 @@ class Settings:
     # Realtime Voice 流水线配置
     REALTIME_AUDIO_INPUT_HIGH_WATERMARK_MS: int = 1200
     REALTIME_AUDIO_INPUT_MAX_MS: int = 1800
-    REALTIME_TTS_JOB_QUEUE_SIZE: int = 2
+    REALTIME_TTS_JOB_QUEUE_SIZE: int = 4
     REALTIME_TTS_GLOBAL_MAX_INFLIGHT: int = 2
     REALTIME_TTS_GLOBAL_QUEUE_SIZE: int = 16
     REALTIME_TTS_QUEUE_TIMEOUT_MS: int = 12000
     REALTIME_TTS_AUDIO_QUEUE_SIZE: int = 12
     REALTIME_TTS_GENERATOR_QUEUE_SIZE: int = 4
-    REALTIME_TEXT_STABLE_HYPOTHESES: int = 2
-    REALTIME_TEXT_MIN_COMMIT_CHARS: int = 8
-    REALTIME_TEXT_MAX_COMMIT_WAIT_MS: int = 400
+    REALTIME_TEXT_STABLE_HYPOTHESES: int = 1
+    REALTIME_TEXT_MIN_COMMIT_CHARS: int = 4
+    REALTIME_TEXT_MAX_COMMIT_WAIT_MS: int = 250
     REALTIME_PACER_FRAME_MS: int = 20
+    REALTIME_PACER_BURST_MS: int = 1200
 
     def __init__(self):
         """从环境变量读取配置"""
@@ -318,6 +319,9 @@ class Settings:
         )
         self.REALTIME_PACER_FRAME_MS = int(
             os.getenv("REALTIME_PACER_FRAME_MS", str(self.REALTIME_PACER_FRAME_MS))
+        )
+        self.REALTIME_PACER_BURST_MS = int(
+            os.getenv("REALTIME_PACER_BURST_MS", str(self.REALTIME_PACER_BURST_MS))
         )
 
     def _ensure_directories(self):
