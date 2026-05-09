@@ -580,6 +580,31 @@ class VoiceManager:
         """获取音色信息"""
         return self.registry["voices"].get(voice_name)
 
+    def get_voice_audio_path(self, voice_name: str) -> Optional[str]:
+        """获取音色注册时保存的参考音频路径。"""
+        registry_entry = self.registry["voices"].get(voice_name, {})
+        candidates = []
+
+        audio_file = registry_entry.get("audio_file")
+        if audio_file:
+            candidates.append(self.voices_dir / Path(str(audio_file)).name)
+
+        for suffix in (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"):
+            candidates.append(self.voices_dir / f"{voice_name}{suffix}")
+
+        voices_dir = self.voices_dir.resolve()
+        for path in candidates:
+            try:
+                resolved = path.resolve()
+            except OSError:
+                continue
+            if voices_dir not in (resolved, *resolved.parents):
+                logger.warning(f"跳过voices目录外的音色参考音频路径: {resolved}")
+                continue
+            if resolved.exists() and resolved.is_file():
+                return str(resolved)
+        return None
+
     def is_voice_available(self, voice_name: str) -> bool:
         """检查音色是否可用"""
         try:

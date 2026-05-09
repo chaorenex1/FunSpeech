@@ -241,6 +241,26 @@ def test_voice_manager_add_voice_formats_reference_text_for_cosyvoice3(
     assert registry["voices"]["new_voice"]["reference_text"] == "新增音色参考文本"
 
 
+def test_voice_manager_get_voice_audio_path_returns_registered_audio(
+    monkeypatch,
+    tmp_path,
+):
+    from app.services.tts.clone import VoiceManager
+
+    voices_dir = _patch_voice_manager_paths(monkeypatch, tmp_path)
+    voices_dir.mkdir(parents=True, exist_ok=True)
+    wav_file = voices_dir / "desktop_voice.wav"
+    wav_file.write_bytes(b"fake-wav")
+
+    manager = VoiceManager(FakeCosyVoiceForRegistry())
+    manager.registry["voices"]["desktop_voice"] = {
+        "name": "desktop_voice",
+        "audio_file": "desktop_voice.wav",
+    }
+
+    assert manager.get_voice_audio_path("desktop_voice") == str(wav_file.resolve())
+
+
 def test_voice_manager_remove_voice_deletes_assets_and_prevents_refresh(
     monkeypatch,
     tmp_path,
@@ -326,6 +346,18 @@ def test_voice_manager_sync_endpoints(monkeypatch):
     assert refresh_response.status_code == 200
     assert refresh_response.json()["status"] == "refreshed"
     assert engine.voice_manager.refreshed is True
+
+
+def test_tts_emotions_endpoint_returns_label_and_prompt():
+    response = client.get("/stream/v1/tts/emotions")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["supports_emotion_control"] is True
+    assert data["total"] == len(data["emotions"])
+    happy = next(item for item in data["emotions"] if item["id"] == "happy")
+    assert happy["label"] == "开心愉悦"
+    assert happy["prompt"] == "请用开心、愉悦的语气说这句话。"
 
 
 def test_voice_design_endpoint_returns_generated_audio_url(monkeypatch, tmp_path):

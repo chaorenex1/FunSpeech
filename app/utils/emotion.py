@@ -38,6 +38,26 @@ EMOTION_PROMPTS = {
     "neutral": "请用自然平静的语气说这句话。",
 }
 
+EMOTION_LABELS = {
+    "neutral": "自然平静",
+    "happy": "开心愉悦",
+    "sad": "伤心低落",
+    "angry": "生气强烈",
+    "fearful": "害怕紧张",
+    "disgusted": "厌恶不满",
+    "surprised": "惊讶意外",
+}
+
+EMOTION_ORDER = (
+    "neutral",
+    "happy",
+    "sad",
+    "angry",
+    "fearful",
+    "disgusted",
+    "surprised",
+)
+
 COSYVOICE_END_OF_PROMPT = "<|endofprompt|>"
 COSYVOICE3_SYSTEM_PROMPT = "You are a helpful assistant."
 _RICH_TAG_RE = re.compile(r"<\|([^|<>]+)\|>")
@@ -77,6 +97,18 @@ def normalize_emotion(value: Optional[str]) -> Optional[str]:
             f"unsupported emotion: {value}. supported: {', '.join(sorted(SUPPORTED_EMOTIONS))}"
         )
     return normalized
+
+
+def list_emotion_options() -> list[dict[str, str]]:
+    """Return UI-safe emotion options; clients display label and send prompt."""
+    return [
+        {
+            "id": emotion,
+            "label": EMOTION_LABELS[emotion],
+            "prompt": EMOTION_PROMPTS[emotion],
+        }
+        for emotion in EMOTION_ORDER
+    ]
 
 
 def extract_sensevoice_emotion(raw_text: str) -> Optional[str]:

@@ -42,6 +42,7 @@ from ...utils.common import (
     validate_voice_parameter,
     clean_text_for_tts,
 )
+from ...utils.emotion import list_emotion_options
 from ...utils.audio import (
     validate_reference_audio,
     cleanup_temp_file,
@@ -361,6 +362,27 @@ async def get_voice_list(request: Request) -> JSONResponse:
     except Exception as e:
         logger.error(f"获取音色列表失败: {str(e)}")
         raise HTTPException(status_code=500, detail=f"获取音色列表失败: {str(e)}")
+
+
+@router.get(
+    "/emotions",
+    summary="获取TTS情感指令列表",
+    description="返回当前TTS支持的情感指令。客户端展示label，提交TTS时传prompt。",
+)
+async def get_emotion_options(request: Request) -> JSONResponse:
+    """获取支持的情感指令选项。"""
+    result, content = validate_token(request)
+    if not result:
+        raise AuthenticationException(content, "get_emotion_options")
+
+    emotions = list_emotion_options()
+    return JSONResponse(
+        content={
+            "supports_emotion_control": True,
+            "emotions": emotions,
+            "total": len(emotions),
+        }
+    )
 
 
 @router.get(

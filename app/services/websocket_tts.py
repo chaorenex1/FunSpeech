@@ -498,17 +498,27 @@ class AliyunWebSocketTTSService:
 
         # 只有显式 prompt/情感指令才走 instruct2，避免空 prompt 复读注册参考文本。
         if use_instruct:
+            prompt_wav = None
+            zero_shot_spk_id = voice
+            if clone_version.lower() == "cosyvoice3":
+                if not hasattr(engine, "_get_saved_voice_prompt_wav"):
+                    raise Exception(f"克隆音色缺少参考音频查询能力，无法执行CosyVoice3指令合成: {voice}")
+                prompt_wav = engine._get_saved_voice_prompt_wav(voice)
+                if not prompt_wav:
+                    raise Exception(f"克隆音色缺少参考音频，无法执行CosyVoice3指令合成: {voice}")
+                zero_shot_spk_id = ""
             inference_method = engine.inference_instruct2
             inference_args = (
                 text,
                 formatted_prompt,  # instruct_text
-                None,  # prompt_wav - 不需要，使用保存的音色
+                prompt_wav,
             )
             inference_kwargs = {
-                "zero_shot_spk_id": voice,
                 "stream": True,
                 "speed": speed,
             }
+            if zero_shot_spk_id:
+                inference_kwargs["zero_shot_spk_id"] = zero_shot_spk_id
         else:
             # 无 prompt 时使用 zero_shot
             inference_method = engine.inference_zero_shot

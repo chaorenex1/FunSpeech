@@ -454,6 +454,12 @@ class CosyVoiceTTSEngine:
         """
         return format_cosyvoice_instruction_prompt(prompt_text, self._clone_model_version)
 
+    def _get_saved_voice_prompt_wav(self, voice: str) -> Optional[str]:
+        """获取保存音色的参考音频，用于 CosyVoice3 instruct2 官方调用形态。"""
+        if not self._voice_manager or not hasattr(self._voice_manager, "get_voice_audio_path"):
+            return None
+        return self._voice_manager.get_voice_audio_path(voice)
+
     def _synthesize_with_saved_voice(
         self,
         text: str,
@@ -502,14 +508,26 @@ class CosyVoiceTTSEngine:
                     sentence_audio_segments = []
                     use_instruct = bool(effective_prompt)
                     if use_instruct:
-                        # 只有显式 prompt/情感指令才走 instruct2，避免空 prompt 复读注册参考文本。
+                        prompt_wav = None
+                        inference_kwargs = {
+                            "zero_shot_spk_id": voice,
+                            "stream": False,
+                            "speed": speed,
+                        }
+                        if self._clone_model_version.lower() == "cosyvoice3":
+                            prompt_wav = self._get_saved_voice_prompt_wav(voice)
+                            if not prompt_wav:
+                                raise DefaultServerErrorException(
+                                    f"克隆音色缺少参考音频，无法执行CosyVoice3指令合成: {voice}"
+                                )
+                            inference_kwargs.pop("zero_shot_spk_id")
+                        # CosyVoice3 指令模式必须传 prompt_wav，不带 zero_shot_spk_id，
+                        # 否则官方 frontend 会复用 spk2info 中注册时的 prompt_text。
                         inference_gen = self.inference_instruct2(
                             sentence_text,
                             formatted_prompt,  # instruct_text
-                            None,  # prompt_wav - 不需要，使用保存的音色
-                            zero_shot_spk_id=voice,
-                            stream=False,
-                            speed=speed,
+                            prompt_wav,
+                            **inference_kwargs,
                         )
                     else:
                         # 无 prompt 时使用 zero_shot
@@ -560,14 +578,26 @@ class CosyVoiceTTSEngine:
                 # 不需要时间戳，直接合成
                 use_instruct = bool(effective_prompt)
                 if use_instruct:
-                    # 只有显式 prompt/情感指令才走 instruct2，避免空 prompt 复读注册参考文本。
+                    prompt_wav = None
+                    inference_kwargs = {
+                        "zero_shot_spk_id": voice,
+                        "stream": False,
+                        "speed": speed,
+                    }
+                    if self._clone_model_version.lower() == "cosyvoice3":
+                        prompt_wav = self._get_saved_voice_prompt_wav(voice)
+                        if not prompt_wav:
+                            raise DefaultServerErrorException(
+                                f"克隆音色缺少参考音频，无法执行CosyVoice3指令合成: {voice}"
+                            )
+                        inference_kwargs.pop("zero_shot_spk_id")
+                    # CosyVoice3 指令模式必须传 prompt_wav，不带 zero_shot_spk_id，
+                    # 否则官方 frontend 会复用 spk2info 中注册时的 prompt_text。
                     inference_gen = self.inference_instruct2(
                         text,
                         formatted_prompt,  # instruct_text
-                        None,  # prompt_wav - 不需要，使用保存的音色
-                        zero_shot_spk_id=voice,
-                        stream=False,
-                        speed=speed,
+                        prompt_wav,
+                        **inference_kwargs,
                     )
                 else:
                     # 无 prompt 时使用 zero_shot

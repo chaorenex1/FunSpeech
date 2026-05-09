@@ -117,6 +117,7 @@ def create_app() -> FastAPI:
                 "tts_clone_eq": "/stream/v1/tts/clone_eq",
                 "tts_openai": "/openai/v1/audio/speech",
                 "tts_voices": "/stream/v1/tts/voices",
+                "tts_emotions": "/stream/v1/tts/emotions",
                 "tts_health": "/stream/v1/tts/health",
                 "async_tts_submit": "/rest/v1/tts/async",
                 "async_tts_query": "/rest/v1/tts/async",
