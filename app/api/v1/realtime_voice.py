@@ -5,6 +5,7 @@ import json
 import logging
 import asyncio
 import contextlib
+from dataclasses import dataclass
 from time import monotonic
 
 import numpy as np
@@ -26,6 +27,15 @@ from ...services.realtime_voice.types import AsrSegment, AudioFrame, AsrHypothes
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/ws/v1/realtime", tags=["Realtime Voice"])
+
+
+@dataclass
+class PrefetchedTtsJob:
+    job: TtsJob
+    tts_job_id: str
+    audio_queue: asyncio.Queue
+    done_sentinel: object
+    task: asyncio.Task
 
 
 class SlidingVadSegmenter:
@@ -199,10 +209,13 @@ class RealtimeVoiceAsrTtsSession:
         self.text_committer = StableTextCommitter(
             stable_hypotheses=settings.REALTIME_TEXT_STABLE_HYPOTHESES,
             min_commit_chars=settings.REALTIME_TEXT_MIN_COMMIT_CHARS,
+            max_commit_chars=settings.REALTIME_TEXT_MAX_COMMIT_CHARS,
             max_commit_wait_ms=settings.REALTIME_TEXT_MAX_COMMIT_WAIT_MS,
         )
         self.audio_pacer = AudioPacer(
-            self.sample_rate, frame_ms=settings.REALTIME_PACER_FRAME_MS
+            self.sample_rate,
+            frame_ms=settings.REALTIME_PACER_FRAME_MS,
+            burst_ms=settings.REALTIME_PACER_BURST_MS,
         )
         self._tasks: list[asyncio.Task] = []
         self._websocket: WebSocket | None = None
@@ -221,6 +234,23 @@ class RealtimeVoiceAsrTtsSession:
         self._pending_vad_last_seq: int | None = None
         self._last_vad_frame_event_at = monotonic()
         self.config_version = 1
+
+    def realtime_config_snapshot(self) -> dict:
+        return {
+            "sensevoice_partial_decode_interval_ms": settings.SENSEVOICE_PARTIAL_DECODE_INTERVAL_MS,
+            "sensevoice_min_decode_window_ms": settings.SENSEVOICE_MIN_DECODE_WINDOW_MS,
+            "sensevoice_max_partial_window_ms": settings.SENSEVOICE_MAX_PARTIAL_WINDOW_MS,
+            "tts_job_queue_size": settings.REALTIME_TTS_JOB_QUEUE_SIZE,
+            "tts_prefetch_jobs": settings.REALTIME_TTS_PREFETCH_JOBS,
+            "tts_global_max_inflight": settings.REALTIME_TTS_GLOBAL_MAX_INFLIGHT,
+            "tts_audio_queue_size": settings.REALTIME_TTS_AUDIO_QUEUE_SIZE,
+            "text_stable_hypotheses": settings.REALTIME_TEXT_STABLE_HYPOTHESES,
+            "text_min_commit_chars": settings.REALTIME_TEXT_MIN_COMMIT_CHARS,
+            "text_max_commit_chars": settings.REALTIME_TEXT_MAX_COMMIT_CHARS,
+            "text_max_commit_wait_ms": settings.REALTIME_TEXT_MAX_COMMIT_WAIT_MS,
+            "pacer_frame_ms": settings.REALTIME_PACER_FRAME_MS,
+            "pacer_burst_ms": settings.REALTIME_PACER_BURST_MS,
+        }
 
     def close(self):
         """Cancel workers and release a session-pinned ASR engine."""
@@ -597,189 +627,228 @@ class RealtimeVoiceAsrTtsSession:
         assert self._websocket is not None
         assert self._task_id is not None
         dispatcher = get_realtime_tts_dispatcher()
-        while not self._closed:
-            job = await self.tts_jobs.get()
-            tts_job_id = f"tts_{job.revision_id}"
-            await self._send_json(
-                self._event(
-                    "tts.job_waiting",
-                    payload={
-                        "tts_job_id": tts_job_id,
-                        "revision_id": job.revision_id,
-                        "text": job.text,
-                        "voice_name": job.voice_name,
-                        "config_version": self.config_version,
-                        "priority": job.priority,
-                        "global_active": dispatcher.active,
-                        "global_waiting": dispatcher.waiting,
-                    },
-                )
-            )
-            lease_or_rejection = await dispatcher.acquire()
-            if not getattr(lease_or_rejection, "admission", lease_or_rejection).accepted:
-                rejection = lease_or_rejection
+        prefetch_limit = max(1, int(settings.REALTIME_TTS_PREFETCH_JOBS))
+        prefetched_jobs: list[PrefetchedTtsJob] = []
+        try:
+            while not self._closed:
+                while len(prefetched_jobs) < prefetch_limit and not self._closed:
+                    job = await self.tts_jobs.get() if not prefetched_jobs else self.tts_jobs.get_nowait()
+                    if job is None:
+                        break
+                    prefetched_jobs.append(self._start_tts_prefetch(job, dispatcher))
+
+                if not prefetched_jobs:
+                    continue
+
+                prefetched = prefetched_jobs.pop(0)
+                await self._drain_prefetched_tts(prefetched)
+        finally:
+            for prefetched in prefetched_jobs:
+                if not prefetched.task.done():
+                    prefetched.task.cancel()
+                with contextlib.suppress(BaseException):
+                    await prefetched.task
+
+    def _start_tts_prefetch(self, job: TtsJob, dispatcher) -> PrefetchedTtsJob:
+        assert self._websocket is not None
+        assert self._task_id is not None
+        tts_job_id = f"tts_{job.revision_id}"
+        audio_queue: asyncio.Queue = asyncio.Queue(
+            maxsize=max(1, settings.REALTIME_TTS_AUDIO_QUEUE_SIZE)
+        )
+        synth_done = object()
+
+        async def synthesize_job_audio() -> None:
+            try:
                 await self._send_json(
                     self._event(
-                        "tts.job_dropped",
+                        "tts.job_waiting",
                         payload={
                             "tts_job_id": tts_job_id,
                             "revision_id": job.revision_id,
-                            "reason": rejection.reason,
-                            "queue_wait_ms": rejection.queue_wait_ms,
-                            "global_active": rejection.active,
-                            "global_waiting": rejection.waiting,
+                            "text": job.text,
+                            "voice_name": job.voice_name,
+                            "config_version": self.config_version,
                             "priority": job.priority,
+                            "global_active": dispatcher.active,
+                            "global_waiting": dispatcher.waiting,
+                            "prefetch_jobs": settings.REALTIME_TTS_PREFETCH_JOBS,
                         },
                     )
                 )
-                await self._send_json(
-                    self._event(
-                        "backpressure.applied",
-                        payload={
-                            "scope": "tts",
-                            "level": "warning",
-                            "reason": rejection.reason,
-                            "action": "drop_tts_job",
-                            "message": f"revision={job.revision_id}",
-                        },
-                        type=rejection.reason,
-                        message=f"revision={job.revision_id}",
-                    )
-                )
-                continue
-
-            lease = lease_or_rejection
-            admission = lease.admission
-            await self._send_json(
-                self._event(
-                    "tts.job_admitted",
-                    payload={
-                        "tts_job_id": tts_job_id,
-                        "revision_id": job.revision_id,
-                        "queue_wait_ms": admission.queue_wait_ms,
-                        "global_active": admission.active,
-                        "global_waiting": admission.waiting,
-                    },
-                )
-            )
-            await self._send_json(
-                self._event(
-                    "tts.job_started",
-                    payload={
-                        "tts_job_id": tts_job_id,
-                        "revision_id": job.revision_id,
-                        "text": job.text,
-                        "voice_name": job.voice_name,
-                        "config_version": self.config_version,
-                        "priority": job.priority,
-                    },
-                    stage="tts_synthesizing",
-                    text=job.text,
-                    revision_id=job.revision_id,
-                )
-            )
-            emitted = False
-            first_audio_sent = False
-            tts_audio_queue: asyncio.Queue = asyncio.Queue(
-                maxsize=max(1, settings.REALTIME_TTS_AUDIO_QUEUE_SIZE)
-            )
-            synth_done = object()
-
-            async def synthesize_job_audio() -> None:
-                try:
-                    async with lease:
-                        async for chunk in self._synthesize(
-                            job.text,
-                            self._websocket,
-                            self._task_id,
-                            voice_name=job.voice_name,
-                            parameters=job.parameters,
-                        ):
-                            if chunk:
-                                await tts_audio_queue.put(chunk)
-                except BaseException as exc:
-                    await tts_audio_queue.put(exc)
-                finally:
-                    await tts_audio_queue.put(synth_done)
-
-            synth_task = asyncio.create_task(
-                synthesize_job_audio(),
-                name=f"{self._task_id}:tts-synth:{job.revision_id}",
-            )
-            try:
-                while True:
-                    chunk = await tts_audio_queue.get()
-                    if chunk is synth_done:
-                        break
-                    if isinstance(chunk, BaseException):
-                        raise chunk
-                    async for frame in self.audio_pacer.iter_frames(chunk):
-                        self._audio_chunk_index += 1
-                        if not first_audio_sent:
-                            await self._send_json(
-                                self._event(
-                                    "tts.first_audio",
-                                    payload={
-                                        "tts_job_id": tts_job_id,
-                                        "revision_id": job.revision_id,
-                                        "audio_chunk_index": self._audio_chunk_index,
-                                    },
-                                )
-                            )
-                            first_audio_sent = True
-                        await self._send_audio_frame(
-                            tts_job_id=tts_job_id,
-                            revision_id=job.revision_id,
-                            frame=frame,
-                        )
-                        emitted = True
-            finally:
-                if not synth_task.done():
-                    synth_task.cancel()
-                with contextlib.suppress(BaseException):
-                    await synth_task
-            async for frame in self.audio_pacer.flush():
-                self._audio_chunk_index += 1
-                if not first_audio_sent:
+                lease_or_rejection = await dispatcher.acquire()
+                if not getattr(lease_or_rejection, "admission", lease_or_rejection).accepted:
+                    rejection = lease_or_rejection
                     await self._send_json(
                         self._event(
-                            "tts.first_audio",
+                            "tts.job_dropped",
                             payload={
                                 "tts_job_id": tts_job_id,
                                 "revision_id": job.revision_id,
-                                "audio_chunk_index": self._audio_chunk_index,
+                                "reason": rejection.reason,
+                                "queue_wait_ms": rejection.queue_wait_ms,
+                                "global_active": rejection.active,
+                                "global_waiting": rejection.waiting,
+                                "priority": job.priority,
                             },
                         )
                     )
-                    first_audio_sent = True
-                await self._send_audio_frame(
-                    tts_job_id=tts_job_id,
-                    revision_id=job.revision_id,
-                    frame=frame,
-                )
-                emitted = True
-            if emitted:
+                    await self._send_json(
+                        self._event(
+                            "backpressure.applied",
+                            payload={
+                                "scope": "tts",
+                                "level": "warning",
+                                "reason": rejection.reason,
+                                "action": "drop_tts_job",
+                                "message": f"revision={job.revision_id}",
+                            },
+                            type=rejection.reason,
+                            message=f"revision={job.revision_id}",
+                        )
+                    )
+                    return
+
+                lease = lease_or_rejection
+                admission = lease.admission
                 await self._send_json(
                     self._event(
-                        "tts.job_completed",
+                        "tts.job_admitted",
                         payload={
                             "tts_job_id": tts_job_id,
                             "revision_id": job.revision_id,
+                            "queue_wait_ms": admission.queue_wait_ms,
+                            "global_active": admission.active,
+                            "global_waiting": admission.waiting,
+                            "prefetch_jobs": settings.REALTIME_TTS_PREFETCH_JOBS,
                         },
                     )
                 )
                 await self._send_json(
                     self._event(
-                        "tts_completed",
+                        "tts.job_started",
                         payload={
-                            "protocol_event": "tts.job_completed",
                             "tts_job_id": tts_job_id,
                             "revision_id": job.revision_id,
+                            "text": job.text,
+                            "voice_name": job.voice_name,
+                            "config_version": self.config_version,
+                            "priority": job.priority,
+                            "prefetch_jobs": settings.REALTIME_TTS_PREFETCH_JOBS,
                         },
-                        stage="tts_audio_sent",
+                        stage="tts_synthesizing",
+                        text=job.text,
                         revision_id=job.revision_id,
                     )
                 )
+                async with lease:
+                    async for chunk in self._synthesize(
+                        job.text,
+                        self._websocket,
+                        self._task_id,
+                        voice_name=job.voice_name,
+                        parameters=job.parameters,
+                    ):
+                        if chunk:
+                            await audio_queue.put(chunk)
+            except BaseException as exc:
+                await audio_queue.put(exc)
+            finally:
+                await audio_queue.put(synth_done)
+
+        task = asyncio.create_task(
+            synthesize_job_audio(),
+            name=f"{self._task_id}:tts-prefetch:{job.revision_id}",
+        )
+        return PrefetchedTtsJob(
+            job=job,
+            tts_job_id=tts_job_id,
+            audio_queue=audio_queue,
+            done_sentinel=synth_done,
+            task=task,
+        )
+
+    async def _drain_prefetched_tts(self, prefetched: PrefetchedTtsJob) -> None:
+        job = prefetched.job
+        emitted = False
+        first_audio_sent = False
+        try:
+            while True:
+                chunk = await prefetched.audio_queue.get()
+                if chunk is prefetched.done_sentinel:
+                    break
+                if isinstance(chunk, BaseException):
+                    raise chunk
+                async for frame in self.audio_pacer.iter_frames(chunk):
+                    self._audio_chunk_index += 1
+                    if not first_audio_sent:
+                        await self._send_json(
+                            self._event(
+                                "tts.first_audio",
+                                payload={
+                                    "tts_job_id": prefetched.tts_job_id,
+                                    "revision_id": job.revision_id,
+                                    "audio_chunk_index": self._audio_chunk_index,
+                                    "prefetched": True,
+                                },
+                            )
+                        )
+                        first_audio_sent = True
+                    await self._send_audio_frame(
+                        tts_job_id=prefetched.tts_job_id,
+                        revision_id=job.revision_id,
+                        frame=frame,
+                    )
+                    emitted = True
+        finally:
+            if not prefetched.task.done():
+                prefetched.task.cancel()
+            with contextlib.suppress(BaseException):
+                await prefetched.task
+
+        async for frame in self.audio_pacer.flush():
+            self._audio_chunk_index += 1
+            if not first_audio_sent:
+                await self._send_json(
+                    self._event(
+                        "tts.first_audio",
+                        payload={
+                            "tts_job_id": prefetched.tts_job_id,
+                            "revision_id": job.revision_id,
+                            "audio_chunk_index": self._audio_chunk_index,
+                            "prefetched": True,
+                        },
+                    )
+                )
+                first_audio_sent = True
+            await self._send_audio_frame(
+                tts_job_id=prefetched.tts_job_id,
+                revision_id=job.revision_id,
+                frame=frame,
+            )
+            emitted = True
+        if emitted:
+            await self._send_json(
+                self._event(
+                    "tts.job_completed",
+                    payload={
+                        "tts_job_id": prefetched.tts_job_id,
+                        "revision_id": job.revision_id,
+                    },
+                )
+            )
+            await self._send_json(
+                self._event(
+                    "tts_completed",
+                    payload={
+                        "protocol_event": "tts.job_completed",
+                        "tts_job_id": prefetched.tts_job_id,
+                        "revision_id": job.revision_id,
+                    },
+                    stage="tts_audio_sent",
+                    revision_id=job.revision_id,
+                )
+            )
 
     async def _transcribe(self, audio: bytes, task_id: str) -> str:
         events = await self._transcribe_events(audio, task_id)
@@ -1062,6 +1131,11 @@ async def realtime_voice_endpoint(websocket: WebSocket):
                 if hasattr(asr_tts_session, "start"):
                     asr_tts_session.start(websocket, task_id)
                 config_version = getattr(asr_tts_session, "config_version", None)
+                realtime_config = (
+                    asr_tts_session.realtime_config_snapshot()
+                    if hasattr(asr_tts_session, "realtime_config_snapshot")
+                    else None
+                )
                 await websocket.send_json(
                     event_builder.build(
                         "configured" if event == "configure" else "voice_switched",
@@ -1075,6 +1149,7 @@ async def realtime_voice_endpoint(websocket: WebSocket):
                             "pipeline": pipeline,
                             "audio_mode": "asr_tts_pipeline",
                             "config_version": config_version,
+                            "realtime_config": realtime_config,
                         },
                         protocol_event="session.configured"
                         if event == "configure"
@@ -1085,6 +1160,7 @@ async def realtime_voice_endpoint(websocket: WebSocket):
                         pipeline=pipeline,
                         audio_mode="asr_tts_pipeline",
                         config_version=config_version,
+                        realtime_config=realtime_config,
                     )
                 )
             elif event == "update":

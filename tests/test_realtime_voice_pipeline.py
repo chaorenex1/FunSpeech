@@ -132,6 +132,23 @@ def test_stable_text_committer_does_not_recommit_rolling_window_subset():
     assert committer.update(AsrHypothesis("我们去公园")) is None
 
 
+def test_stable_text_committer_bounds_speculative_delta_size():
+    committer = StableTextCommitter(
+        stable_hypotheses=1,
+        min_commit_chars=2,
+        max_commit_chars=4,
+        max_commit_wait_ms=10_000,
+    )
+
+    first = committer.update(AsrHypothesis("今天我们一起去公园"))
+    second = committer.update(AsrHypothesis("今天我们一起去公园"))
+
+    assert first is not None
+    assert first.text == "今天我们"
+    assert second is not None
+    assert second.text == "一起去公"
+
+
 def test_bounded_audio_queue_drops_silence_before_speech_when_over_budget():
     async def run():
         queue = BoundedAudioQueue(high_watermark_ms=60, max_ms=100)
@@ -282,7 +299,7 @@ def test_tts_job_queue_drops_stale_stable_jobs_and_prefers_final():
 
 def test_tts_job_queue_coalesces_stable_text_when_waiting():
     async def run():
-        queue = TtsJobQueue(maxsize=3)
+        queue = TtsJobQueue(maxsize=1)
 
         await queue.put(TtsJob(1, "你", "voice", {}, "stable"))
         events = await queue.put(TtsJob(2, "好", "voice", {}, "stable"))
@@ -291,6 +308,21 @@ def test_tts_job_queue_coalesces_stable_text_when_waiting():
         job = await queue.get()
         assert job.revision_id == 2
         assert job.text == "你好"
+
+    asyncio.run(run())
+
+
+def test_tts_job_queue_keeps_small_stable_jobs_separate_before_pressure():
+    async def run():
+        queue = TtsJobQueue(maxsize=3)
+
+        assert await queue.put(TtsJob(1, "你", "voice", {}, "stable")) == []
+        assert await queue.put(TtsJob(2, "好", "voice", {}, "stable")) == []
+
+        first = await queue.get()
+        second = await queue.get()
+        assert first.text == "你"
+        assert second.text == "好"
 
     asyncio.run(run())
 

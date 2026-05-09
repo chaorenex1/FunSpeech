@@ -16,10 +16,16 @@ class StableTextCommitter:
         self,
         stable_hypotheses: int = 2,
         min_commit_chars: int = 8,
+        max_commit_chars: int | None = None,
         max_commit_wait_ms: int = 400,
     ):
         self.stable_hypotheses = max(1, stable_hypotheses)
         self.min_commit_chars = max(1, min_commit_chars)
+        self.max_commit_chars = (
+            max(self.min_commit_chars, max_commit_chars)
+            if max_commit_chars is not None and max_commit_chars > 0
+            else 0
+        )
         self.max_commit_wait_ms = max(1, max_commit_wait_ms)
         self._recent: deque[str] = deque(maxlen=self.stable_hypotheses)
         self._committed_text = ""
@@ -52,6 +58,11 @@ class StableTextCommitter:
 
         if not hypothesis.is_final and not self._should_commit(delta):
             return None
+
+        if not hypothesis.is_final and self.max_commit_chars > 0:
+            delta = self._bounded_delta(delta)
+            if not delta:
+                return None
 
         self._revision_id += 1
         self._committed_text = f"{self._committed_text}{delta}"
@@ -104,6 +115,16 @@ class StableTextCommitter:
             return True
         elapsed_ms = int((monotonic() - self._last_commit_at) * 1000)
         return elapsed_ms >= self.max_commit_wait_ms
+
+    def _bounded_delta(self, delta: str) -> str:
+        """Emit short speculative TTS chunks while keeping punctuation intact."""
+        if len(delta) <= self.max_commit_chars:
+            return delta
+        window = delta[: self.max_commit_chars]
+        for index in range(len(window) - 1, self.min_commit_chars - 2, -1):
+            if window[index] in "，。！？；,.!?;":
+                return window[: index + 1].strip()
+        return window.strip()
 
 
 def _longest_common_prefix(left: str, right: str) -> str:

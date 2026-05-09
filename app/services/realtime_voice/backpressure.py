@@ -165,7 +165,7 @@ class TtsJobQueue:
     async def put(self, job) -> list[BackpressureEvent]:
         events: list[BackpressureEvent] = []
         async with self._condition:
-            if job.priority == "stable":
+            if job.priority == "stable" and len(self._jobs) >= self.maxsize:
                 stable_jobs = [existing for existing in self._jobs if existing.priority == "stable"]
                 if stable_jobs:
                     merged_text = "".join(existing.text for existing in stable_jobs) + job.text
@@ -203,6 +203,14 @@ class TtsJobQueue:
             if final_jobs:
                 return self._remove_at(final_jobs[0])
             return self._jobs.popleft()
+
+    def get_nowait(self):
+        if not self._jobs:
+            return None
+        final_jobs = [i for i, job in enumerate(self._jobs) if job.priority == "final"]
+        if final_jobs:
+            return self._remove_at(final_jobs[0])
+        return self._jobs.popleft()
 
     def clear(self) -> None:
         self._jobs.clear()

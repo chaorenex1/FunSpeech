@@ -135,9 +135,11 @@ class Settings:
     REALTIME_TTS_QUEUE_TIMEOUT_MS: int = 12000
     REALTIME_TTS_AUDIO_QUEUE_SIZE: int = 12
     REALTIME_TTS_GENERATOR_QUEUE_SIZE: int = 4
+    REALTIME_TTS_PREFETCH_JOBS: int = 2
     REALTIME_TEXT_STABLE_HYPOTHESES: int = 1
-    REALTIME_TEXT_MIN_COMMIT_CHARS: int = 4
-    REALTIME_TEXT_MAX_COMMIT_WAIT_MS: int = 250
+    REALTIME_TEXT_MIN_COMMIT_CHARS: int = 2
+    REALTIME_TEXT_MAX_COMMIT_CHARS: int = 8
+    REALTIME_TEXT_MAX_COMMIT_WAIT_MS: int = 120
     REALTIME_PACER_FRAME_MS: int = 20
     REALTIME_PACER_BURST_MS: int = 1200
 
@@ -299,6 +301,12 @@ class Settings:
                 str(self.REALTIME_TTS_GENERATOR_QUEUE_SIZE),
             )
         )
+        self.REALTIME_TTS_PREFETCH_JOBS = int(
+            os.getenv(
+                "REALTIME_TTS_PREFETCH_JOBS",
+                str(self.REALTIME_TTS_PREFETCH_JOBS),
+            )
+        )
         self.REALTIME_TEXT_STABLE_HYPOTHESES = int(
             os.getenv(
                 "REALTIME_TEXT_STABLE_HYPOTHESES",
@@ -309,6 +317,12 @@ class Settings:
             os.getenv(
                 "REALTIME_TEXT_MIN_COMMIT_CHARS",
                 str(self.REALTIME_TEXT_MIN_COMMIT_CHARS),
+            )
+        )
+        self.REALTIME_TEXT_MAX_COMMIT_CHARS = int(
+            os.getenv(
+                "REALTIME_TEXT_MAX_COMMIT_CHARS",
+                str(self.REALTIME_TEXT_MAX_COMMIT_CHARS),
             )
         )
         self.REALTIME_TEXT_MAX_COMMIT_WAIT_MS = int(
