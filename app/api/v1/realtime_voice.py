@@ -195,17 +195,22 @@ class RealtimeVoiceAsrTtsSession:
         self.audio_queue = BoundedAudioQueue(
             settings.REALTIME_AUDIO_INPUT_HIGH_WATERMARK_MS,
             settings.REALTIME_AUDIO_INPUT_MAX_MS,
+            preserve_speech=settings.REALTIME_PRESERVE_SPEECH_UNDER_PRESSURE,
         )
         self.asr_queue = AsrSegmentQueue(
             settings.REALTIME_AUDIO_INPUT_HIGH_WATERMARK_MS,
             settings.REALTIME_AUDIO_INPUT_MAX_MS,
+            preserve_speech=settings.REALTIME_PRESERVE_SPEECH_UNDER_PRESSURE,
         )
         self.vad_segmenter = SlidingVadSegmenter(
             window_ms=settings.ASR_VAD_CHUNK_SIZE_MS,
             pre_roll_ms=settings.ASR_VAD_SPEECH_PAD_MS,
             end_silence_ms=settings.ASR_VAD_END_FALLBACK_MS,
         )
-        self.tts_jobs = TtsJobQueue(settings.REALTIME_TTS_JOB_QUEUE_SIZE)
+        self.tts_jobs = TtsJobQueue(
+            settings.REALTIME_TTS_JOB_QUEUE_SIZE,
+            drop_on_overload=settings.REALTIME_TTS_DROP_ON_OVERLOAD,
+        )
         self.text_committer = StableTextCommitter(
             stable_hypotheses=settings.REALTIME_TEXT_STABLE_HYPOTHESES,
             min_commit_chars=settings.REALTIME_TEXT_MIN_COMMIT_CHARS,
@@ -216,6 +221,9 @@ class RealtimeVoiceAsrTtsSession:
             self.sample_rate,
             frame_ms=settings.REALTIME_PACER_FRAME_MS,
             burst_ms=settings.REALTIME_PACER_BURST_MS,
+            target_queue_ms=settings.REALTIME_OUTPUT_TARGET_QUEUE_MS,
+            high_queue_ms=settings.REALTIME_OUTPUT_HIGH_QUEUE_MS,
+            max_backpressure_sleep_ms=settings.REALTIME_OUTPUT_BACKPRESSURE_MAX_SLEEP_MS,
         )
         self._tasks: list[asyncio.Task] = []
         self._websocket: WebSocket | None = None
@@ -233,6 +241,7 @@ class RealtimeVoiceAsrTtsSession:
         self._pending_vad_first_seq: int | None = None
         self._pending_vad_last_seq: int | None = None
         self._last_vad_frame_event_at = monotonic()
+        self._last_client_playback_backpressure_at = 0.0
         self.config_version = 1
 
     def realtime_config_snapshot(self) -> dict:
@@ -240,8 +249,10 @@ class RealtimeVoiceAsrTtsSession:
             "sensevoice_partial_decode_interval_ms": settings.SENSEVOICE_PARTIAL_DECODE_INTERVAL_MS,
             "sensevoice_min_decode_window_ms": settings.SENSEVOICE_MIN_DECODE_WINDOW_MS,
             "sensevoice_max_partial_window_ms": settings.SENSEVOICE_MAX_PARTIAL_WINDOW_MS,
+            "preserve_speech_under_pressure": settings.REALTIME_PRESERVE_SPEECH_UNDER_PRESSURE,
             "tts_job_queue_size": settings.REALTIME_TTS_JOB_QUEUE_SIZE,
             "tts_prefetch_jobs": settings.REALTIME_TTS_PREFETCH_JOBS,
+            "tts_drop_on_overload": settings.REALTIME_TTS_DROP_ON_OVERLOAD,
             "tts_global_max_inflight": settings.REALTIME_TTS_GLOBAL_MAX_INFLIGHT,
             "tts_audio_queue_size": settings.REALTIME_TTS_AUDIO_QUEUE_SIZE,
             "text_stable_hypotheses": settings.REALTIME_TEXT_STABLE_HYPOTHESES,
@@ -250,7 +261,46 @@ class RealtimeVoiceAsrTtsSession:
             "text_max_commit_wait_ms": settings.REALTIME_TEXT_MAX_COMMIT_WAIT_MS,
             "pacer_frame_ms": settings.REALTIME_PACER_FRAME_MS,
             "pacer_burst_ms": settings.REALTIME_PACER_BURST_MS,
+            "output_target_queue_ms": settings.REALTIME_OUTPUT_TARGET_QUEUE_MS,
+            "output_high_queue_ms": settings.REALTIME_OUTPUT_HIGH_QUEUE_MS,
+            "output_backpressure_max_sleep_ms": settings.REALTIME_OUTPUT_BACKPRESSURE_MAX_SLEEP_MS,
         }
+
+    async def update_client_audio_ack(self, payload: dict) -> None:
+        last = payload.get("last") if isinstance(payload.get("last"), dict) else {}
+        ack_items = payload.get("acks") if isinstance(payload.get("acks"), list) else []
+        queue_values = [
+            int(item["playback_queue_ms"])
+            for item in ack_items
+            if isinstance(item, dict) and isinstance(item.get("playback_queue_ms"), (int, float))
+        ]
+        if isinstance(last.get("playback_queue_ms"), (int, float)):
+            queue_values.append(int(last["playback_queue_ms"]))
+        if not queue_values:
+            return
+        playback_queue_ms = max(queue_values)
+        self.audio_pacer.update_client_queue_ms(playback_queue_ms)
+        now = monotonic()
+        if (
+            playback_queue_ms >= settings.REALTIME_OUTPUT_HIGH_QUEUE_MS
+            and now - self._last_client_playback_backpressure_at >= 1.0
+        ):
+            self._last_client_playback_backpressure_at = now
+            await self._send_json(
+                self._event(
+                    "backpressure.applied",
+                    payload={
+                        "scope": "client_playback",
+                        "level": "warning",
+                        "reason": "client_playback_queue_high",
+                        "action": "slow_output_pacer",
+                        "message": f"playback_queue_ms={playback_queue_ms}",
+                        "playback_queue_ms": playback_queue_ms,
+                    },
+                    type="client_playback_queue_high",
+                    message=f"playback_queue_ms={playback_queue_ms}",
+                )
+            )
 
     def close(self):
         """Cancel workers and release a session-pinned ASR engine."""
@@ -543,7 +593,9 @@ class RealtimeVoiceAsrTtsSession:
                 parameters=job_parameters,
                 priority="final" if committed.is_final else "stable",
             )
-            for event in await self.tts_jobs.put(job):
+            queued_job, queue_events = await self.tts_jobs.put_with_result(job)
+            queued_tts_job_id = f"tts_{queued_job.revision_id}"
+            for event in queue_events:
                 await self._send_json(
                     self._event(
                         "backpressure.applied",
@@ -562,13 +614,14 @@ class RealtimeVoiceAsrTtsSession:
                 self._event(
                     "tts.job_queued",
                     payload={
-                        "tts_job_id": tts_job_id,
-                        "revision_id": committed.revision_id,
+                        "tts_job_id": queued_tts_job_id,
+                        "revision_id": queued_job.revision_id,
                         "utterance_id": utterance_id,
-                        "text": committed.text,
+                        "text": queued_job.text,
+                        "text_chars": len(queued_job.text),
                         "voice_name": self.voice_name,
                         "config_version": self.config_version,
-                        "priority": job.priority,
+                        "priority": queued_job.priority,
                     },
                 )
             )
@@ -683,9 +736,11 @@ class RealtimeVoiceAsrTtsSession:
                         self._event(
                             "tts.job_dropped",
                             payload={
-                                "tts_job_id": tts_job_id,
-                                "revision_id": job.revision_id,
-                                "reason": rejection.reason,
+                            "tts_job_id": tts_job_id,
+                            "revision_id": job.revision_id,
+                            "text": job.text,
+                            "text_chars": len(job.text),
+                            "reason": rejection.reason,
                                 "queue_wait_ms": rejection.queue_wait_ms,
                                 "global_active": rejection.active,
                                 "global_waiting": rejection.waiting,
@@ -752,9 +807,17 @@ class RealtimeVoiceAsrTtsSession:
                         if chunk:
                             await audio_queue.put(chunk)
             except BaseException as exc:
-                await audio_queue.put(exc)
+                if self._closed:
+                    with contextlib.suppress(asyncio.QueueFull):
+                        audio_queue.put_nowait(exc)
+                else:
+                    await audio_queue.put(exc)
             finally:
-                await audio_queue.put(synth_done)
+                if self._closed:
+                    with contextlib.suppress(asyncio.QueueFull):
+                        audio_queue.put_nowait(synth_done)
+                else:
+                    await audio_queue.put(synth_done)
 
         task = asyncio.create_task(
             synthesize_job_audio(),
@@ -834,6 +897,8 @@ class RealtimeVoiceAsrTtsSession:
                     payload={
                         "tts_job_id": prefetched.tts_job_id,
                         "revision_id": job.revision_id,
+                        "text": job.text,
+                        "text_chars": len(job.text),
                     },
                 )
             )
@@ -844,6 +909,8 @@ class RealtimeVoiceAsrTtsSession:
                         "protocol_event": "tts.job_completed",
                         "tts_job_id": prefetched.tts_job_id,
                         "revision_id": job.revision_id,
+                        "text": job.text,
+                        "text_chars": len(job.text),
                     },
                     stage="tts_audio_sent",
                     revision_id=job.revision_id,
@@ -1199,6 +1266,8 @@ async def realtime_voice_endpoint(websocket: WebSocket):
             elif event == "client.audio_ack":
                 payload = data.get("payload") or {}
                 ack_count = payload.get("count") or len(payload.get("acks") or [])
+                if asr_tts_session is not None and hasattr(asr_tts_session, "update_client_audio_ack"):
+                    await asr_tts_session.update_client_audio_ack(payload)
                 logger.debug(
                     "[%s] client audio ack received: count=%s last=%s",
                     task_id,

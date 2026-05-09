@@ -128,7 +128,8 @@ class Settings:
 
     # Realtime Voice 流水线配置
     REALTIME_AUDIO_INPUT_HIGH_WATERMARK_MS: int = 1200
-    REALTIME_AUDIO_INPUT_MAX_MS: int = 1800
+    REALTIME_AUDIO_INPUT_MAX_MS: int = 6000
+    REALTIME_PRESERVE_SPEECH_UNDER_PRESSURE: bool = True
     REALTIME_TTS_JOB_QUEUE_SIZE: int = 4
     REALTIME_TTS_GLOBAL_MAX_INFLIGHT: int = 2
     REALTIME_TTS_GLOBAL_QUEUE_SIZE: int = 16
@@ -136,12 +137,16 @@ class Settings:
     REALTIME_TTS_AUDIO_QUEUE_SIZE: int = 12
     REALTIME_TTS_GENERATOR_QUEUE_SIZE: int = 4
     REALTIME_TTS_PREFETCH_JOBS: int = 2
+    REALTIME_TTS_DROP_ON_OVERLOAD: bool = False
     REALTIME_TEXT_STABLE_HYPOTHESES: int = 1
     REALTIME_TEXT_MIN_COMMIT_CHARS: int = 2
     REALTIME_TEXT_MAX_COMMIT_CHARS: int = 8
     REALTIME_TEXT_MAX_COMMIT_WAIT_MS: int = 120
     REALTIME_PACER_FRAME_MS: int = 20
-    REALTIME_PACER_BURST_MS: int = 1200
+    REALTIME_PACER_BURST_MS: int = 160
+    REALTIME_OUTPUT_TARGET_QUEUE_MS: int = 800
+    REALTIME_OUTPUT_HIGH_QUEUE_MS: int = 1600
+    REALTIME_OUTPUT_BACKPRESSURE_MAX_SLEEP_MS: int = 80
 
     def __init__(self):
         """从环境变量读取配置"""
@@ -265,6 +270,13 @@ class Settings:
                 str(self.REALTIME_AUDIO_INPUT_MAX_MS),
             )
         )
+        self.REALTIME_PRESERVE_SPEECH_UNDER_PRESSURE = (
+            os.getenv(
+                "REALTIME_PRESERVE_SPEECH_UNDER_PRESSURE",
+                str(self.REALTIME_PRESERVE_SPEECH_UNDER_PRESSURE),
+            ).lower()
+            == "true"
+        )
         self.REALTIME_TTS_JOB_QUEUE_SIZE = int(
             os.getenv(
                 "REALTIME_TTS_JOB_QUEUE_SIZE",
@@ -307,6 +319,13 @@ class Settings:
                 str(self.REALTIME_TTS_PREFETCH_JOBS),
             )
         )
+        self.REALTIME_TTS_DROP_ON_OVERLOAD = (
+            os.getenv(
+                "REALTIME_TTS_DROP_ON_OVERLOAD",
+                str(self.REALTIME_TTS_DROP_ON_OVERLOAD),
+            ).lower()
+            == "true"
+        )
         self.REALTIME_TEXT_STABLE_HYPOTHESES = int(
             os.getenv(
                 "REALTIME_TEXT_STABLE_HYPOTHESES",
@@ -336,6 +355,18 @@ class Settings:
         )
         self.REALTIME_PACER_BURST_MS = int(
             os.getenv("REALTIME_PACER_BURST_MS", str(self.REALTIME_PACER_BURST_MS))
+        )
+        self.REALTIME_OUTPUT_TARGET_QUEUE_MS = int(
+            os.getenv("REALTIME_OUTPUT_TARGET_QUEUE_MS", str(self.REALTIME_OUTPUT_TARGET_QUEUE_MS))
+        )
+        self.REALTIME_OUTPUT_HIGH_QUEUE_MS = int(
+            os.getenv("REALTIME_OUTPUT_HIGH_QUEUE_MS", str(self.REALTIME_OUTPUT_HIGH_QUEUE_MS))
+        )
+        self.REALTIME_OUTPUT_BACKPRESSURE_MAX_SLEEP_MS = int(
+            os.getenv(
+                "REALTIME_OUTPUT_BACKPRESSURE_MAX_SLEEP_MS",
+                str(self.REALTIME_OUTPUT_BACKPRESSURE_MAX_SLEEP_MS),
+            )
         )
 
     def _ensure_directories(self):

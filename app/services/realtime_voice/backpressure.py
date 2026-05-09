@@ -18,9 +18,10 @@ class BoundedAudioQueue:
     already-covered speech, speech-like pending frames, then oldest speech.
     """
 
-    def __init__(self, high_watermark_ms: int, max_ms: int):
+    def __init__(self, high_watermark_ms: int, max_ms: int, preserve_speech: bool = True):
         self.high_watermark_ms = high_watermark_ms
         self.max_ms = max_ms
+        self.preserve_speech = preserve_speech
         self._frames: Deque[AudioFrame] = deque()
         self._queued_ms = 0
         self._condition = asyncio.Condition()
@@ -75,6 +76,21 @@ class BoundedAudioQueue:
         events: list[BackpressureEvent] = []
         while self._queued_ms > self.max_ms and self._frames:
             index, reason = self._find_best_drop_candidate()
+            if self.preserve_speech and reason == "drop_oldest_speech":
+                frame = self._frames[index]
+                events.append(
+                    BackpressureEvent(
+                        type="input_preserve_speech_backpressure",
+                        queue_ms=self._queued_ms,
+                        message=f"preserve speech seq={frame.sequence}",
+                        vad_state=frame.vad_state,
+                        pre_class=frame.pre_class,
+                        utterance_id=frame.utterance_id,
+                        first_dropped_seq=frame.sequence or None,
+                        last_dropped_seq=frame.sequence or None,
+                    )
+                )
+                break
             frame = self._remove_at(index)
             self._queued_ms = max(0, self._queued_ms - frame.duration_ms)
             events.append(_drop_event(reason, self._queued_ms, frame))
@@ -157,15 +173,20 @@ class TtsJobQueue:
     synthesis cannot keep up.
     """
 
-    def __init__(self, maxsize: int):
+    def __init__(self, maxsize: int, drop_on_overload: bool = False):
         self.maxsize = max(1, maxsize)
+        self.drop_on_overload = drop_on_overload
         self._jobs: Deque = deque()
         self._condition = asyncio.Condition()
 
     async def put(self, job) -> list[BackpressureEvent]:
+        _, events = await self.put_with_result(job)
+        return events
+
+    async def put_with_result(self, job) -> tuple[object, list[BackpressureEvent]]:
         events: list[BackpressureEvent] = []
         async with self._condition:
-            if job.priority == "stable" and len(self._jobs) >= self.maxsize:
+            if self.drop_on_overload and job.priority == "stable" and len(self._jobs) >= self.maxsize:
                 stable_jobs = [existing for existing in self._jobs if existing.priority == "stable"]
                 if stable_jobs:
                     merged_text = "".join(existing.text for existing in stable_jobs) + job.text
@@ -183,7 +204,7 @@ class TtsJobQueue:
                             message=f"merged={len(stable_jobs) + 1} revision={job.revision_id}",
                         )
                     )
-            while len(self._jobs) >= self.maxsize:
+            while self.drop_on_overload and len(self._jobs) >= self.maxsize:
                 dropped = self._drop_lowest_priority()
                 events.append(
                     BackpressureEvent(
@@ -191,9 +212,16 @@ class TtsJobQueue:
                         message=f"revision={dropped.revision_id}",
                     )
                 )
+            if not self.drop_on_overload and len(self._jobs) >= self.maxsize:
+                events.append(
+                    BackpressureEvent(
+                        type="tts_queue_preserved",
+                        message=f"queued={len(self._jobs) + 1} revision={job.revision_id}",
+                    )
+                )
             self._jobs.append(job)
             self._condition.notify()
-        return events
+        return job, events
 
     async def get(self):
         async with self._condition:
@@ -233,9 +261,10 @@ class TtsJobQueue:
 class AsrSegmentQueue:
     """Bounded ASR queue that coalesces speech before dropping it."""
 
-    def __init__(self, high_watermark_ms: int, max_ms: int):
+    def __init__(self, high_watermark_ms: int, max_ms: int, preserve_speech: bool = True):
         self.high_watermark_ms = max(1, high_watermark_ms)
         self.max_ms = max(self.high_watermark_ms, max_ms)
+        self.preserve_speech = preserve_speech
         self._segments: Deque[AsrSegment] = deque()
         self._queued_ms = 0
         self._condition = asyncio.Condition()
@@ -295,6 +324,19 @@ class AsrSegmentQueue:
     def _drop_until_within_budget(self) -> list[BackpressureEvent]:
         events: list[BackpressureEvent] = []
         while self._queued_ms > self.max_ms and self._segments:
+            if self.preserve_speech:
+                segment = self._segments[0]
+                events.append(
+                    BackpressureEvent(
+                        type="asr_preserve_speech_backpressure",
+                        queue_ms=self._queued_ms,
+                        message=f"frames={segment.first_frame_seq}-{segment.last_frame_seq}",
+                        utterance_id=segment.utterance_id,
+                        first_dropped_seq=segment.first_frame_seq,
+                        last_dropped_seq=segment.last_frame_seq,
+                    )
+                )
+                break
             index = self._find_drop_index()
             segment = self._remove_at(index)
             self._queued_ms = max(0, self._queued_ms - segment.duration_ms)

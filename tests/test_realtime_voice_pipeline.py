@@ -231,7 +231,7 @@ def test_bounded_audio_queue_drops_speech_like_before_active_speech():
 
 def test_bounded_audio_queue_reports_oldest_speech_when_no_lower_layer_exists():
     async def run():
-        queue = BoundedAudioQueue(high_watermark_ms=20, max_ms=40)
+        queue = BoundedAudioQueue(high_watermark_ms=20, max_ms=40, preserve_speech=False)
 
         await queue.put(AudioFrame(b"one", duration_ms=20, is_silence=False, sequence=1, vad_state="speech", speech_active=True))
         await queue.put(AudioFrame(b"two", duration_ms=20, is_silence=False, sequence=2, vad_state="speech", speech_active=True))
@@ -241,6 +241,20 @@ def test_bounded_audio_queue_reports_oldest_speech_when_no_lower_layer_exists():
         assert dropped
         assert dropped[0].first_dropped_seq == 1
         assert queue.queued_ms == 40
+
+    asyncio.run(run())
+
+
+def test_bounded_audio_queue_preserves_active_speech_by_default():
+    async def run():
+        queue = BoundedAudioQueue(high_watermark_ms=20, max_ms=40)
+
+        await queue.put(AudioFrame(b"one", duration_ms=20, is_silence=False, sequence=1, vad_state="speech", speech_active=True))
+        await queue.put(AudioFrame(b"two", duration_ms=20, is_silence=False, sequence=2, vad_state="speech", speech_active=True))
+        events = await queue.put(AudioFrame(b"three", duration_ms=20, is_silence=False, sequence=3, vad_state="speech", speech_active=True))
+
+        assert any(event.type == "input_preserve_speech_backpressure" for event in events)
+        assert queue.queued_ms == 60
 
     asyncio.run(run())
 
@@ -266,7 +280,7 @@ def test_asr_segment_queue_coalesces_when_pressure_is_high():
 
 def test_asr_segment_queue_drops_speech_over_high_water_budget_but_keeps_final_marker():
     async def run():
-        queue = AsrSegmentQueue(high_watermark_ms=40, max_ms=80)
+        queue = AsrSegmentQueue(high_watermark_ms=40, max_ms=80, preserve_speech=False)
 
         await queue.put(_asr_segment(1, duration_ms=40))
         await queue.put(_asr_segment(2, duration_ms=40))
@@ -280,9 +294,23 @@ def test_asr_segment_queue_drops_speech_over_high_water_budget_but_keeps_final_m
     asyncio.run(run())
 
 
+def test_asr_segment_queue_preserves_speech_by_default_under_pressure():
+    async def run():
+        queue = AsrSegmentQueue(high_watermark_ms=40, max_ms=80)
+
+        await queue.put(_asr_segment(1, duration_ms=40))
+        await queue.put(_asr_segment(2, duration_ms=40))
+        events = await queue.put(_asr_segment(3, duration_ms=40))
+
+        assert any(event.type == "asr_preserve_speech_backpressure" for event in events)
+        assert queue.queued_ms == 120
+
+    asyncio.run(run())
+
+
 def test_tts_job_queue_drops_stale_stable_jobs_and_prefers_final():
     async def run():
-        queue = TtsJobQueue(maxsize=2)
+        queue = TtsJobQueue(maxsize=2, drop_on_overload=True)
         await queue.put(TtsJob(1, "旧", "voice", {}, "stable"))
         await queue.put(TtsJob(2, "新", "voice", {}, "stable"))
         await queue.put(TtsJob(3, "最终", "voice", {}, "final"))
@@ -297,17 +325,33 @@ def test_tts_job_queue_drops_stale_stable_jobs_and_prefers_final():
     asyncio.run(run())
 
 
-def test_tts_job_queue_coalesces_stable_text_when_waiting():
+def test_tts_job_queue_preserves_jobs_by_default_when_overloaded():
+    async def run():
+        queue = TtsJobQueue(maxsize=2)
+        await queue.put(TtsJob(1, "甲", "voice", {}, "final"))
+        await queue.put(TtsJob(2, "乙", "voice", {}, "final"))
+        events = await queue.put(TtsJob(3, "丙", "voice", {}, "stable"))
+
+        assert any(event.type == "tts_queue_preserved" for event in events)
+        assert (await queue.get()).text == "甲"
+        assert (await queue.get()).text == "乙"
+        assert (await queue.get()).text == "丙"
+
+    asyncio.run(run())
+
+
+def test_tts_job_queue_preserves_small_stable_jobs_when_waiting():
     async def run():
         queue = TtsJobQueue(maxsize=1)
 
         await queue.put(TtsJob(1, "你", "voice", {}, "stable"))
         events = await queue.put(TtsJob(2, "好", "voice", {}, "stable"))
 
-        assert any(event.type == "tts_jobs_coalesced" for event in events)
-        job = await queue.get()
-        assert job.revision_id == 2
-        assert job.text == "你好"
+        assert any(event.type == "tts_queue_preserved" for event in events)
+        first = await queue.get()
+        second = await queue.get()
+        assert first.text == "你"
+        assert second.text == "好"
 
     asyncio.run(run())
 
@@ -378,5 +422,27 @@ def test_audio_pacer_can_burst_initial_frames_to_seed_client_jitter_buffer():
 
         assert len(frames) == 5
         assert elapsed_ms < 50
+
+    asyncio.run(run())
+
+
+def test_audio_pacer_slows_when_client_playback_queue_is_high():
+    async def run():
+        pacer = AudioPacer(
+            sample_rate=1000,
+            frame_ms=20,
+            burst_ms=0,
+            target_queue_ms=10,
+            high_queue_ms=20,
+            max_backpressure_sleep_ms=20,
+        )
+        pacer.update_client_queue_ms(20)
+        audio = b"\x01\x00" * 20
+        started = asyncio.get_running_loop().time()
+        frames = [frame async for frame in pacer.iter_frames(audio)]
+        elapsed_ms = int((asyncio.get_running_loop().time() - started) * 1000)
+
+        assert len(frames) == 1
+        assert elapsed_ms >= 15
 
     asyncio.run(run())
