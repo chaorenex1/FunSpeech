@@ -7,7 +7,7 @@ import asyncio
 from collections import deque
 from typing import Deque, Optional
 
-from .types import AudioFrame, BackpressureEvent
+from .types import AsrSegment, AudioFrame, BackpressureEvent
 
 
 class BoundedAudioQueue:
@@ -166,14 +166,23 @@ class TtsJobQueue:
         events: list[BackpressureEvent] = []
         async with self._condition:
             if job.priority == "stable":
-                self._jobs = deque(
-                    existing
-                    for existing in self._jobs
-                    if not (
-                        existing.priority == "stable"
-                        and existing.revision_id < job.revision_id
+                stable_jobs = [existing for existing in self._jobs if existing.priority == "stable"]
+                if stable_jobs:
+                    merged_text = "".join(existing.text for existing in stable_jobs) + job.text
+                    job = type(job)(
+                        revision_id=job.revision_id,
+                        text=merged_text,
+                        voice_name=job.voice_name,
+                        parameters=job.parameters,
+                        priority=job.priority,
                     )
-                )
+                    self._jobs = deque(existing for existing in self._jobs if existing.priority != "stable")
+                    events.append(
+                        BackpressureEvent(
+                            type="tts_jobs_coalesced",
+                            message=f"merged={len(stable_jobs) + 1} revision={job.revision_id}",
+                        )
+                    )
             while len(self._jobs) >= self.maxsize:
                 dropped = self._drop_lowest_priority()
                 events.append(
@@ -211,3 +220,99 @@ class TtsJobQueue:
         job = self._jobs.popleft()
         self._jobs.rotate(index)
         return job
+
+
+class AsrSegmentQueue:
+    """Bounded ASR queue that coalesces speech before dropping it."""
+
+    def __init__(self, high_watermark_ms: int, max_ms: int):
+        self.high_watermark_ms = max(1, high_watermark_ms)
+        self.max_ms = max(self.high_watermark_ms, max_ms)
+        self._segments: Deque[AsrSegment] = deque()
+        self._queued_ms = 0
+        self._condition = asyncio.Condition()
+
+    @property
+    def queued_ms(self) -> int:
+        return self._queued_ms
+
+    async def put(self, segment: AsrSegment) -> list[BackpressureEvent]:
+        events: list[BackpressureEvent] = []
+        async with self._condition:
+            if self._queued_ms >= self.high_watermark_ms and not segment.is_final:
+                if self._segments and not self._segments[-1].is_final:
+                    previous = self._segments.pop()
+                    self._queued_ms = max(0, self._queued_ms - previous.duration_ms)
+                    segment = AsrSegment(
+                        payload=previous.payload + segment.payload,
+                        duration_ms=previous.duration_ms + segment.duration_ms,
+                        frame_count=previous.frame_count + segment.frame_count,
+                        utterance_id=segment.utterance_id,
+                        first_frame_seq=previous.first_frame_seq,
+                        last_frame_seq=segment.last_frame_seq,
+                        is_final=False,
+                        vad_source=segment.vad_source,
+                    )
+                    events.append(
+                        BackpressureEvent(
+                            type="asr_segments_coalesced",
+                            queue_ms=self._queued_ms,
+                            message=f"frames={segment.first_frame_seq}-{segment.last_frame_seq}",
+                            utterance_id=segment.utterance_id,
+                            first_dropped_seq=segment.first_frame_seq,
+                            last_dropped_seq=segment.last_frame_seq,
+                        )
+                    )
+                else:
+                    events.append(BackpressureEvent(type="asr_input_throttle", queue_ms=self._queued_ms))
+
+            self._segments.append(segment)
+            self._queued_ms += segment.duration_ms
+            events.extend(self._drop_until_within_budget())
+            self._condition.notify()
+        return events
+
+    async def get(self) -> AsrSegment:
+        async with self._condition:
+            while not self._segments:
+                await self._condition.wait()
+            segment = self._segments.popleft()
+            self._queued_ms = max(0, self._queued_ms - segment.duration_ms)
+            return segment
+
+    def clear(self) -> None:
+        self._segments.clear()
+        self._queued_ms = 0
+
+    def _drop_until_within_budget(self) -> list[BackpressureEvent]:
+        events: list[BackpressureEvent] = []
+        while self._queued_ms > self.max_ms and self._segments:
+            index = self._find_drop_index()
+            segment = self._remove_at(index)
+            self._queued_ms = max(0, self._queued_ms - segment.duration_ms)
+            events.append(
+                BackpressureEvent(
+                    type="drop_asr_speech",
+                    queue_ms=self._queued_ms,
+                    dropped_ms=segment.duration_ms,
+                    message=f"frames={segment.first_frame_seq}-{segment.last_frame_seq}",
+                    utterance_id=segment.utterance_id,
+                    first_dropped_seq=segment.first_frame_seq,
+                    last_dropped_seq=segment.last_frame_seq,
+                )
+            )
+        return events
+
+    def _find_drop_index(self) -> int:
+        for index, segment in enumerate(self._segments):
+            if not segment.is_final:
+                return index
+        return 0
+
+    def _remove_at(self, index: int) -> AsrSegment:
+        if index == 0:
+            return self._segments.popleft()
+        self._segments.rotate(-index)
+        segment = self._segments.popleft()
+        self._segments.rotate(index)
+        return segment

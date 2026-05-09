@@ -25,6 +25,21 @@ class AudioFrame:
 
 
 @dataclass(frozen=True)
+class AsrSegment:
+    """A VAD-approved speech segment queued for ASR."""
+
+    payload: bytes
+    duration_ms: int
+    frame_count: int
+    utterance_id: str
+    first_frame_seq: int
+    last_frame_seq: int
+    is_final: bool = False
+    vad_source: str = "vad"
+    created_at: float = field(default_factory=monotonic)
+
+
+@dataclass(frozen=True)
 class BackpressureEvent:
     """Observable backpressure decision."""
 
