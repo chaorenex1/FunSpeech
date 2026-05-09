@@ -39,6 +39,10 @@ class AliyunStartSynthesisPayload(BaseModel):
     enable_subtitle: bool = Field(default=False, description="启用字幕")
     platform: str = Field(default="python", description="平台")
     method: int = Field(default=1, description="合成方法")
+    prompt: Optional[str] = Field(default="", description="自然语言语音指令")
+    emotion: Optional[str] = Field(default=None, description="结构化情感控制标签")
+    emotion_intensity: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="情感强度")
+    emotion_source: Optional[str] = Field(default=None, description="情感来源")
 
     @field_validator("format")
     @classmethod

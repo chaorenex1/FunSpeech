@@ -71,6 +71,8 @@ class RealtimeVoiceAsrTtsSession:
             "enable_punctuation_prediction": True,
             "enable_inverse_text_normalization": True,
             "enable_voice_detection": True,
+            "enable_emotion": bool(self.parameters.get("enable_emotion_detection", True)),
+            "return_rich_text": bool(self.parameters.get("return_rich_text", False)),
         }
         asr_engine = self.asr_service._ensure_asr_engine()
         self.asr_engine = asr_engine
@@ -156,6 +158,10 @@ class RealtimeVoiceAsrTtsSession:
     def update_parameters(self, parameters: dict) -> int:
         """Update runtime parameters and return the new config version."""
         self.parameters.update(parameters)
+        if "enable_emotion_detection" in parameters:
+            self.asr_params["enable_emotion"] = bool(parameters["enable_emotion_detection"])
+        if "return_rich_text" in parameters:
+            self.asr_params["return_rich_text"] = bool(parameters["return_rich_text"])
         self.config_version += 1
         return self.config_version
 
@@ -232,6 +238,9 @@ class RealtimeVoiceAsrTtsSession:
                     "text": hypothesis.text,
                     "is_final": hypothesis.is_final,
                     "time_ms": hypothesis.time_ms,
+                    "emotion": hypothesis.emotion,
+                    "emotion_confidence": hypothesis.emotion_confidence,
+                    "raw_rich_text": hypothesis.raw_rich_text,
                 },
             )
         )
@@ -244,6 +253,9 @@ class RealtimeVoiceAsrTtsSession:
                     "hypothesis_id": hypothesis_id,
                     "text": hypothesis.text,
                     "is_final": hypothesis.is_final,
+                    "emotion": hypothesis.emotion,
+                    "emotion_confidence": hypothesis.emotion_confidence,
+                    "raw_rich_text": hypothesis.raw_rich_text,
                 },
                 stage="asr_text_received",
                 text=hypothesis.text,
@@ -266,11 +278,21 @@ class RealtimeVoiceAsrTtsSession:
                     },
                 )
             )
+            job_parameters = dict(self.parameters)
+            if (
+                hypothesis.emotion
+                and job_parameters.get("emotion_control", "asr") != "off"
+                and not job_parameters.get("emotion")
+            ):
+                job_parameters["emotion"] = hypothesis.emotion
+                job_parameters["emotion_intensity"] = job_parameters.get("emotion_intensity")
+                job_parameters["emotion_source"] = "asr"
+
             job = TtsJob(
                 revision_id=committed.revision_id,
                 text=committed.text,
                 voice_name=self.voice_name,
-                parameters=dict(self.parameters),
+                parameters=job_parameters,
                 priority="final" if committed.is_final else "stable",
             )
             for event in await self.tts_jobs.put(job):
@@ -521,6 +543,9 @@ class RealtimeVoiceAsrTtsSession:
                     text=event.text.strip(),
                     is_final=event.kind == "end",
                     time_ms=getattr(event, "time_ms", 0),
+                    emotion=getattr(event, "emotion", None),
+                    emotion_confidence=getattr(event, "emotion_confidence", None),
+                    raw_rich_text=getattr(event, "raw_rich_text", None),
                 )
                 for event in events
                 if event.kind in {"end", "partial"} and event.text
@@ -578,6 +603,8 @@ class RealtimeVoiceAsrTtsSession:
             task_id,
             websocket,
             parameters.get("prompt", ""),
+            parameters.get("emotion"),
+            parameters.get("emotion_intensity"),
         ):
             yield chunk
 

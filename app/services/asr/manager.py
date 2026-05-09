@@ -42,6 +42,13 @@ class ModelConfig:
         self.family = config.get("family", self.engine)
         self.streaming_strategy = config.get("streaming_strategy")
         self.supports_realtime = config.get("supports_realtime", False)
+        self.supports_emotion = config.get("supports_emotion", self.family == "sensevoice")
+        self.supported_emotions = config.get(
+            "supported_emotions",
+            ["neutral", "happy", "sad", "angry", "fearful", "disgusted", "surprised"]
+            if self.supports_emotion
+            else [],
+        )
 
         # 模型路径结构
         self.models = config.get("models", {})
@@ -147,6 +154,8 @@ class ModelManager:
                     "default": config.is_default,
                     "loaded": loaded,
                     "supports_realtime": config.supports_realtime,
+                    "supports_emotion": config.supports_emotion,
+                    "supported_emotions": config.supported_emotions,
                     "family": config.family,
                     "streaming_strategy": config.streaming_strategy,
                     "offline_model": (

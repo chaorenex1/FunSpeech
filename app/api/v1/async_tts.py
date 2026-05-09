@@ -104,7 +104,10 @@ def _process_async_tasks():
                         sample_rate=task['sample_rate'],
                         volume=50,  # 默认音量
                         pitch_rate=0,
-                        prompt="",  # 默认prompt
+                        prompt=task.get('prompt') or "",
+                        emotion=task.get('emotion'),
+                        emotion_intensity=task.get('emotion_intensity'),
+                        emotion_source=task.get('emotion_source'),
                         return_timestamps=task['enable_subtitle'],
                     )
 
@@ -256,6 +259,10 @@ async def submit_async_tts(request: Request, tts_request: AsyncTTSRequest):
             'sample_rate': payload.sample_rate,
             'format': payload.format,
             'enable_subtitle': payload.enable_subtitle,
+            'prompt': payload.prompt,
+            'emotion': payload.emotion,
+            'emotion_intensity': payload.emotion_intensity,
+            'emotion_source': payload.emotion_source,
             'enable_notify': tts_request.payload.enable_notify,
             'notify_url': tts_request.payload.notify_url if tts_request.payload.enable_notify else None,
         }

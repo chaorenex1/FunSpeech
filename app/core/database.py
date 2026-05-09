@@ -78,6 +78,16 @@ class DatabaseManager:
                     completed_at TIMESTAMP
                 )
             """)
+            self._ensure_columns(
+                cursor,
+                "async_tts_tasks",
+                {
+                    "prompt": "TEXT DEFAULT ''",
+                    "emotion": "TEXT",
+                    "emotion_intensity": "REAL",
+                    "emotion_source": "TEXT",
+                },
+            )
 
             # 创建索引
             cursor.execute("""
@@ -119,6 +129,17 @@ class DatabaseManager:
                     completed_at TIMESTAMP
                 )
             """)
+            self._ensure_columns(
+                cursor,
+                "async_asr_tasks",
+                {
+                    "enable_emotion": "BOOLEAN NOT NULL DEFAULT FALSE",
+                    "return_rich_text": "BOOLEAN NOT NULL DEFAULT FALSE",
+                    "emotion": "TEXT",
+                    "emotion_confidence": "REAL",
+                    "raw_rich_text": "TEXT",
+                },
+            )
 
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_async_asr_task_status
@@ -137,6 +158,14 @@ class DatabaseManager:
             logger.error(f"数据库初始化失败: {e}")
             raise
 
+    def _ensure_columns(self, cursor: sqlite3.Cursor, table: str, columns: Dict[str, str]) -> None:
+        """Add columns to existing SQLite tables without requiring a separate migration."""
+        cursor.execute(f"PRAGMA table_info({table})")
+        existing = {row[1] for row in cursor.fetchall()}
+        for column, definition in columns.items():
+            if column not in existing:
+                cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
     def create_task(self, task_data: Dict[str, Any]) -> bool:
         """创建异步TTS任务"""
         try:
@@ -146,8 +175,9 @@ class DatabaseManager:
             cursor.execute("""
                 INSERT INTO async_tts_tasks (
                     task_id, request_id, text, voice, sample_rate,
-                    format, enable_subtitle, enable_notify, notify_url, status, error_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    format, enable_subtitle, prompt, emotion, emotion_intensity,
+                    emotion_source, enable_notify, notify_url, status, error_message
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 task_data['task_id'],
                 task_data['request_id'],
@@ -156,6 +186,10 @@ class DatabaseManager:
                 task_data['sample_rate'],
                 task_data['format'],
                 task_data['enable_subtitle'],
+                task_data.get('prompt', ''),
+                task_data.get('emotion'),
+                task_data.get('emotion_intensity'),
+                task_data.get('emotion_source'),
                 task_data.get('enable_notify', False),
                 task_data.get('notify_url'),
                 'RUNNING',
@@ -290,8 +324,9 @@ class DatabaseManager:
                     vocabulary_id, hotwords, customization_id,
                     enable_punctuation_prediction, enable_inverse_text_normalization,
                     enable_voice_detection, disfluency, dolphin_lang_sym,
-                    dolphin_region_sym, enable_notify, notify_url, status, error_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    dolphin_region_sym, enable_emotion, return_rich_text,
+                    enable_notify, notify_url, status, error_message
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 task_data["task_id"],
                 task_data["request_id"],
@@ -307,6 +342,8 @@ class DatabaseManager:
                 task_data["disfluency"],
                 task_data["dolphin_lang_sym"],
                 task_data["dolphin_region_sym"],
+                task_data.get("enable_emotion", False),
+                task_data.get("return_rich_text", False),
                 task_data.get("enable_notify", False),
                 task_data.get("notify_url"),
                 "RUNNING",
@@ -362,6 +399,9 @@ class DatabaseManager:
         status: str,
         result: str = None,
         duration_ms: int = None,
+        emotion: str = None,
+        emotion_confidence: float = None,
+        raw_rich_text: str = None,
         error_code: int = 20000000,
         error_message: str = "SUCCESS",
     ) -> bool:
@@ -385,6 +425,18 @@ class DatabaseManager:
             if duration_ms is not None:
                 sql_parts.append("duration_ms = ?")
                 params.append(duration_ms)
+
+            if emotion is not None:
+                sql_parts.append("emotion = ?")
+                params.append(emotion)
+
+            if emotion_confidence is not None:
+                sql_parts.append("emotion_confidence = ?")
+                params.append(emotion_confidence)
+
+            if raw_rich_text is not None:
+                sql_parts.append("raw_rich_text = ?")
+                params.append(raw_rich_text)
 
             if status in ["SUCCESS", "FAILED"]:
                 sql_parts.append("completed_at = CURRENT_TIMESTAMP")

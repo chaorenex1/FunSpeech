@@ -115,6 +115,9 @@ async def openai_compatible_tts(request_body: OpenAITTSRequest, request: Request
             volume=50,  # 默认音量
             pitch_rate=0,
             prompt=request_body.instructions or "",  # 将instructions映射到prompt
+            emotion=request_body.emotion,
+            emotion_intensity=request_body.emotion_intensity,
+            emotion_source="manual" if request_body.emotion else None,
         )
 
         logger.debug(f"[{task_id}] OpenAI兼容接口合成完成: {output_path}")

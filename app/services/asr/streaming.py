@@ -10,6 +10,7 @@ import numpy as np
 
 from ...core.config import settings
 from ...core.executor import run_sync
+from ...utils.emotion import ASRTranscriptionResult, build_asr_result
 from .vad import StreamingVADEndpointDetector
 
 
@@ -23,6 +24,9 @@ class StreamingASREvent:
     raw_text: str = ""
     begin_time_ms: int = 0
     itn_applied: bool = False
+    emotion: Optional[str] = None
+    emotion_confidence: Optional[float] = None
+    raw_rich_text: Optional[str] = None
 
 
 class SenseVoiceWindowedStreamingSession:
@@ -34,6 +38,8 @@ class SenseVoiceWindowedStreamingSession:
         self.sample_rate = int(sample_rate[0] if isinstance(sample_rate, list) else sample_rate)
         self.enable_itn = bool(params.get("enable_inverse_text_normalization", True))
         self.enable_vad = bool(params.get("enable_voice_detection", True))
+        self.enable_emotion = bool(params.get("enable_emotion", False))
+        self.return_rich_text = bool(params.get("return_rich_text", False))
         self.vad = StreamingVADEndpointDetector(engine, self.sample_rate)
 
         self.audio_time_ms = 0
@@ -74,7 +80,8 @@ class SenseVoiceWindowedStreamingSession:
 
         if self.sentence_active:
             if await self._should_emit_partial(chunk_end_ms):
-                text = await self._decode_current_sentence(partial=True)
+                asr_result = await self._decode_current_sentence_result(partial=True)
+                text = asr_result.text
                 if self._should_emit_text(text):
                     self.last_emitted_text = text
                     events.append(
@@ -83,6 +90,9 @@ class SenseVoiceWindowedStreamingSession:
                             time_ms=chunk_end_ms,
                             text=text,
                             raw_text=text,
+                            raw_rich_text=asr_result.raw_rich_text,
+                            emotion=asr_result.emotion,
+                            emotion_confidence=asr_result.emotion_confidence,
                             begin_time_ms=self.sentence_begin_time_ms,
                             itn_applied=self.enable_itn,
                         )
@@ -117,12 +127,16 @@ class SenseVoiceWindowedStreamingSession:
         self.pre_speech_audio = np.array([], dtype=np.float32)
 
     async def _end_sentence(self, end_time_ms: int) -> StreamingASREvent:
-        text = await self._decode_current_sentence(partial=False)
+        asr_result = await self._decode_current_sentence_result(partial=False)
+        text = asr_result.text
         event = StreamingASREvent(
             kind="end",
             time_ms=max(end_time_ms, self.sentence_begin_time_ms),
             text=text,
             raw_text=text,
+            raw_rich_text=asr_result.raw_rich_text,
+            emotion=asr_result.emotion,
+            emotion_confidence=asr_result.emotion_confidence,
             begin_time_ms=self.sentence_begin_time_ms,
             itn_applied=self.enable_itn,
         )
@@ -139,8 +153,13 @@ class SenseVoiceWindowedStreamingSession:
         return True
 
     async def _decode_current_sentence(self, partial: bool = False) -> str:
+        return (await self._decode_current_sentence_result(partial=partial)).text
+
+    async def _decode_current_sentence_result(
+        self, partial: bool = False
+    ) -> ASRTranscriptionResult:
         if len(self.current_sentence_audio) == 0:
-            return ""
+            return build_asr_result("")
         audio = self.current_sentence_audio
         if partial:
             max_partial_samples = int(
@@ -148,13 +167,24 @@ class SenseVoiceWindowedStreamingSession:
             )
             if max_partial_samples > 0 and len(audio) > max_partial_samples:
                 audio = audio[-max_partial_samples:]
-        return await run_sync(
+        if hasattr(self.engine, "transcribe_array_with_metadata"):
+            return await run_sync(
+                self.engine.transcribe_array_with_metadata,
+                audio,
+                sample_rate=self.sample_rate,
+                enable_itn=self.enable_itn,
+                enable_vad=False,
+                enable_emotion=self.enable_emotion,
+                return_rich_text=self.return_rich_text,
+            )
+        text = await run_sync(
             self.engine.transcribe_array,
             audio,
             sample_rate=self.sample_rate,
             enable_itn=self.enable_itn,
             enable_vad=False,
         )
+        return build_asr_result(text)
 
     def _should_emit_text(self, text: str) -> bool:
         if not text or text == self.last_emitted_text:

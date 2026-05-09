@@ -38,6 +38,7 @@ from ..utils.audio import (
     validate_sample_rate,
     resample_audio_array,
 )
+from ..utils.emotion import compose_emotion_prompt, normalize_emotion
 from .tts.engine import get_tts_engine, MultiGPUTTSEngine
 
 logger = logging.getLogger(__name__)
@@ -257,6 +258,9 @@ class AliyunWebSocketTTSService:
                 "pitch_rate": payload.get("pitch_rate", 0),
                 "enable_subtitle": payload.get("enable_subtitle", False),
                 "prompt": payload.get("prompt", ""),  # 自然语言指令控制
+                "emotion": normalize_emotion(payload.get("emotion")),
+                "emotion_intensity": payload.get("emotion_intensity"),
+                "emotion_source": payload.get("emotion_source"),
             }
 
             # 验证参数
@@ -293,6 +297,8 @@ class AliyunWebSocketTTSService:
 
             # 获取 prompt 参数
             prompt = params.get("prompt", "")
+            emotion = params.get("emotion")
+            emotion_intensity = params.get("emotion_intensity")
 
             # 生成音频
             audio_sent = False
@@ -307,6 +313,8 @@ class AliyunWebSocketTTSService:
                 task_id,
                 websocket,  # 传入websocket用于检测连接状态
                 prompt,  # 传入 prompt 参数
+                emotion,
+                emotion_intensity,
             ):
                 if audio_chunk and len(audio_chunk) > 0:
                     # 检查WebSocket连接状态
@@ -388,6 +396,8 @@ class AliyunWebSocketTTSService:
         task_id: str,
         websocket,  # 添加websocket参数用于检测连接状态
         prompt: str = "",  # 自然语言指令控制
+        emotion: Optional[str] = None,
+        emotion_intensity: Optional[float] = None,
     ) -> AsyncGenerator[Optional[bytes], None]:
         """生成流式音频数据"""
         tts_engine = self._ensure_tts_engine()
@@ -414,7 +424,8 @@ class AliyunWebSocketTTSService:
                 if voice_manager.is_voice_available(voice):
                     # 使用CosyVoice2/3流式合成（零样本克隆音色）
                     async for chunk in self._stream_clone_voice_with_engine(
-                        text, voice, speed, format, sample_rate, volume, pitch_rate, task_id, websocket, single_engine, prompt
+                        text, voice, speed, format, sample_rate, volume, pitch_rate,
+                        task_id, websocket, single_engine, prompt, emotion, emotion_intensity
                     ):
                         yield chunk
                     return
@@ -481,17 +492,21 @@ class AliyunWebSocketTTSService:
             await asyncio.sleep(0.01)
 
     async def _stream_clone_voice_with_engine(
-        self, text: str, voice: str, speed: float, format: str, target_sr: int, volume: int, pitch_rate: int, task_id: str, websocket, engine, prompt: str = ""
+        self, text: str, voice: str, speed: float, format: str, target_sr: int,
+        volume: int, pitch_rate: int, task_id: str, websocket, engine,
+        prompt: str = "", emotion: Optional[str] = None,
+        emotion_intensity: Optional[float] = None,
     ) -> AsyncGenerator[bytes, None]:
         """使用指定引擎的 CosyVoice2/3 进行流式合成（零样本克隆音色）"""
         clone_version = engine._clone_model_version if hasattr(engine, '_clone_model_version') else "cosyvoice3"
         logger.debug(f"[{task_id}] 使用 {clone_version} 流式合成零样本克隆音色: {voice}, prompt: {prompt}")
         model_sr = engine.cosyvoice_clone.sample_rate
 
-        # 格式化 prompt（CosyVoice3 需要特殊前缀，CosyVoice2 需要后缀）
-        formatted_prompt = self._format_prompt_text(prompt, clone_version)
+        # Emotion tags are converted to a natural-language instruct prompt for CosyVoice.
+        effective_prompt = compose_emotion_prompt(prompt, emotion, emotion_intensity)
+        formatted_prompt = self._format_prompt_text(effective_prompt, clone_version)
 
-        use_instruct = bool(prompt) or clone_version == "cosyvoice3"
+        use_instruct = bool(effective_prompt) or clone_version == "cosyvoice3"
 
         # CosyVoice3 的 LLM 输入必须包含 <|endofprompt|>，即使调用方没有传 prompt
         # 也要走 instruct2 并注入默认 prompt，避免模型线程断言失败。

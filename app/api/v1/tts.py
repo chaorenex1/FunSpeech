@@ -295,6 +295,9 @@ async def synthesize_speech(
             volume=tts_request.volume,
             pitch_rate=tts_request.pitch_rate,
             prompt=tts_request.prompt or "",
+            emotion=tts_request.emotion,
+            emotion_intensity=tts_request.emotion_intensity,
+            emotion_source=tts_request.emotion_source,
         )
 
         logger.debug(f"[{task_id}] 语音合成完成: {output_path}")
@@ -448,6 +451,16 @@ async def health_check(request: Request) -> JSONResponse:
             "tts_model_loaded": tts_engine.is_tts_model_loaded(),
             "device": tts_engine.device,
             "preset_voices": tts_engine.get_voices(),
+            "supports_emotion_control": True,
+            "supported_emotions": [
+                "neutral",
+                "happy",
+                "sad",
+                "angry",
+                "fearful",
+                "disgusted",
+                "surprised",
+            ],
             "version": settings.APP_VERSION,
         }
 

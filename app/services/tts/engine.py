@@ -14,6 +14,7 @@ from pathlib import Path
 from ...core.config import settings
 from ...core.exceptions import APIException, DefaultServerErrorException, InvalidParameterException
 from ...utils.audio import save_audio_array, generate_temp_audio_path
+from ...utils.emotion import compose_emotion_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -293,6 +294,9 @@ class CosyVoiceTTSEngine:
         volume: int = 50,
         pitch_rate: int = 0,
         prompt: str = "",
+        emotion: Optional[str] = None,
+        emotion_intensity: Optional[float] = None,
+        emotion_source: Optional[str] = None,
         return_timestamps: bool = False,
     ) -> Union[str, Tuple[str, Optional[List[Dict[str, Any]]]]]:
         """语音合成（自动判断音色类型）"""
@@ -311,6 +315,9 @@ class CosyVoiceTTSEngine:
                         volume,
                         pitch_rate,
                         prompt,
+                        emotion,
+                        emotion_intensity,
+                        emotion_source,
                         return_timestamps,
                     )
 
@@ -473,6 +480,9 @@ class CosyVoiceTTSEngine:
         volume: int = 50,
         pitch_rate: int = 0,
         prompt: str = "",
+        emotion: Optional[str] = None,
+        emotion_intensity: Optional[float] = None,
+        emotion_source: Optional[str] = None,
         return_timestamps: bool = False,
     ) -> Union[str, Tuple[str, Optional[List[Dict[str, Any]]]]]:
         """使用保存的音色合成语音（基于官方API）"""
@@ -491,8 +501,9 @@ class CosyVoiceTTSEngine:
             all_audio_segments = []
             current_time = 0.0
 
-            # 格式化 prompt（CosyVoice3 需要特殊前缀）
-            formatted_prompt = self._format_prompt_text(prompt)
+            # Emotion tags are converted to a natural-language instruct prompt for CosyVoice.
+            effective_prompt = compose_emotion_prompt(prompt, emotion, emotion_intensity)
+            formatted_prompt = self._format_prompt_text(effective_prompt)
 
             if return_timestamps:
                 # 获取CosyVoice的分句结果
@@ -505,7 +516,7 @@ class CosyVoiceTTSEngine:
                 # 为每个句子生成音频并记录时间戳
                 for sentence_text in normalized_texts:
                     sentence_audio_segments = []
-                    use_instruct = bool(prompt) or self._clone_model_version == "cosyvoice3"
+                    use_instruct = bool(effective_prompt) or self._clone_model_version == "cosyvoice3"
                     if use_instruct:
                         # CosyVoice3 即使无 prompt 也需要默认 instruct_text 中的 endofprompt。
                         inference_gen = self.inference_instruct2(
@@ -563,7 +574,7 @@ class CosyVoiceTTSEngine:
 
             else:
                 # 不需要时间戳，直接合成
-                use_instruct = bool(prompt) or self._clone_model_version == "cosyvoice3"
+                use_instruct = bool(effective_prompt) or self._clone_model_version == "cosyvoice3"
                 if use_instruct:
                     # CosyVoice3 即使无 prompt 也需要默认 instruct_text 中的 endofprompt。
                     inference_gen = self.inference_instruct2(
@@ -728,7 +739,14 @@ class CosyVoiceTTSEngine:
                     "description": f"自定义音色：{voice}",
                 }
 
-            info.update({"name": voice, "sample_rate": 22050, "available": True})
+            info.update(
+                {
+                    "name": voice,
+                    "sample_rate": 22050,
+                    "available": True,
+                    "supports_emotion_control": info.get("type") == "clone",
+                }
+            )
             voices_info[voice] = info
 
         return voices_info
@@ -903,6 +921,9 @@ class MultiGPUTTSEngine:
         volume: int = 50,
         pitch_rate: int = 0,
         prompt: str = "",
+        emotion: Optional[str] = None,
+        emotion_intensity: Optional[float] = None,
+        emotion_source: Optional[str] = None,
         return_timestamps: bool = False,
     ) -> Union[str, Tuple[str, Optional[List[Dict[str, Any]]]]]:
         """语音合成（负载均衡）"""
@@ -918,6 +939,9 @@ class MultiGPUTTSEngine:
                 volume=volume,
                 pitch_rate=pitch_rate,
                 prompt=prompt,
+                emotion=emotion,
+                emotion_intensity=emotion_intensity,
+                emotion_source=emotion_source,
                 return_timestamps=return_timestamps,
             )
         finally:

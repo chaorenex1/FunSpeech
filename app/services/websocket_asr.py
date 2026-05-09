@@ -652,6 +652,8 @@ class AliyunWebSocketASRService:
                 "enable_voice_detection": payload.get("enable_voice_detection", True),
                 "max_sentence_silence": payload.get("max_sentence_silence", 800),
                 "enable_words": payload.get("enable_words", False),
+                "enable_emotion": payload.get("enable_emotion", False),
+                "return_rich_text": payload.get("return_rich_text", False),
             }
 
             logger.info(f"[{task_id}] StartTranscription参数解析成功: {params}")
@@ -690,6 +692,9 @@ class AliyunWebSocketASRService:
                     current_index,
                     event.time_ms,
                     event.text,
+                    emotion=getattr(event, "emotion", None),
+                    emotion_confidence=getattr(event, "emotion_confidence", None),
+                    raw_rich_text=getattr(event, "raw_rich_text", None),
                 )
             elif event.kind == "end":
                 current_index = active_index or sentence_index + 1
@@ -705,6 +710,9 @@ class AliyunWebSocketASRService:
                     result_text,
                     begin_time=event.begin_time_ms,
                     enable_itn=enable_itn and not getattr(event, "itn_applied", False),
+                    emotion=getattr(event, "emotion", None),
+                    emotion_confidence=getattr(event, "emotion_confidence", None),
+                    raw_rich_text=getattr(event, "raw_rich_text", None),
                 )
                 sentence_index = max(sentence_index, current_index)
                 active_index = None
@@ -1019,7 +1027,15 @@ class AliyunWebSocketASRService:
             raise WebSocketDisconnect()
 
     async def _send_transcription_result_changed(
-        self, websocket, task_id: str, index: int, time: int, result: str
+        self,
+        websocket,
+        task_id: str,
+        index: int,
+        time: int,
+        result: str,
+        emotion: Optional[str] = None,
+        emotion_confidence: Optional[float] = None,
+        raw_rich_text: Optional[str] = None,
     ):
         """发送TranscriptionResultChanged响应（中间结果）"""
         response = {
@@ -1039,6 +1055,9 @@ class AliyunWebSocketASRService:
                 "text": result,
                 "is_final": False,
                 "confidence": None,
+                "emotion": emotion,
+                "emotion_confidence": emotion_confidence,
+                "raw_rich_text": raw_rich_text,
                 "duration_ms": time,
             },
         }
@@ -1057,6 +1076,9 @@ class AliyunWebSocketASRService:
         result: str,
         begin_time: int = 0,
         enable_itn: bool = False,
+        emotion: Optional[str] = None,
+        emotion_confidence: Optional[float] = None,
+        raw_rich_text: Optional[str] = None,
     ):
         """发送SentenceEnd响应"""
         if enable_itn and result:
@@ -1082,6 +1104,9 @@ class AliyunWebSocketASRService:
                 "text": result,
                 "is_final": True,
                 "confidence": None,
+                "emotion": emotion,
+                "emotion_confidence": emotion_confidence,
+                "raw_rich_text": raw_rich_text,
                 "duration_ms": max(0, time - begin_time),
             },
         }

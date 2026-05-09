@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, field_validator
 from datetime import datetime
 
 from .common import AudioFormat, SampleRate, BaseResponse
+from ..utils.emotion import normalize_emotion
 
 
 class AsyncTTSPayload(BaseModel):
@@ -26,6 +27,10 @@ class AsyncTTSRequestData(BaseModel):
     format: str = Field("wav", description="音频格式", example="wav")
     text: str = Field(..., description="待合成文本", min_length=1, max_length=5000)
     enable_subtitle: bool = Field(True, description="是否启用字幕", example=True)
+    prompt: str = Field("", description="自然语言语音指令", max_length=500)
+    emotion: Optional[str] = Field(None, description="结构化情感控制标签")
+    emotion_intensity: Optional[float] = Field(None, ge=0.0, le=1.0, description="情感强度")
+    emotion_source: Optional[str] = Field(None, description="情感来源")
 
     @field_validator("sample_rate")
     @classmethod
@@ -40,6 +45,11 @@ class AsyncTTSRequestData(BaseModel):
         if v not in ["pcm", "wav", "mp3"]:
             raise ValueError(f"不支持的音频格式: {v}")
         return v
+
+    @field_validator("emotion")
+    @classmethod
+    def validate_emotion(cls, v: Optional[str]) -> Optional[str]:
+        return normalize_emotion(v)
 
 
 class AsyncTTSContext(BaseModel):

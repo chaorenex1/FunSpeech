@@ -21,6 +21,8 @@ class AsyncASRRequestData(BaseModel):
     enable_inverse_text_normalization: bool = Field(False, description="是否启用ITN")
     enable_voice_detection: bool = Field(True, description="是否启用VAD，长录音默认启用")
     disfluency: bool = Field(False, description="是否过滤语气词")
+    enable_emotion: bool = Field(False, description="是否返回ASR识别到的情感标签")
+    return_rich_text: bool = Field(False, description="是否返回模型原始rich transcription文本")
     dolphin_lang_sym: str = Field("zh", description="Dolphin语言符号", max_length=8)
     dolphin_region_sym: str = Field("SHANGHAI", description="Dolphin区域符号", max_length=16)
 
@@ -70,6 +72,9 @@ class AsyncASRTaskData(BaseModel):
     task_id: str = Field(..., description="任务ID")
     result: Optional[str] = Field(None, description="识别结果文本")
     duration_ms: Optional[int] = Field(None, description="音频时长毫秒")
+    emotion: Optional[str] = Field(None, description="识别到的情感标签")
+    emotion_confidence: Optional[float] = Field(None, description="情感识别置信度")
+    raw_rich_text: Optional[str] = Field(None, description="模型原始rich transcription文本")
     notify_custom: Optional[str] = Field(None, description="自定义通知数据")
 
 

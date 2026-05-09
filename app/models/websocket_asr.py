@@ -41,6 +41,8 @@ class AliyunStartTranscriptionPayload(BaseModel):
     disfluency: bool = Field(default=False, description="过滤语气词")
     speech_noise_threshold: Optional[float] = Field(None, ge=-1.0, le=1.0, description="噪音参数阈值")
     enable_semantic_sentence_detection: bool = Field(default=False, description="是否开启语义断句")
+    enable_emotion: bool = Field(default=False, description="是否返回情感标签")
+    return_rich_text: bool = Field(default=False, description="是否返回模型原始rich transcription文本")
 
     @field_validator("format")
     @classmethod
@@ -76,6 +78,9 @@ class AliyunTranscriptionResultPayload(BaseModel):
     begin_time: Optional[int] = Field(None, description="句子开始时间(ms)")
     result: Optional[str] = Field(None, description="识别结果文本")
     confidence: Optional[float] = Field(None, description="置信度[0.0,1.0]")
+    emotion: Optional[str] = Field(None, description="识别到的情感标签")
+    emotion_confidence: Optional[float] = Field(None, description="情感识别置信度")
+    raw_rich_text: Optional[str] = Field(None, description="模型原始rich transcription文本")
     words: Optional[List[AliyunWordInfo]] = Field(None, description="词信息列表")
     status: Optional[int] = Field(None, description="状态码")
 

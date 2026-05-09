@@ -17,6 +17,7 @@ from funasr import AutoModel
 from ...core.config import settings
 from ...core.exceptions import DefaultServerErrorException
 from ...utils.audio import cleanup_temp_file
+from ...utils.emotion import ASRTranscriptionResult, build_asr_result
 from ...utils.text_processing import apply_itn_to_text
 
 logger = logging.getLogger(__name__)
@@ -89,6 +90,37 @@ class BaseASREngine(ABC):
     ) -> str:
         """转录音频文件"""
         pass
+
+    def transcribe_file_with_metadata(
+        self,
+        audio_path: str,
+        hotwords: str = "",
+        enable_punctuation: bool = False,
+        enable_itn: bool = False,
+        enable_vad: bool = False,
+        sample_rate: int = 16000,
+        dolphin_lang_sym: str = "zh",
+        dolphin_region_sym: str = "SHANGHAI",
+        enable_emotion: bool = False,
+        return_rich_text: bool = False,
+    ) -> ASRTranscriptionResult:
+        """转录音频文件并返回可选元数据。默认引擎只返回文本。"""
+        text = self.transcribe_file(
+            audio_path=audio_path,
+            hotwords=hotwords,
+            enable_punctuation=enable_punctuation,
+            enable_itn=enable_itn,
+            enable_vad=enable_vad,
+            sample_rate=sample_rate,
+            dolphin_lang_sym=dolphin_lang_sym,
+            dolphin_region_sym=dolphin_region_sym,
+        )
+        return build_asr_result(
+            text,
+            raw_text=text,
+            enable_emotion=enable_emotion,
+            return_rich_text=return_rich_text,
+        )
 
     @abstractmethod
     def is_model_loaded(self) -> bool:
@@ -253,6 +285,31 @@ class FunASREngine(RealTimeASREngine):
         1. 只PUNC：手动后处理
         2. 有VAD：利用全局实例直接构造临时AutoModel（复用已加载模型）
         """
+        return self.transcribe_file_with_metadata(
+            audio_path=audio_path,
+            hotwords=hotwords,
+            enable_punctuation=enable_punctuation,
+            enable_itn=enable_itn,
+            enable_vad=enable_vad,
+            sample_rate=sample_rate,
+            dolphin_lang_sym=dolphin_lang_sym,
+            dolphin_region_sym=dolphin_region_sym,
+        ).text
+
+    def transcribe_file_with_metadata(
+        self,
+        audio_path: str,
+        hotwords: str = "",
+        enable_punctuation: bool = False,
+        enable_itn: bool = False,
+        enable_vad: bool = False,
+        sample_rate: int = 16000,
+        dolphin_lang_sym: str = "zh",
+        dolphin_region_sym: str = "SHANGHAI",
+        enable_emotion: bool = False,
+        return_rich_text: bool = False,
+    ) -> ASRTranscriptionResult:
+        """使用FunASR转录音频文件并返回文本/情感元数据。"""
         # 优先使用离线模型进行文件识别
         if not self.offline_model:
             raise DefaultServerErrorException(
@@ -262,12 +319,14 @@ class FunASREngine(RealTimeASREngine):
 
         try:
             if self.family == "sensevoice":
-                return self._transcribe_sensevoice_file(
+                return self._transcribe_sensevoice_file_with_metadata(
                     audio_path=audio_path,
                     hotwords=hotwords,
                     enable_itn=enable_itn,
                     enable_vad=enable_vad,
                     sample_rate=sample_rate,
+                    enable_emotion=enable_emotion,
+                    return_rich_text=return_rich_text,
                 )
 
             # 根据参数决定是否需要VAD/PUNC
@@ -358,9 +417,18 @@ class FunASREngine(RealTimeASREngine):
                     text = apply_itn_to_text(text)
                     logger.debug(f"应用ITN处理后: {text}")
 
-                return text
+                return build_asr_result(
+                    text,
+                    raw_text=text,
+                    enable_emotion=enable_emotion,
+                    return_rich_text=return_rich_text,
+                )
             else:
-                return ""
+                return build_asr_result(
+                    "",
+                    enable_emotion=enable_emotion,
+                    return_rich_text=return_rich_text,
+                )
 
         except Exception as e:
             raise DefaultServerErrorException(f"语音识别失败: {str(e)}")
@@ -389,6 +457,25 @@ class FunASREngine(RealTimeASREngine):
         sample_rate: int = 16000,
     ) -> str:
         """使用SenseVoiceSmall转录音频文件。"""
+        return self._transcribe_sensevoice_file_with_metadata(
+            audio_path=audio_path,
+            hotwords=hotwords,
+            enable_itn=enable_itn,
+            enable_vad=enable_vad,
+            sample_rate=sample_rate,
+        ).text
+
+    def _transcribe_sensevoice_file_with_metadata(
+        self,
+        audio_path: str,
+        hotwords: str = "",
+        enable_itn: bool = False,
+        enable_vad: bool = False,
+        sample_rate: int = 16000,
+        enable_emotion: bool = False,
+        return_rich_text: bool = False,
+    ) -> ASRTranscriptionResult:
+        """使用SenseVoiceSmall转录音频文件，并保留可选rich标签元数据。"""
         result = self.offline_model.generate(
             input=audio_path,
             language=settings.SENSEVOICE_LANGUAGE,
@@ -400,16 +487,26 @@ class FunASREngine(RealTimeASREngine):
         )
 
         if not result:
-            return ""
+            return build_asr_result(
+                "",
+                enable_emotion=enable_emotion,
+                return_rich_text=return_rich_text,
+            )
 
-        text = result[0].get("text", "").strip()
-        text = self._postprocess_sensevoice_text(text)
+        raw_text = result[0].get("text", "").strip()
+        text = self._postprocess_sensevoice_text(raw_text)
 
         if enable_itn and text:
             # SenseVoice use_itn已优先处理；这里仅复用现有轻量规则兜底。
             text = apply_itn_to_text(text)
 
-        return text
+        return build_asr_result(
+            text,
+            raw_text=raw_text,
+            raw_rich_text=raw_text,
+            enable_emotion=enable_emotion,
+            return_rich_text=return_rich_text,
+        )
 
     def transcribe_array(
         self,
@@ -419,6 +516,23 @@ class FunASREngine(RealTimeASREngine):
         enable_vad: bool = False,
     ) -> str:
         """转录内存中的float32音频，供窗口化伪流式会话使用。"""
+        return self.transcribe_array_with_metadata(
+            audio_array=audio_array,
+            sample_rate=sample_rate,
+            enable_itn=enable_itn,
+            enable_vad=enable_vad,
+        ).text
+
+    def transcribe_array_with_metadata(
+        self,
+        audio_array: np.ndarray,
+        sample_rate: int = 16000,
+        enable_itn: bool = False,
+        enable_vad: bool = False,
+        enable_emotion: bool = False,
+        return_rich_text: bool = False,
+    ) -> ASRTranscriptionResult:
+        """转录内存音频并返回可选元数据，供窗口化伪流式会话使用。"""
         if not self.offline_model:
             raise DefaultServerErrorException("离线模型未加载，无法转录音频窗口")
 
@@ -429,11 +543,13 @@ class FunASREngine(RealTimeASREngine):
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
                 temp_path = temp_file.name
             sf.write(temp_path, audio_array, sample_rate)
-            return self.transcribe_file(
+            return self.transcribe_file_with_metadata(
                 temp_path,
                 enable_itn=enable_itn,
                 enable_vad=enable_vad,
                 sample_rate=sample_rate,
+                enable_emotion=enable_emotion,
+                return_rich_text=return_rich_text,
             )
         finally:
             if temp_path:
@@ -917,6 +1033,38 @@ class MultiGPUASREngine(RealTimeASREngine):
                 sample_rate=sample_rate,
                 dolphin_lang_sym=dolphin_lang_sym,
                 dolphin_region_sym=dolphin_region_sym,
+            )
+        finally:
+            self._release_engine(idx)
+
+    def transcribe_file_with_metadata(
+        self,
+        audio_path: str,
+        hotwords: str = "",
+        enable_punctuation: bool = False,
+        enable_itn: bool = False,
+        enable_vad: bool = False,
+        sample_rate: int = 16000,
+        dolphin_lang_sym: str = "zh",
+        dolphin_region_sym: str = "SHANGHAI",
+        enable_emotion: bool = False,
+        return_rich_text: bool = False,
+    ) -> ASRTranscriptionResult:
+        """转录音频文件并返回元数据（负载均衡）。"""
+        idx, engine = self._select_engine()
+        try:
+            logger.debug(f"使用引擎 {idx} ({self._devices[idx]}) 处理ASR请求")
+            return engine.transcribe_file_with_metadata(
+                audio_path=audio_path,
+                hotwords=hotwords,
+                enable_punctuation=enable_punctuation,
+                enable_itn=enable_itn,
+                enable_vad=enable_vad,
+                sample_rate=sample_rate,
+                dolphin_lang_sym=dolphin_lang_sym,
+                dolphin_region_sym=dolphin_region_sym,
+                enable_emotion=enable_emotion,
+                return_rich_text=return_rich_text,
             )
         finally:
             self._release_engine(idx)

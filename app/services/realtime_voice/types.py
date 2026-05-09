@@ -35,6 +35,9 @@ class AsrHypothesis:
     text: str
     is_final: bool = False
     time_ms: int = 0
+    emotion: str | None = None
+    emotion_confidence: float | None = None
+    raw_rich_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -56,4 +59,3 @@ class TtsJob:
     voice_name: str
     parameters: dict
     priority: Literal["stable", "final"] = "stable"
-

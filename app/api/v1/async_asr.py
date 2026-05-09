@@ -104,7 +104,7 @@ def _process_async_asr_tasks() -> None:
                     asr_engine = model_manager.get_asr_engine(task["customization_id"])
                     hotwords = resolve_hotwords(task.get("vocabulary_id"), task.get("hotwords"))
 
-                    result_text = asr_engine.transcribe_file(
+                    asr_result = asr_engine.transcribe_file_with_metadata(
                         audio_path=normalized_audio_path,
                         hotwords=hotwords,
                         enable_punctuation=bool(task["enable_punctuation_prediction"]),
@@ -113,7 +113,10 @@ def _process_async_asr_tasks() -> None:
                         sample_rate=task["sample_rate"],
                         dolphin_lang_sym=task["dolphin_lang_sym"],
                         dolphin_region_sym=task["dolphin_region_sym"],
+                        enable_emotion=bool(task.get("enable_emotion")),
+                        return_rich_text=bool(task.get("return_rich_text")),
                     )
+                    result_text = asr_result.text
 
                     if task["disfluency"]:
                         result_text = filter_disfluencies(result_text)
@@ -124,6 +127,9 @@ def _process_async_asr_tasks() -> None:
                         "SUCCESS",
                         result=result_text,
                         duration_ms=duration_ms,
+                        emotion=asr_result.emotion,
+                        emotion_confidence=asr_result.emotion_confidence,
+                        raw_rich_text=asr_result.raw_rich_text,
                         error_code=20000000,
                         error_message="SUCCESS",
                     )
@@ -138,6 +144,9 @@ def _process_async_asr_tasks() -> None:
                                 task_id=task_id,
                                 result=result_text,
                                 duration_ms=duration_ms,
+                                emotion=asr_result.emotion,
+                                emotion_confidence=asr_result.emotion_confidence,
+                                raw_rich_text=asr_result.raw_rich_text,
                                 notify_custom=task["notify_url"],
                             ),
                         )
@@ -230,6 +239,8 @@ async def submit_async_asr(request: Request, asr_request: AsyncASRRequest):
             "enable_inverse_text_normalization": payload.enable_inverse_text_normalization,
             "enable_voice_detection": payload.enable_voice_detection,
             "disfluency": payload.disfluency,
+            "enable_emotion": payload.enable_emotion,
+            "return_rich_text": payload.return_rich_text,
             "dolphin_lang_sym": payload.dolphin_lang_sym,
             "dolphin_region_sym": payload.dolphin_region_sym,
             "enable_notify": asr_request.payload.enable_notify,
@@ -300,6 +311,9 @@ async def get_async_asr_result(
             task_id=task_id,
             result=task.get("result") if task["status"] == "SUCCESS" else None,
             duration_ms=task.get("duration_ms") if task["status"] == "SUCCESS" else None,
+            emotion=task.get("emotion") if task["status"] == "SUCCESS" else None,
+            emotion_confidence=task.get("emotion_confidence") if task["status"] == "SUCCESS" else None,
+            raw_rich_text=task.get("raw_rich_text") if task["status"] == "SUCCESS" else None,
             notify_custom=task.get("notify_url") if task.get("enable_notify") else None,
         )
         response_data = AsyncASRResponse(

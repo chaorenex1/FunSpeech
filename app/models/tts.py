@@ -16,6 +16,7 @@ from .common import (
     ErrorResponse,
 )
 from ..core.config import settings
+from ..utils.emotion import normalize_emotion
 
 
 class TTSModelType(str, Enum):
@@ -105,6 +106,28 @@ class TTSRequest(BaseModel):
         max_length=500,
     )
 
+    emotion: Optional[str] = Field(
+        None,
+        description="结构化情感控制标签，如 neutral/happy/sad/angry/fearful/disgusted/surprised",
+        example="happy",
+        max_length=32,
+    )
+
+    emotion_intensity: Optional[float] = Field(
+        None,
+        description="情感强度，范围0.0~1.0",
+        example=0.8,
+        ge=0.0,
+        le=1.0,
+    )
+
+    emotion_source: Optional[str] = Field(
+        None,
+        description="情感来源，如 manual/asr/default",
+        example="manual",
+        max_length=32,
+    )
+
     @field_validator("text")
     @classmethod
     def validate_text(cls, v: str) -> str:
@@ -122,6 +145,11 @@ class TTSRequest(BaseModel):
         if not v or not v.strip():
             raise ValueError("音色参数不能为空")
         return v.strip()
+
+    @field_validator("emotion")
+    @classmethod
+    def validate_emotion(cls, v: Optional[str]) -> Optional[str]:
+        return normalize_emotion(v)
 
 
 class OpenAITTSRequest(BaseModel):
@@ -169,6 +197,26 @@ class OpenAITTSRequest(BaseModel):
         example="说话温柔一些，语气轻松",
         max_length=500,
     )
+
+    emotion: Optional[str] = Field(
+        None,
+        description="结构化情感控制标签，如 happy/sad/angry/neutral",
+        example="happy",
+        max_length=32,
+    )
+
+    emotion_intensity: Optional[float] = Field(
+        None,
+        description="情感强度，范围0.0~1.0",
+        example=0.8,
+        ge=0.0,
+        le=1.0,
+    )
+
+    @field_validator("emotion")
+    @classmethod
+    def validate_emotion(cls, v: Optional[str]) -> Optional[str]:
+        return normalize_emotion(v)
 
 
 # ============= 响应模型 =============
@@ -256,6 +304,7 @@ class VoiceInfo(BaseModel):
     description: Optional[str] = Field(None, description="音色描述")
     sample_rate: Optional[int] = Field(None, description="音频采样率")
     available: bool = Field(True, description="是否可用")
+    supports_emotion_control: bool = Field(False, description="是否支持结构化情感控制")
 
     class Config:
         json_schema_extra = {

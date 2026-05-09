@@ -87,6 +87,18 @@ class ASRQueryParams(BaseModel):
         example=False,
     )
 
+    enable_emotion: Optional[bool] = Field(
+        False,
+        description="是否返回ASR识别到的情感标签（SenseVoice支持）",
+        example=True,
+    )
+
+    return_rich_text: Optional[bool] = Field(
+        False,
+        description="是否返回模型原始rich transcription文本，便于调试情感/事件标签",
+        example=False,
+    )
+
     audio_address: Optional[str] = Field(
         None,
         description="音频文件下载链接（HTTP/HTTPS）",
@@ -141,6 +153,9 @@ class ASRSuccessResponse(BaseResponse):
         example="北京的天气怎么样？",
         max_length=10000,
     )
+    emotion: Optional[str] = Field(None, description="识别到的情感标签")
+    emotion_confidence: Optional[float] = Field(None, description="情感识别置信度")
+    raw_rich_text: Optional[str] = Field(None, description="模型原始rich transcription文本")
 
     class Config:
         json_schema_extra = {
@@ -212,6 +227,8 @@ class ASRModelInfo(BaseModel):
     default: bool = Field(False, description="是否为默认模型")
     loaded: bool = Field(False, description="是否已加载")
     supports_realtime: bool = Field(False, description="是否支持实时识别")
+    supports_emotion: bool = Field(False, description="是否支持情感识别")
+    supported_emotions: List[str] = Field(default_factory=list, description="支持的情感标签")
     family: Optional[str] = Field(None, description="模型族")
     streaming_strategy: Optional[str] = Field(None, description="实时识别策略")
     offline_model: Optional[dict] = Field(None, description="离线模型信息")

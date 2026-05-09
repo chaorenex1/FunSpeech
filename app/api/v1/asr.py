@@ -337,8 +337,8 @@ async def asr_transcribe(
         hotwords = resolve_hotwords(params.vocabulary_id, params.hotwords)
 
         # 使用线程池执行模型推理，避免阻塞事件循环
-        result_text = await run_sync(
-            asr_engine.transcribe_file,
+        asr_result = await run_sync(
+            asr_engine.transcribe_file_with_metadata,
             audio_path=normalized_audio_path,
             hotwords=hotwords,
             enable_punctuation=params.enable_punctuation_prediction,
@@ -347,7 +347,10 @@ async def asr_transcribe(
             sample_rate=params.sample_rate,
             dolphin_lang_sym=params.dolphin_lang_sym,
             dolphin_region_sym=params.dolphin_region_sym,
+            enable_emotion=params.enable_emotion,
+            return_rich_text=params.return_rich_text,
         )
+        result_text = asr_result.text
 
         logger.debug(f"[{task_id}] 识别完成: {result_text}")
 
@@ -363,6 +366,9 @@ async def asr_transcribe(
             "language": params.dolphin_lang_sym,
             "duration_ms": int(audio_duration * 1000),
             "confidence": None,
+            "emotion": asr_result.emotion,
+            "emotion_confidence": asr_result.emotion_confidence,
+            "raw_rich_text": asr_result.raw_rich_text,
             "status": 20000000,
             "message": "SUCCESS",
         }

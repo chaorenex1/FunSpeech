@@ -28,6 +28,16 @@
             "family": "sensevoice",
             "streaming_strategy": "windowed_offline",
             "supports_realtime": true,
+            "supports_emotion": true,
+            "supported_emotions": [
+                "neutral",
+                "happy",
+                "sad",
+                "angry",
+                "fearful",
+                "disgusted",
+                "surprised"
+            ],
             "models": {
                 "offline": "iic/SenseVoiceSmall"
             }
