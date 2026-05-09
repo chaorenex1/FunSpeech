@@ -44,7 +44,7 @@ class StableTextCommitter:
             stable_text = self._stable_prefix()
 
         if not stable_text.startswith(self._committed_text):
-            stable_text = self._trim_to_committed_boundary(stable_text)
+            stable_text = self._merge_rolling_window_text(stable_text)
 
         delta = stable_text[len(self._committed_text) :].strip()
         if not delta:
@@ -76,11 +76,26 @@ class StableTextCommitter:
             prefix = _longest_common_prefix(prefix, text)
         return prefix.strip()
 
-    def _trim_to_committed_boundary(self, text: str) -> str:
+    def _merge_rolling_window_text(self, text: str) -> str:
+        """Merge ASR rolling-window text with already committed text.
+
+        SenseVoice partial decoding may use only the latest audio window for
+        latency control. In that mode a new hypothesis can be a suffix window
+        rather than the whole sentence, so strict prefix matching would stop all
+        commits until VAD final. We keep prefix behavior when possible, otherwise
+        append only the non-overlapping suffix of the rolling hypothesis.
+        """
         if not self._committed_text:
             return text
         prefix = _longest_common_prefix(self._committed_text, text)
-        return prefix if len(prefix) >= len(self._committed_text) else self._committed_text
+        if len(prefix) >= len(self._committed_text):
+            return prefix
+        if text in self._committed_text:
+            return self._committed_text
+        overlap = _longest_suffix_prefix_overlap(self._committed_text, text)
+        if overlap > 0:
+            return f"{self._committed_text}{text[overlap:]}"
+        return f"{self._committed_text}{text}"
 
     def _should_commit(self, delta: str) -> bool:
         if len(delta) >= self.min_commit_chars:
@@ -98,3 +113,11 @@ def _longest_common_prefix(left: str, right: str) -> str:
             break
         index += 1
     return left[:index]
+
+
+def _longest_suffix_prefix_overlap(left: str, right: str) -> int:
+    max_len = min(len(left), len(right))
+    for size in range(max_len, 0, -1):
+        if left[-size:] == right[:size]:
+            return size
+    return 0

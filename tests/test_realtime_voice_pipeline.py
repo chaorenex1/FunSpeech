@@ -109,6 +109,28 @@ def test_stable_text_committer_resets_sentence_after_final():
     assert second.full_text == "再见。"
 
 
+def test_stable_text_committer_appends_rolling_window_overlap():
+    committer = StableTextCommitter(stable_hypotheses=1, min_commit_chars=1)
+
+    first = committer.update(AsrHypothesis("今天我们去公园"))
+    assert first is not None
+    assert first.text == "今天我们去公园"
+
+    rolling = committer.update(AsrHypothesis("去公园散步聊天"))
+
+    assert rolling is not None
+    assert rolling.text == "散步聊天"
+    assert rolling.full_text == "今天我们去公园散步聊天"
+
+
+def test_stable_text_committer_does_not_recommit_rolling_window_subset():
+    committer = StableTextCommitter(stable_hypotheses=1, min_commit_chars=1)
+
+    assert committer.update(AsrHypothesis("今天我们去公园")) is not None
+
+    assert committer.update(AsrHypothesis("我们去公园")) is None
+
+
 def test_bounded_audio_queue_drops_silence_before_speech_when_over_budget():
     async def run():
         queue = BoundedAudioQueue(high_watermark_ms=60, max_ms=100)
