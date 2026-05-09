@@ -494,10 +494,9 @@ class AliyunWebSocketTTSService:
         effective_prompt = compose_emotion_prompt(prompt, emotion, emotion_intensity)
         formatted_prompt = self._format_prompt_text(effective_prompt, clone_version)
 
-        use_instruct = bool(effective_prompt) or clone_version == "cosyvoice3"
+        use_instruct = bool(effective_prompt)
 
-        # CosyVoice3 的 LLM 输入必须包含 <|endofprompt|>，即使调用方没有传 prompt
-        # 也要走 instruct2 并注入默认 prompt，避免模型线程断言失败。
+        # 只有显式 prompt/情感指令才走 instruct2，避免空 prompt 复读注册参考文本。
         if use_instruct:
             inference_method = engine.inference_instruct2
             inference_args = (

@@ -500,9 +500,9 @@ class CosyVoiceTTSEngine:
                 # 为每个句子生成音频并记录时间戳
                 for sentence_text in normalized_texts:
                     sentence_audio_segments = []
-                    use_instruct = bool(effective_prompt) or self._clone_model_version == "cosyvoice3"
+                    use_instruct = bool(effective_prompt)
                     if use_instruct:
-                        # CosyVoice3 即使无 prompt 也需要默认 instruct_text 中的 endofprompt。
+                        # 只有显式 prompt/情感指令才走 instruct2，避免空 prompt 复读注册参考文本。
                         inference_gen = self.inference_instruct2(
                             sentence_text,
                             formatted_prompt,  # instruct_text
@@ -558,9 +558,9 @@ class CosyVoiceTTSEngine:
 
             else:
                 # 不需要时间戳，直接合成
-                use_instruct = bool(effective_prompt) or self._clone_model_version == "cosyvoice3"
+                use_instruct = bool(effective_prompt)
                 if use_instruct:
-                    # CosyVoice3 即使无 prompt 也需要默认 instruct_text 中的 endofprompt。
+                    # 只有显式 prompt/情感指令才走 instruct2，避免空 prompt 复读注册参考文本。
                     inference_gen = self.inference_instruct2(
                         text,
                         formatted_prompt,  # instruct_text
