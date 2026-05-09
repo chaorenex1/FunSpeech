@@ -88,11 +88,15 @@ def _process_async_asr_tasks() -> None:
                 try:
                     logger.info("处理异步ASR任务: %s", task_id)
 
-                    audio_data = download_audio_from_url(
-                        task["audio_address"],
-                        max_size=settings.MAX_ASYNC_ASR_AUDIO_SIZE,
-                    )
-                    file_suffix = get_audio_file_suffix(task["audio_address"], task["format"])
+                    if task.get("audio_bytes"):
+                        audio_data = bytes(task["audio_bytes"])
+                        file_suffix = task["format"]
+                    else:
+                        audio_data = download_audio_from_url(
+                            task["audio_address"],
+                            max_size=settings.MAX_ASYNC_ASR_AUDIO_SIZE,
+                        )
+                        file_suffix = get_audio_file_suffix(task["audio_address"], task["format"])
                     audio_path = save_audio_to_temp_file(audio_data, file_suffix)
                     normalized_audio_path = normalize_audio_for_asr(
                         audio_path,
@@ -230,6 +234,7 @@ async def submit_async_asr(request: Request, asr_request: AsyncASRRequest):
             "task_id": task_id,
             "request_id": request_id,
             "audio_address": payload.audio_address,
+            "audio_bytes": bytes(payload.audio_bytes) if payload.audio_bytes is not None else None,
             "format": payload.format,
             "sample_rate": payload.sample_rate,
             "vocabulary_id": payload.vocabulary_id,

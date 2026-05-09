@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """长录音异步ASR数据模型。"""
 
-from typing import Optional
+from typing import List, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .common import AudioFormat, SampleRate
 
@@ -11,7 +11,8 @@ from .common import AudioFormat, SampleRate
 class AsyncASRRequestData(BaseModel):
     """异步ASR请求数据。"""
 
-    audio_address: str = Field(..., description="长录音HTTP/HTTPS下载地址", max_length=2048)
+    audio_address: Optional[str] = Field(None, description="长录音HTTP/HTTPS下载地址", max_length=2048)
+    audio_bytes: Optional[List[int]] = Field(None, description="音频字节数组")
     format: AudioFormat = Field("wav", description="音频格式")
     sample_rate: SampleRate = Field(16000, description="音频采样率")
     vocabulary_id: Optional[str] = Field(None, description="热词表ID", max_length=64)
@@ -29,12 +30,31 @@ class AsyncASRRequestData(BaseModel):
     @field_validator("audio_address")
     @classmethod
     def validate_audio_address(cls, value: str) -> str:
+        if value is None:
+            return value
         if not value or not value.strip():
             raise ValueError("audio_address不能为空")
         value = value.strip()
         if not value.startswith(("http://", "https://")):
             raise ValueError("audio_address必须是HTTP/HTTPS URL")
         return value
+
+    @field_validator("audio_bytes")
+    @classmethod
+    def validate_audio_bytes(cls, value: Optional[List[int]]) -> Optional[List[int]]:
+        if value is None:
+            return value
+        if not value:
+            raise ValueError("audio_bytes不能为空")
+        if any(byte < 0 or byte > 255 for byte in value):
+            raise ValueError("audio_bytes必须是0-255之间的整数数组")
+        return value
+
+    @model_validator(mode="after")
+    def validate_audio_source(self):
+        if not self.audio_address and not self.audio_bytes:
+            raise ValueError("audio_address和audio_bytes必须至少提供一个")
+        return self
 
 
 class AsyncASRPayload(BaseModel):

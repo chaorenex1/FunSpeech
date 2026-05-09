@@ -106,7 +106,7 @@ class DatabaseManager:
                     task_id TEXT PRIMARY KEY,
                     request_id TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'RUNNING',
-                    audio_address TEXT NOT NULL,
+                    audio_address TEXT,
                     format TEXT NOT NULL DEFAULT 'wav',
                     sample_rate INTEGER NOT NULL DEFAULT 16000,
                     vocabulary_id TEXT,
@@ -138,6 +138,7 @@ class DatabaseManager:
                     "emotion": "TEXT",
                     "emotion_confidence": "REAL",
                     "raw_rich_text": "TEXT",
+                    "audio_bytes": "BLOB",
                 },
             )
 
@@ -320,17 +321,18 @@ class DatabaseManager:
 
             cursor.execute("""
                 INSERT INTO async_asr_tasks (
-                    task_id, request_id, audio_address, format, sample_rate,
+                    task_id, request_id, audio_address, audio_bytes, format, sample_rate,
                     vocabulary_id, hotwords, customization_id,
                     enable_punctuation_prediction, enable_inverse_text_normalization,
                     enable_voice_detection, disfluency, dolphin_lang_sym,
                     dolphin_region_sym, enable_emotion, return_rich_text,
                     enable_notify, notify_url, status, error_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 task_data["task_id"],
                 task_data["request_id"],
-                task_data["audio_address"],
+                task_data.get("audio_address") or "",
+                task_data.get("audio_bytes"),
                 task_data["format"],
                 task_data["sample_rate"],
                 task_data.get("vocabulary_id"),
