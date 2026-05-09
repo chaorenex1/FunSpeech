@@ -222,6 +222,8 @@ async def submit_async_asr(request: Request, asr_request: AsyncASRRequest):
             raise AuthenticationException(content, task_id)
 
         payload = asr_request.payload.asr_request
+        if payload.audio_bytes is not None and len(payload.audio_bytes) > settings.MAX_ASYNC_ASR_AUDIO_SIZE:
+            raise InvalidParameterException("audio_bytes超过长录音异步识别大小限制", task_id)
 
         if asr_request.payload.enable_notify:
             notify_url = asr_request.payload.notify_url

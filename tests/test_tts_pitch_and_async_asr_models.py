@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 
+from app.core.database import DatabaseManager
 from app.models.async_asr import AsyncASRRequest
 from app.models.tts import TTSRequest
 from app.utils.audio import adjust_audio_pitch
@@ -50,3 +51,65 @@ def test_async_asr_request_shape_matches_long_recording_api():
     assert request.payload.asr_request.audio_address == "https://example.com/long.wav"
     assert request.payload.asr_request.enable_voice_detection is True
     assert request.payload.asr_request.hotwords == "FunSpeech"
+
+
+def test_async_asr_request_accepts_audio_byte_array_without_url():
+    request = AsyncASRRequest(
+        payload={
+            "asr_request": {
+                "audio_bytes": [82, 73, 70, 70],
+                "format": "wav",
+                "sample_rate": 16000,
+            },
+            "enable_notify": False,
+        },
+        header={"appkey": "app", "token": "0123456789"},
+    )
+
+    assert request.payload.asr_request.audio_address is None
+    assert request.payload.asr_request.audio_bytes == [82, 73, 70, 70]
+
+
+def test_async_asr_request_requires_url_or_audio_bytes():
+    with pytest.raises(ValueError):
+        AsyncASRRequest(
+            payload={
+                "asr_request": {
+                    "format": "wav",
+                    "sample_rate": 16000,
+                },
+                "enable_notify": False,
+            },
+            header={"appkey": "app", "token": "0123456789"},
+        )
+
+
+def test_async_asr_database_persists_audio_bytes(tmp_path, monkeypatch):
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "DATA_DIR", str(tmp_path))
+    DatabaseManager._instance = None
+    manager = DatabaseManager()
+
+    created = manager.create_asr_task(
+        {
+            "task_id": "task-bytes",
+            "request_id": "request-bytes",
+            "audio_address": None,
+            "audio_bytes": bytes([82, 73, 70, 70]),
+            "format": "wav",
+            "sample_rate": 16000,
+            "customization_id": "sensevoice-small",
+            "enable_punctuation_prediction": False,
+            "enable_inverse_text_normalization": False,
+            "enable_voice_detection": True,
+            "disfluency": False,
+            "dolphin_lang_sym": "zh",
+            "dolphin_region_sym": "SHANGHAI",
+        }
+    )
+    task = manager.get_asr_task("task-bytes")
+
+    assert created is True
+    assert not task["audio_address"]
+    assert bytes(task["audio_bytes"]) == b"RIFF"
