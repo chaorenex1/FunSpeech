@@ -60,6 +60,27 @@ def test_bounded_audio_queue_drops_silence_before_speech_when_over_budget():
     asyncio.run(run())
 
 
+def test_bounded_audio_queue_preserves_vad_metadata_on_backpressure():
+    async def run():
+        queue = BoundedAudioQueue(high_watermark_ms=10, max_ms=20)
+
+        await queue.put(AudioFrame(b"voice", duration_ms=10, is_silence=False))
+        events = await queue.put(
+            AudioFrame(
+                b"silence",
+                duration_ms=20,
+                is_silence=True,
+                sequence=7,
+                vad_state="silence",
+            )
+        )
+
+        assert events[0].type == "dropped_silence"
+        assert queue.queued_ms == 10
+
+    asyncio.run(run())
+
+
 def test_tts_job_queue_drops_stale_stable_jobs_and_prefers_final():
     async def run():
         queue = TtsJobQueue(maxsize=2)

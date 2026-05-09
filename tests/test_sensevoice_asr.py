@@ -91,4 +91,8 @@ def test_sensevoice_streaming_session_uses_rms_fallback(monkeypatch):
     events = asyncio.run(run())
 
     assert [event.kind for event in events] == ["begin", "partial", "end"]
+    assert events[0].speech_begin_ms == 0
+    assert events[0].speech_active is True
+    assert events[-1].speech_end_ms is not None
+    assert events[-1].speech_active is False
     assert events[-1].text == "你好"

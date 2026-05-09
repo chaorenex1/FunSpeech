@@ -120,6 +120,8 @@ class RealtimeVoiceAsrTtsSession:
         self._utterance_index = 1
         self._hypothesis_index = 0
         self._audio_chunk_index = 0
+        self._input_frame_index = 0
+        self._speech_active = False
         self.config_version = 1
 
     def close(self):
@@ -183,6 +185,8 @@ class RealtimeVoiceAsrTtsSession:
                         "dropped_ms": event.dropped_ms,
                         "action": event.type,
                         "message": event.message,
+                        "vad_state": frame.vad_state,
+                        "speech_active": frame.speech_active,
                     },
                     type=event.type,
                     queue_ms=event.queue_ms,
@@ -213,21 +217,68 @@ class RealtimeVoiceAsrTtsSession:
                         "queue_ms": self.audio_queue.queued_ms,
                         "duration_ms": frame.duration_ms,
                         "is_silence": frame.is_silence,
+                        "input_frame_index": frame.sequence,
+                        "vad_state": frame.vad_state,
+                        "speech_active": frame.speech_active,
                     },
                     stage="asr_receiving_audio",
                     queue_ms=self.audio_queue.queued_ms,
                 )
             )
+            if frame.speech_active:
+                await self._send_json(
+                    self._event(
+                        "vad.speech_frame",
+                        payload={
+                            "utterance_id": self._current_utterance_id(),
+                            "input_frame_index": frame.sequence,
+                            "duration_ms": frame.duration_ms,
+                            "vad_state": frame.vad_state,
+                            "source": "vad",
+                        },
+                    )
+                )
             events = await self._transcribe_events(frame.payload, self._task_id)
             for asr_event in events:
                 await self._handle_asr_hypothesis(asr_event)
 
     async def _handle_asr_hypothesis(self, hypothesis: AsrHypothesis) -> None:
         assert self._task_id is not None
+        utterance_id = self._current_utterance_id()
+        if hypothesis.kind == "begin":
+            self._speech_active = True
+            await self._send_json(
+                self._event(
+                    "vad.speech_started",
+                    payload={
+                        "utterance_id": utterance_id,
+                        "speech_begin_ms": hypothesis.speech_begin_ms
+                        if hypothesis.speech_begin_ms is not None
+                        else hypothesis.begin_time_ms,
+                        "time_ms": hypothesis.time_ms,
+                        "source": hypothesis.vad_source or "vad",
+                    },
+                )
+            )
+            return
+        if hypothesis.kind == "end":
+            await self._send_json(
+                self._event(
+                    "vad.speech_ended",
+                    payload={
+                        "utterance_id": utterance_id,
+                        "speech_end_ms": hypothesis.speech_end_ms
+                        if hypothesis.speech_end_ms is not None
+                        else hypothesis.time_ms,
+                        "time_ms": hypothesis.time_ms,
+                        "source": hypothesis.vad_source or "vad",
+                    },
+                )
+            )
+            self._speech_active = False
         if not hypothesis.text:
             return
         self._hypothesis_index += 1
-        utterance_id = self._current_utterance_id()
         hypothesis_id = f"{utterance_id}_hyp_{self._hypothesis_index}"
         await self._send_json(
             self._event(
@@ -238,6 +289,8 @@ class RealtimeVoiceAsrTtsSession:
                     "text": hypothesis.text,
                     "is_final": hypothesis.is_final,
                     "time_ms": hypothesis.time_ms,
+                    "begin_time_ms": hypothesis.begin_time_ms,
+                    "speech_active": self._speech_active,
                     "emotion": hypothesis.emotion,
                     "emotion_confidence": hypothesis.emotion_confidence,
                     "raw_rich_text": hypothesis.raw_rich_text,
@@ -253,6 +306,7 @@ class RealtimeVoiceAsrTtsSession:
                     "hypothesis_id": hypothesis_id,
                     "text": hypothesis.text,
                     "is_final": hypothesis.is_final,
+                    "speech_active": self._speech_active,
                     "emotion": hypothesis.emotion,
                     "emotion_confidence": hypothesis.emotion_confidence,
                     "raw_rich_text": hypothesis.raw_rich_text,
@@ -542,13 +596,19 @@ class RealtimeVoiceAsrTtsSession:
                 AsrHypothesis(
                     text=event.text.strip(),
                     is_final=event.kind == "end",
+                    kind=event.kind,
                     time_ms=getattr(event, "time_ms", 0),
+                    begin_time_ms=getattr(event, "begin_time_ms", 0),
+                    speech_begin_ms=getattr(event, "speech_begin_ms", None),
+                    speech_end_ms=getattr(event, "speech_end_ms", None),
+                    vad_source=getattr(event, "vad_source", None),
+                    speech_active=getattr(event, "speech_active", False),
                     emotion=getattr(event, "emotion", None),
                     emotion_confidence=getattr(event, "emotion_confidence", None),
                     raw_rich_text=getattr(event, "raw_rich_text", None),
                 )
                 for event in events
-                if event.kind in {"end", "partial"} and event.text
+                if event.kind in {"begin", "end", "partial"}
             ]
 
         self.audio_buffer = np.concatenate([self.audio_buffer, incoming])
@@ -610,10 +670,15 @@ class RealtimeVoiceAsrTtsSession:
 
     def _build_audio_frame(self, audio: bytes) -> AudioFrame:
         duration_ms = self._estimate_duration_ms(audio)
+        is_silence = self._is_silence(audio)
+        self._input_frame_index += 1
         return AudioFrame(
             payload=audio,
             duration_ms=duration_ms,
-            is_silence=self._is_silence(audio),
+            is_silence=is_silence,
+            sequence=self._input_frame_index,
+            vad_state="speech" if self._speech_active else ("silence" if is_silence else "speech_like"),
+            speech_active=self._speech_active,
         )
 
     def _estimate_duration_ms(self, audio: bytes) -> int:

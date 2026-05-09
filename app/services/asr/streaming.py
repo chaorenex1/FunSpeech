@@ -23,6 +23,10 @@ class StreamingASREvent:
     text: str = ""
     raw_text: str = ""
     begin_time_ms: int = 0
+    speech_begin_ms: Optional[int] = None
+    speech_end_ms: Optional[int] = None
+    vad_source: Optional[str] = None
+    speech_active: bool = False
     itn_applied: bool = False
     emotion: Optional[str] = None
     emotion_confidence: Optional[float] = None
@@ -69,6 +73,9 @@ class SenseVoiceWindowedStreamingSession:
                     kind="begin",
                     time_ms=self.sentence_begin_time_ms,
                     begin_time_ms=self.sentence_begin_time_ms,
+                    speech_begin_ms=vad_event.speech_begin_ms,
+                    vad_source=vad_event.source,
+                    speech_active=True,
                 )
             )
         elif self.sentence_active and len(audio_array) > 0:
@@ -94,6 +101,8 @@ class SenseVoiceWindowedStreamingSession:
                             emotion=asr_result.emotion,
                             emotion_confidence=asr_result.emotion_confidence,
                             begin_time_ms=self.sentence_begin_time_ms,
+                            speech_active=True,
+                            vad_source=vad_event.source,
                             itn_applied=self.enable_itn,
                         )
                     )
@@ -138,6 +147,9 @@ class SenseVoiceWindowedStreamingSession:
             emotion=asr_result.emotion,
             emotion_confidence=asr_result.emotion_confidence,
             begin_time_ms=self.sentence_begin_time_ms,
+            speech_end_ms=end_time_ms,
+            speech_active=False,
+            vad_source="vad",
             itn_applied=self.enable_itn,
         )
         self._reset_sentence()

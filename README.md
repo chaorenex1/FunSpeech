@@ -25,10 +25,12 @@
 - **🚀 多模型支持** - 集成 FunASR、Dolphin、CosyVoice 等多种高质量模型
 - **🌐 完全 API 兼容** - 支持阿里云语音 API 和 OpenAI TTS API 格式,及 Websocket 流式 ASR/TTS 协议
 - **🎭 智能音色管理** - 支持预训练音色和零样本克隆音色
+- **🧩 Voice Cloner 对接** - 提供音色设计、音色同步和实时 ASR->TTS 变声 WebSocket 接口
+- **🕒 异步任务** - 支持长文本异步 TTS 和长录音异步 ASR,可轮询结果或配置回调通知
 - **🔧 灵活配置** - 统一的配置系统,支持环境变量和文件配置
 - **🛡️ 安全鉴权** - 完善的身份认证和权限控制
 - **💾 性能优化** - 智能模型缓存和动态加载机制
-- **🎯 智能过滤** - 流式ASR远场声音过滤，减少环境音误触发
+- **🎯 智能过滤与控制** - 支持 ASR 热词/语气词过滤/情感标签,以及 TTS 音量、语调、情感控制
 
 ## 📦 快速部署
 
@@ -96,6 +98,9 @@ FunSpeech 支持多路并发处理,通过以下环境变量配置:
 | `INFERENCE_THREAD_POOL_SIZE` | `auto` | 推理线程池大小,确保事件循环不阻塞 |
 | `TTS_GPUS` | `""` | TTS GPU配置: `""` (自动), `cpu`, `0` (单卡), `0,1` (多卡) |
 | `ASR_GPUS` | `""` | ASR GPU配置: `""` (自动), `cpu`, `0` (单卡), `0,1` (多卡) |
+| `REALTIME_TTS_GLOBAL_MAX_INFLIGHT` | `2` | Realtime Voice 全局同时合成任务数 |
+| `REALTIME_TTS_GLOBAL_QUEUE_SIZE` | `16` | Realtime Voice 全局 TTS 排队长度 |
+| `REALTIME_AUDIO_INPUT_MAX_MS` | `1800` | Realtime Voice 单会话音频输入缓冲上限 |
 
 **配置示例:**
 
@@ -126,22 +131,106 @@ cd FunSpeech
 git submodule update --init --recursive
 
 # 安装依赖
-pip install -r app/services/tts/third_party/CosyVoice/requirements.txt
-pip install -r requirements.txt
+pip install -r dependencies/requirements.txt
+
+# 根据运行环境安装 CosyVoice 依赖
+pip install -r dependencies/CosyVoice/requirements-cpu.txt
+# 或 GPU 环境:
+# pip install -r dependencies/CosyVoice/requirements-gpu.txt
 
 # 启动服务
 python main.py
 ```
 
+## 🛠️ 脚本工具
+
+脚本依赖可按需安装:
+
+```bash
+pip install numpy matplotlib soundfile websockets tqdm
+```
+
+### Docker 构建脚本
+
+`scripts/build-docker.sh` 用于在服务器源码目录构建 CPU/GPU 镜像并可选导出离线包:
+
+```bash
+bash scripts/build-docker.sh cpu
+bash scripts/build-docker.sh gpu
+bash scripts/build-docker.sh all --image docker.cnb.cool/nexa/funspeech --tag v1.0.0 --gpu-tag gpu-v1.0.0 --push
+```
+
+### RMS 音频分析
+
+`scripts/analyze_audio_rms.py` 用于分析录音 RMS 能量时序,辅助调优流式 ASR 远场过滤阈值:
+
+```bash
+# 基础分析
+python scripts/analyze_audio_rms.py audio.wav
+
+# 指定声道、阈值并保存图表
+python scripts/analyze_audio_rms.py recording.wav \
+  --channel right \
+  --threshold 0.015 \
+  --output rms_analysis.png
+
+# 仅输出统计信息
+python scripts/analyze_audio_rms.py recording.wav --no-plot
+```
+
+常用参数: `--channel stereo|left|right`、`--threshold 0.01`、`--chunk-size 240`、`--output`、`--no-plot`。详细说明见 [scripts/README.md](./scripts/README.md)。
+
+### ASR/TTS 并发基准测试
+
+`scripts.benchmark.run` 用于压测 `/ws/v1/asr` 和 `/ws/v1/tts` 的并发性能,生成 Markdown 报告和图表:
+
+```bash
+# 完整测试(ASR + TTS)
+python -m scripts.benchmark.run --audio-file test.wav
+
+# 仅测试 TTS
+python -m scripts.benchmark.run --test-type tts --voice 中文女
+
+# 自定义并发级别和远程地址
+python -m scripts.benchmark.run \
+  --host 192.168.1.100 \
+  --port 8000 \
+  --audio-file test.wav \
+  --concurrency 5 10 20 50 100
+```
+
+常用参数: `--host`、`--port`、`--audio-file`、`--test-type asr|tts|both`、`--concurrency`、`--output`、`--timeout`、`--voice`。详细说明见 [benchmark 文档](./scripts/benchmark/README.md)。
+
+### Realtime Voice 压测
+
+`scripts/benchmark/realtime_voice_pressure.py` 用于压测 `/ws/v1/realtime/voice`,输入本地 WAV 文件并输出每个并发档位的延迟、事件数、背压统计:
+
+```bash
+python scripts/benchmark/realtime_voice_pressure.py \
+  --base-url http://localhost:8000 \
+  --audio test.wav \
+  --voice desktop_voice \
+  --levels 1,2,4 \
+  --duration 12 \
+  --chunk-ms 100 \
+  --output benchmark_results/realtime_voice.json
+```
+
+输入音频会被脚本转换为 16kHz PCM16 mono。常用参数: `--base-url`、`--audio`、`--voice`、`--levels`、`--duration`、`--chunk-ms`、`--realtime-factor`、`--drain-seconds`、`--timeout`、`--output`。
+
 ## 📚 API 接口
 
 ### ASR(语音识别)
 
-| 端点                    | 方法 | 功能           |
-| ----------------------- | ---- | -------------- |
-| `/stream/v1/asr`        | POST | 一句话语音识别 |
-| `/stream/v1/asr/models` | GET  | 模型列表       |
-| `/stream/v1/asr/health` | GET  | 健康检查       |
+| 端点                          | 方法      | 功能                             |
+| ----------------------------- | --------- | -------------------------------- |
+| `/stream/v1/asr`              | POST      | 一句话语音识别                   |
+| **`/rest/v1/asr/async`**      | **POST**  | **提交长录音异步识别任务** 🆕    |
+| **`/rest/v1/asr/async`**      | **GET**   | **查询长录音异步识别结果** 🆕    |
+| **`/ws/v1/asr`**              | WebSocket | **双向流式语音识别**             |
+| `/ws/v1/asr/test`             | GET       | WebSocket ASR 测试页面           |
+| `/stream/v1/asr/models`       | GET       | 模型列表                         |
+| `/stream/v1/asr/health`       | GET       | 健康检查                         |
 
 **完整接口文档:**
 
@@ -151,7 +240,9 @@ python main.py
 **特殊说明:**
 
 - 一句话识别限制音频时长 60 秒
-- 热词功能待实现
+- 一句话和异步 ASR 均支持 `hotwords` 临时热词、`vocabulary_id` 热词表、`disfluency` 语气词过滤
+- SenseVoice 可通过 `enable_emotion=true` 返回情感标签,通过 `return_rich_text=true` 返回模型原始 rich transcription 文本
+- 异步 ASR 支持 `audio_address`(HTTP/HTTPS) 或 `audio_bytes`(0-255 整数数组)作为输入,长录音默认启用 VAD
 
 **流式ASR高级功能:**
 
@@ -159,6 +250,7 @@ python main.py
   - 基于RMS能量阈值检测
   - 零性能开销（<0.1ms），完全可配置
   - 默认启用，详见 [远场过滤文档](./docs/nearfield_filter.md)
+- **Voice Cloner 字段** - WebSocket 识别结果会携带 `task_id`、`text`、`is_final`、`confidence`、`duration_ms` 等稳定字段,便于桌面端消费
 
 ### TTS(语音合成)
 
@@ -171,6 +263,7 @@ python main.py
 | `/stream/v1/tts/voices`         | GET       | 音色列表                    |
 | `/stream/v1/tts/voices/info`    | GET       | 音色详细信息                |
 | `/stream/v1/tts/voices/refresh` | POST      | 刷新音色配置                |
+| **`/stream/v1/tts/emotions`**   | **GET**   | **情感控制标签列表** 🆕     |
 | `/stream/v1/tts/health`         | GET       | 健康检查                    |
 | **`/ws/v1/tts`**                | WebSocket | **双向流式语音合成** 🚀     |
 | `/ws/v1/tts/test`               | GET       | WebSocket 测试页面          |
@@ -184,6 +277,28 @@ python main.py
 **特殊说明:**
 
 - 合成传入采样率中，CosyVoice1 采样率固定（默认）为 22050，CosyVoice2 采样率固定（默认）为 24000
+- `/stream/v1/tts` 支持 `volume`(0-100)、`pitch_rate`(-500~500)、`prompt`、`emotion`、`emotion_intensity` 等控制参数
+- `/openai/v1/audio/speech` 兼容 OpenAI 请求格式,`instructions` 会映射为本项目的音色指导 `prompt`
+
+### Voice Cloner / 实时变声
+
+| 端点                              | 方法      | 功能                                      |
+| --------------------------------- | --------- | ----------------------------------------- |
+| **`/voices/v1/voice-design`**     | **POST**  | **根据音色设计指令生成参考音频** 🆕       |
+| **`/voices/v1/list`**             | **GET**   | **首次启动全量同步 voice_manager 音色**   |
+| **`/voices/v1/register`**         | **POST**  | **增量注册桌面端自定义音色**              |
+| **`/voices/v1/update`**           | **POST**  | **增量更新桌面端自定义音色**              |
+| **`/voices/v1/delete`**           | **POST**  | **增量删除桌面端自定义音色**              |
+| **`/voices/v1/refresh`**          | **POST**  | **重新扫描并加载 voice_manager 音色**     |
+| **`/ws/v1/realtime/voice`**       | WebSocket | **实时 ASR->TTS 变声会话** 🆕             |
+
+**对接约定:**
+
+- 桌面端以唯一 `voice_name` 作为音色关联键;本项目不引入 `voice_id`
+- `/voices/v1/voice-design` 默认不静默降级,需要设置 `VOICE_DESIGN_PROVIDER=module.submodule:function` 注入 VoxCPM 参考音频生成函数
+- `register` / `update` 支持 JSON 的 `reference_audio_url`,也支持 multipart 的 `reference_audio` 文件上传
+- 预置音色名称不可被注册、覆盖或删除;找不到 `voice_name` 时会返回明确错误
+- Realtime Voice 连接后先收 `session_started`,再发送 `configure`,后续可发送 PCM 二进制音频块和 `update` 参数事件
 
 ## 🎯 快速开始
 
@@ -197,16 +312,108 @@ curl -X POST "http://localhost:8000/stream/v1/asr?format=wav&sample_rate=16000" 
 
 **WebSocket 流式识别测试:** 访问 `http://localhost:8000/ws/v1/asr/test`
 
+**长录音异步识别:**
+
+```bash
+# 提交任务
+curl -X POST "http://localhost:8000/rest/v1/asr/async" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "payload": {
+      "asr_request": {
+        "audio_address": "https://example.com/long.wav",
+        "format": "wav",
+        "sample_rate": 16000,
+        "hotwords": "FunSpeech SenseVoice",
+        "disfluency": true
+      },
+      "enable_notify": false
+    },
+    "header": {"appkey": "your_appkey", "token": "your_token"}
+  }'
+
+# 查询结果
+curl "http://localhost:8000/rest/v1/asr/async?appkey=your_appkey&token=your_token&task_id=<task_id>"
+```
+
 **TTS 语音合成:**
 
 ```bash
 curl -X POST "http://localhost:8000/stream/v1/tts" \
   -H "Content-Type: application/json" \
-  -d '{"text": "你好，这是语音合成测试。", "voice": "中文女"}' \
+  -d '{
+    "text": "你好，这是语音合成测试。",
+    "voice": "中文女",
+    "volume": 60,
+    "pitch_rate": 0,
+    "emotion": "happy",
+    "emotion_intensity": 0.8
+  }' \
   --output speech.wav
 ```
 
 **WebSocket 流式合成测试:** 访问 `http://localhost:8000/ws/v1/tts/test`
+
+**异步 TTS:**
+
+```bash
+# 提交长文本合成任务
+curl -X POST "http://localhost:8000/rest/v1/tts/async" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "payload": {
+      "tts_request": {
+        "text": "这是一段需要异步合成的长文本。",
+        "voice": "中文女",
+        "format": "wav",
+        "sample_rate": 22050,
+        "enable_subtitle": true
+      },
+      "enable_notify": false
+    },
+    "header": {"appkey": "your_appkey", "token": "your_token"}
+  }'
+
+# 查询结果
+curl "http://localhost:8000/rest/v1/tts/async?appkey=your_appkey&token=your_token&task_id=<task_id>"
+```
+
+**音色设计与同步:**
+
+```bash
+# 音色设计接口需要先注入 VoxCPM 生成函数
+export VOICE_DESIGN_PROVIDER="your_module.voice_design:generate_reference_audio"
+
+# 生成参考音频
+curl -X POST "http://localhost:8000/voices/v1/voice-design" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "voice_name": "desktop_voice",
+    "voice_instruction": "清亮、少年感、自然口语",
+    "reference_text": "今天的天气很好。",
+    "format": "wav",
+    "sample_rate": 24000
+  }'
+
+# 注册桌面端自定义音色
+curl -X POST "http://localhost:8000/voices/v1/register" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "voice_name": "desktop_voice",
+    "reference_text": "今天的天气很好。",
+    "voice_instruction": "清亮、少年感、自然口语",
+    "reference_audio_url": "https://example.com/desktop_voice.wav"
+  }'
+```
+
+**Realtime Voice WebSocket 协议示例:**
+
+```json
+{"event":"configure","voice_name":"desktop_voice","format":"pcm","sample_rate":16000,"pipeline":"asr_tts","parameters":{"volume":50,"speech_rate":0,"pitch_rate":0}}
+{"event":"update","parameters":{"pitch_rate":120,"emotion_control":"asr"}}
+```
+
+发送 `configure` 后即可持续发送 16kHz PCM16 mono 二进制音频块;服务端会返回 `asr.hypothesis`、`asr.text_committed`、`tts.first_audio`、音频二进制帧、`session_completed` 等事件。
 
 > 💡 更多示例请查看 `tests/` 目录或访问 `http://localhost:8000/docs`(开发模式)
 
@@ -426,16 +633,18 @@ modelscope download --model iic/speech_fsmn_vad_zh-cn-16k-common-pytorch
 
 - **部署指南**: [详细文档](./docs/deployment.md)
 - **远场过滤配置**: [配置指南](./docs/nearfield_filter.md)
+- **Voice Cloner 对接说明**: [一期功能增补清单](./docs/voice-cloner-api-additions.md)
 - **CosyVoice 模型**: [CosyVoice GitHub](https://github.com/FunAudioLLM/CosyVoice)
 - **Dolphin 模型**: [DataoceanAI/Dolphin](https://github.com/DataoceanAI/Dolphin)
 - **FunASR**: [FunASR GitHub](https://github.com/alibaba-damo-academy/FunASR)
 
 ## 📋 TODO
 
-- [ ] 实现 ASR 热词功能 (vocabulary_id)
-- [ ] 实现过滤语气词功能 (disfluency)
-- [ ] 实现 TTS 语调控制 (pitch_rate)
-- [ ] 实现长录音文件异步识别接口
+- [x] 实现 ASR 热词功能 (`vocabulary_id` / `hotwords`)
+- [x] 实现过滤语气词功能 (`disfluency`)
+- [x] 实现 TTS 语调控制 (`pitch_rate`)
+- [x] 实现长录音文件异步识别接口
+- [x] 实现 Voice Cloner 音色设计、音色同步与 Realtime Voice 对接接口
 
 ## 📄 许可证
 

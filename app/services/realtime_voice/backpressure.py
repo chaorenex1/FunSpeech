@@ -32,7 +32,7 @@ class BoundedAudioQueue:
     async def put(self, frame: AudioFrame) -> list[BackpressureEvent]:
         events: list[BackpressureEvent] = []
         async with self._condition:
-            if self._queued_ms >= self.high_watermark_ms and frame.is_silence:
+            if self._queued_ms >= self.high_watermark_ms and _is_backpressure_silence(frame):
                 events.append(
                     BackpressureEvent(
                         type="dropped_silence",
@@ -95,7 +95,7 @@ class BoundedAudioQueue:
 
     def _find_oldest_silence_index(self) -> Optional[int]:
         for index, frame in enumerate(self._frames):
-            if frame.is_silence:
+            if _is_backpressure_silence(frame):
                 return index
         return None
 
@@ -106,6 +106,15 @@ class BoundedAudioQueue:
         frame = self._frames.popleft()
         self._frames.rotate(index)
         return frame
+
+
+def _is_backpressure_silence(frame: AudioFrame) -> bool:
+    """Use VAD state when available, with RMS silence as a fallback."""
+    if frame.vad_state == "silence":
+        return True
+    if frame.vad_state in {"speech", "speech_like", "active"} or frame.speech_active:
+        return False
+    return frame.is_silence
 
 
 class TtsJobQueue:

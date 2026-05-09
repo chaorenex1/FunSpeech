@@ -15,6 +15,9 @@ class AudioFrame:
     payload: bytes
     duration_ms: int
     is_silence: bool
+    sequence: int = 0
+    vad_state: str = "unknown"
+    speech_active: bool = False
     created_at: float = field(default_factory=monotonic)
 
 
@@ -34,7 +37,13 @@ class AsrHypothesis:
 
     text: str
     is_final: bool = False
+    kind: str = "partial"
     time_ms: int = 0
+    begin_time_ms: int = 0
+    speech_begin_ms: int | None = None
+    speech_end_ms: int | None = None
+    vad_source: str | None = None
+    speech_active: bool = False
     emotion: str | None = None
     emotion_confidence: float | None = None
     raw_rich_text: str | None = None
