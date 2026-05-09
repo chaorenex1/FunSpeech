@@ -16,8 +16,11 @@ class AudioFrame:
     duration_ms: int
     is_silence: bool
     sequence: int = 0
+    pre_class: str = "unknown"
     vad_state: str = "unknown"
+    utterance_id: str | None = None
     speech_active: bool = False
+    covered_by_asr: bool = False
     created_at: float = field(default_factory=monotonic)
 
 
@@ -29,6 +32,11 @@ class BackpressureEvent:
     queue_ms: int = 0
     dropped_ms: int = 0
     message: str = ""
+    vad_state: str | None = None
+    pre_class: str | None = None
+    utterance_id: str | None = None
+    first_dropped_seq: int | None = None
+    last_dropped_seq: int | None = None
 
 
 @dataclass(frozen=True)

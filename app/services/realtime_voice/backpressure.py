@@ -13,9 +13,9 @@ from .types import AudioFrame, BackpressureEvent
 class BoundedAudioQueue:
     """Audio queue budgeted by duration instead of item count.
 
-    Realtime audio can arrive faster than ASR/TTS can consume it. This queue
-    keeps latency bounded by preferring to drop silence and old uncommitted
-    frames before allowing unbounded backlog.
+    Realtime audio can arrive faster than ASR/TTS can consume it. The queue
+    keeps latency bounded with a layered policy: VAD silence, RMS pre-silence,
+    already-covered speech, speech-like pending frames, then oldest speech.
     """
 
     def __init__(self, high_watermark_ms: int, max_ms: int):
@@ -32,13 +32,10 @@ class BoundedAudioQueue:
     async def put(self, frame: AudioFrame) -> list[BackpressureEvent]:
         events: list[BackpressureEvent] = []
         async with self._condition:
-            if self._queued_ms >= self.high_watermark_ms and _is_backpressure_silence(frame):
+            incoming_drop_reason = _incoming_drop_reason(frame)
+            if self._queued_ms >= self.high_watermark_ms and incoming_drop_reason is not None:
                 events.append(
-                    BackpressureEvent(
-                        type="dropped_silence",
-                        queue_ms=self._queued_ms,
-                        dropped_ms=frame.duration_ms,
-                    )
+                    _drop_event(incoming_drop_reason, self._queued_ms, frame)
                 )
                 return events
 
@@ -50,15 +47,7 @@ class BoundedAudioQueue:
                     BackpressureEvent(type="input_throttle", queue_ms=self._queued_ms)
                 )
 
-            dropped_ms = self._drop_until_within_budget()
-            if dropped_ms:
-                events.append(
-                    BackpressureEvent(
-                        type="dropped_audio",
-                        queue_ms=self._queued_ms,
-                        dropped_ms=dropped_ms,
-                    )
-                )
+            events.extend(self._drop_until_within_budget())
 
             self._condition.notify()
         return events
@@ -82,22 +71,28 @@ class BoundedAudioQueue:
         self._frames.clear()
         self._queued_ms = 0
 
-    def _drop_until_within_budget(self) -> int:
-        dropped_ms = 0
+    def _drop_until_within_budget(self) -> list[BackpressureEvent]:
+        events: list[BackpressureEvent] = []
         while self._queued_ms > self.max_ms and self._frames:
-            index = self._find_oldest_silence_index()
-            if index is None:
-                index = 0
+            index, reason = self._find_best_drop_candidate()
             frame = self._remove_at(index)
-            dropped_ms += frame.duration_ms
             self._queued_ms = max(0, self._queued_ms - frame.duration_ms)
-        return dropped_ms
+            events.append(_drop_event(reason, self._queued_ms, frame))
+        return events
 
-    def _find_oldest_silence_index(self) -> Optional[int]:
+    def _find_best_drop_candidate(self) -> tuple[int, str]:
+        best_index = 0
+        best_priority = 10_000
+        best_reason = "drop_oldest_speech"
         for index, frame in enumerate(self._frames):
-            if _is_backpressure_silence(frame):
-                return index
-        return None
+            priority, reason = _drop_priority(frame)
+            if priority < best_priority:
+                best_index = index
+                best_priority = priority
+                best_reason = reason
+                if priority == 0:
+                    break
+        return best_index, best_reason
 
     def _remove_at(self, index: int) -> AudioFrame:
         if index == 0:
@@ -108,13 +103,51 @@ class BoundedAudioQueue:
         return frame
 
 
-def _is_backpressure_silence(frame: AudioFrame) -> bool:
-    """Use VAD state when available, with RMS silence as a fallback."""
+def _incoming_drop_reason(frame: AudioFrame) -> Optional[str]:
+    """Only drop incoming frames early when they are silence-like."""
+    priority, reason = _drop_priority(frame)
+    return reason if priority <= 1 else None
+
+
+def _drop_priority(frame: AudioFrame) -> tuple[int, str]:
+    """Lower priority values are safer to drop under input backpressure."""
     if frame.vad_state == "silence":
-        return True
-    if frame.vad_state in {"speech", "speech_like", "active"} or frame.speech_active:
+        return 0, "drop_vad_silence"
+    if _is_pre_silence(frame):
+        return 1, "drop_pre_silence"
+    if frame.covered_by_asr:
+        return 2, "drop_covered_speech"
+    if _is_speech_like(frame):
+        return 3, "drop_speech_like"
+    return 4, "drop_oldest_speech"
+
+
+def _is_pre_silence(frame: AudioFrame) -> bool:
+    if frame.speech_active or frame.vad_state in {"speech", "active"}:
         return False
-    return frame.is_silence
+    return frame.pre_class == "rms_silence" or (
+        frame.vad_state in {"pending", "unknown"} and frame.is_silence
+    )
+
+
+def _is_speech_like(frame: AudioFrame) -> bool:
+    if frame.speech_active or frame.vad_state in {"speech", "active"}:
+        return False
+    return frame.vad_state == "speech_like" or frame.pre_class == "rms_voice"
+
+
+def _drop_event(reason: str, queue_ms: int, frame: AudioFrame) -> BackpressureEvent:
+    return BackpressureEvent(
+        type=reason,
+        queue_ms=queue_ms,
+        dropped_ms=frame.duration_ms,
+        message=f"{reason} seq={frame.sequence}" if frame.sequence else reason,
+        vad_state=frame.vad_state,
+        pre_class=frame.pre_class,
+        utterance_id=frame.utterance_id,
+        first_dropped_seq=frame.sequence or None,
+        last_dropped_seq=frame.sequence or None,
+    )
 
 
 class TtsJobQueue:

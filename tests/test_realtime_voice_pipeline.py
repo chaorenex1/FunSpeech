@@ -52,7 +52,7 @@ def test_bounded_audio_queue_drops_silence_before_speech_when_over_budget():
         await queue.put(AudioFrame(b"silence", duration_ms=50, is_silence=True))
         events = await queue.put(AudioFrame(b"voice-2", duration_ms=50, is_silence=False))
 
-        assert any(event.type == "dropped_audio" for event in events)
+        assert any(event.type == "drop_pre_silence" for event in events)
         assert queue.queued_ms == 100
         assert (await queue.get()).payload == b"voice-1"
         assert (await queue.get()).payload == b"voice-2"
@@ -75,8 +75,67 @@ def test_bounded_audio_queue_preserves_vad_metadata_on_backpressure():
             )
         )
 
-        assert events[0].type == "dropped_silence"
+        assert events[0].type == "drop_vad_silence"
         assert queue.queued_ms == 10
+
+    asyncio.run(run())
+
+
+def test_bounded_audio_queue_drops_speech_like_before_active_speech():
+    async def run():
+        queue = BoundedAudioQueue(high_watermark_ms=20, max_ms=40)
+
+        await queue.put(
+            AudioFrame(
+                b"active",
+                duration_ms=20,
+                is_silence=False,
+                sequence=1,
+                vad_state="speech",
+                speech_active=True,
+            )
+        )
+        await queue.put(
+            AudioFrame(
+                b"speech-like",
+                duration_ms=20,
+                is_silence=False,
+                sequence=2,
+                pre_class="rms_voice",
+                vad_state="pending",
+            )
+        )
+        events = await queue.put(
+            AudioFrame(
+                b"active-2",
+                duration_ms=20,
+                is_silence=False,
+                sequence=3,
+                vad_state="speech",
+                speech_active=True,
+            )
+        )
+
+        assert any(event.type == "drop_speech_like" for event in events)
+        assert queue.queued_ms == 40
+        assert (await queue.get()).payload == b"active"
+        assert (await queue.get()).payload == b"active-2"
+
+    asyncio.run(run())
+
+
+def test_bounded_audio_queue_reports_oldest_speech_when_no_lower_layer_exists():
+    async def run():
+        queue = BoundedAudioQueue(high_watermark_ms=20, max_ms=40)
+
+        await queue.put(AudioFrame(b"one", duration_ms=20, is_silence=False, sequence=1, vad_state="speech", speech_active=True))
+        await queue.put(AudioFrame(b"two", duration_ms=20, is_silence=False, sequence=2, vad_state="speech", speech_active=True))
+        events = await queue.put(AudioFrame(b"three", duration_ms=20, is_silence=False, sequence=3, vad_state="speech", speech_active=True))
+
+        dropped = [event for event in events if event.type == "drop_oldest_speech"]
+        assert dropped
+        assert dropped[0].first_dropped_seq == 1
+        assert queue.queued_ms == 40
 
     asyncio.run(run())
 
