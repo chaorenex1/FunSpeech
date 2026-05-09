@@ -6,6 +6,7 @@ import logging
 import asyncio
 import contextlib
 from dataclasses import replace
+from time import monotonic
 
 import numpy as np
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -123,6 +124,10 @@ class RealtimeVoiceAsrTtsSession:
         self._audio_chunk_index = 0
         self._input_frame_index = 0
         self._speech_active = False
+        self._pending_vad_speech_frames = 0
+        self._pending_vad_first_seq: int | None = None
+        self._pending_vad_last_seq: int | None = None
+        self._last_vad_frame_event_at = monotonic()
         self.config_version = 1
 
     def close(self):
@@ -217,22 +222,23 @@ class RealtimeVoiceAsrTtsSession:
         assert self._task_id is not None
         while not self._closed:
             frame = await self.audio_queue.get()
-            await self._send_json(
-                self._event(
-                    "input.audio_dequeued",
-                    payload={
-                        "queue_ms": self.audio_queue.queued_ms,
-                        "duration_ms": frame.duration_ms,
-                        "is_silence": frame.is_silence,
-                        "input_frame_index": frame.sequence,
-                        "pre_class": frame.pre_class,
-                        "vad_state": frame.vad_state,
-                        "speech_active": frame.speech_active,
-                    },
-                    stage="asr_receiving_audio",
-                    queue_ms=self.audio_queue.queued_ms,
+            if frame.sequence == 1 or frame.sequence % 10 == 0 or self.audio_queue.queued_ms:
+                await self._send_json(
+                    self._event(
+                        "input.audio_dequeued",
+                        payload={
+                            "queue_ms": self.audio_queue.queued_ms,
+                            "duration_ms": frame.duration_ms,
+                            "is_silence": frame.is_silence,
+                            "input_frame_index": frame.sequence,
+                            "pre_class": frame.pre_class,
+                            "vad_state": frame.vad_state,
+                            "speech_active": frame.speech_active,
+                        },
+                        stage="asr_receiving_audio",
+                        queue_ms=self.audio_queue.queued_ms,
+                    )
                 )
-            )
             events = await self._transcribe_events(frame.payload, self._task_id)
             begin_events = [event for event in events if event.kind == "begin"]
             for asr_event in begin_events:
@@ -246,18 +252,7 @@ class RealtimeVoiceAsrTtsSession:
                     speech_active=True,
                     utterance_id=self._current_utterance_id(),
                 )
-                await self._send_json(
-                    self._event(
-                        "vad.speech_frame",
-                        payload={
-                            "utterance_id": frame.utterance_id,
-                            "input_frame_index": frame.sequence,
-                            "duration_ms": frame.duration_ms,
-                            "vad_state": frame.vad_state,
-                            "source": "vad",
-                        },
-                    )
-                )
+                await self._record_vad_speech_frame(frame)
             for asr_event in events:
                 if asr_event.kind == "begin":
                     continue
@@ -283,6 +278,7 @@ class RealtimeVoiceAsrTtsSession:
             )
             return
         if hypothesis.kind == "end":
+            await self._flush_vad_speech_frames()
             await self._send_json(
                 self._event(
                     "vad.speech_ended",
@@ -408,6 +404,36 @@ class RealtimeVoiceAsrTtsSession:
             )
             self.text_committer.reset_sentence()
             self._utterance_index += 1
+
+    async def _record_vad_speech_frame(self, frame: AudioFrame) -> None:
+        self._pending_vad_speech_frames += 1
+        self._pending_vad_first_seq = self._pending_vad_first_seq or frame.sequence
+        self._pending_vad_last_seq = frame.sequence
+        elapsed_ms = int((monotonic() - self._last_vad_frame_event_at) * 1000)
+        if self._pending_vad_speech_frames >= 10 or elapsed_ms >= 200:
+            await self._flush_vad_speech_frames()
+
+    async def _flush_vad_speech_frames(self) -> None:
+        if not self._pending_vad_speech_frames:
+            return
+        await self._send_json(
+            self._event(
+                "vad.speech_frame",
+                payload={
+                    "utterance_id": self._current_utterance_id(),
+                    "frames": self._pending_vad_speech_frames,
+                    "first_input_frame_index": self._pending_vad_first_seq,
+                    "last_input_frame_index": self._pending_vad_last_seq,
+                    "duration_ms": self._pending_vad_speech_frames * 20,
+                    "vad_state": "speech",
+                    "source": "vad",
+                },
+            )
+        )
+        self._pending_vad_speech_frames = 0
+        self._pending_vad_first_seq = None
+        self._pending_vad_last_seq = None
+        self._last_vad_frame_event_at = monotonic()
 
     async def _tts_worker(self) -> None:
         assert self._websocket is not None
@@ -935,22 +961,13 @@ async def realtime_voice_endpoint(websocket: WebSocket):
                 )
                 break
             elif event == "client.audio_ack":
-                await websocket.send_json(
-                    event_builder.build(
-                        "client.audio_ack.received",
-                        payload={
-                            "protocol_event": "client.audio_ack.received",
-                            "tts_job_id": (data.get("payload") or {}).get("tts_job_id")
-                            or data.get("tts_job_id"),
-                            "audio_chunk_index": (data.get("payload") or {}).get("audio_chunk_index")
-                            or data.get("audio_chunk_index"),
-                            "received": (data.get("payload") or {}).get("received", True),
-                            "written_to_virtual_mic": (data.get("payload") or {}).get(
-                                "written_to_virtual_mic"
-                            ),
-                            "monitor_written": (data.get("payload") or {}).get("monitor_written"),
-                        },
-                    )
+                payload = data.get("payload") or {}
+                ack_count = payload.get("count") or len(payload.get("acks") or [])
+                logger.debug(
+                    "[%s] client audio ack received: count=%s last=%s",
+                    task_id,
+                    ack_count,
+                    payload.get("last"),
                 )
             else:
                 await _send_error(websocket, task_id, f"不支持的事件: {event}", event_builder)
