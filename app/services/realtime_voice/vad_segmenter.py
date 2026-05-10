@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Sliding-window VAD and ordered ASR segment commits."""
+"""Frame-smoothed VAD and ordered ASR utterance commits."""
 
 from __future__ import annotations
 
@@ -12,12 +12,33 @@ from ...core.config import settings
 from .types import AsrSegment, AudioFrame
 
 
-class SlidingVadSegmenter:
-    """Detect speech with overlapping windows while committing contiguous audio.
+class FixedPcmFrameBuffer:
+    """Accumulate arbitrary PCM bytes and emit fixed 20ms/30ms frames."""
 
-    The detection window is allowed to slide and overlap. ASR segments are cut
-    from an utterance accumulator, so the ASR queue receives ordered frame ranges
-    instead of raw VAD windows.
+    def __init__(self, sample_rate: int, frame_ms: int):
+        self.sample_rate = int(sample_rate or 16000)
+        self.frame_ms = int(frame_ms)
+        if self.frame_ms not in {20, 30}:
+            raise ValueError("Realtime VAD frame_ms must be 20ms or 30ms")
+        samples_per_frame = self.sample_rate * self.frame_ms // 1000
+        self.frame_bytes = max(2, samples_per_frame * 2)
+        self._buffer = bytearray()
+
+    def accept(self, audio: bytes) -> list[bytes]:
+        if audio:
+            self._buffer.extend(audio)
+        frames: list[bytes] = []
+        while len(self._buffer) >= self.frame_bytes:
+            frames.append(bytes(self._buffer[: self.frame_bytes]))
+            del self._buffer[: self.frame_bytes]
+        return frames
+
+class SlidingVadSegmenter:
+    """Detect utterance boundaries from fixed-size frames.
+
+    Raw frame decisions are majority-smoothed before feeding an explicit
+    IDLE/SPEAKING/END_OF_UTTERANCE state machine. ASR receives one final
+    utterance payload with configured pre-roll and post-roll padding.
     """
 
     def __init__(
@@ -26,100 +47,99 @@ class SlidingVadSegmenter:
         pre_roll_ms: int,
         end_silence_ms: int,
         *,
-        hop_ms: int | None = None,
-        partial_commit_ms: int | None = None,
-        active_ratio: float = 0.6,
-        silence_ratio: float = 0.2,
         post_pad_ms: int = 0,
+        smooth_window_frames: int = 5,
+        smooth_speech_frames: int = 3,
+        start_speech_frames: int | None = None,
+        end_silence_frames: int | None = None,
     ):
         self.window_ms = max(20, int(window_ms))
-        self.hop_ms = max(20, int(hop_ms or max(20, self.window_ms // 2)))
         self.pre_roll_ms = max(0, int(pre_roll_ms))
-        self.end_silence_ms = max(20, int(end_silence_ms))
-        self.partial_commit_ms = max(20, int(partial_commit_ms or max(800, self.window_ms)))
-        self.active_ratio = min(1.0, max(0.0, float(active_ratio)))
-        self.silence_ratio = min(self.active_ratio, max(0.0, float(silence_ratio)))
+        end_silence_ms = max(20, int(end_silence_ms))
         self.post_pad_ms = max(0, int(post_pad_ms))
+        self.smooth_window_frames = max(1, int(smooth_window_frames))
+        self.smooth_speech_frames = min(
+            self.smooth_window_frames,
+            max(1, int(smooth_speech_frames)),
+        )
+        self.start_speech_frames = (
+            max(1, int(start_speech_frames))
+            if start_speech_frames is not None
+            else max(1, _ceil_div(settings.ASR_VAD_MIN_SPEECH_MS, self.window_ms))
+        )
+        self.end_silence_frames = (
+            max(1, int(end_silence_frames))
+            if end_silence_frames is not None
+            else max(1, _ceil_div(end_silence_ms, self.window_ms))
+        )
 
+        self.state = "IDLE"
         self.active = False
         self.silence_ms = 0
-        self._pressure_queued_ms = 0
-        self._pressure_high_ms = 0
-        self._pressure_max_ms = 0
-        self._since_eval_ms = 0
-        self._analysis_frames: Deque[AudioFrame] = deque()
+        self._consecutive_speech_frames = 0
+        self._consecutive_silence_frames = 0
+        self._speech_started = False
+        self._decision_window: Deque[bool] = deque(maxlen=self.smooth_window_frames)
         self._pre_roll: Deque[AudioFrame] = deque()
         self._utterance_frames: list[AudioFrame] = []
-        self._commit_cursor = 0
         self._last_voice_frame_index = 0
         self._segment_index = 0
 
-    def set_asr_pressure(self, queued_ms: int, high_watermark_ms: int, max_ms: int) -> None:
-        """Slow partial commits when ASR queue pressure rises."""
-        self._pressure_queued_ms = max(0, int(queued_ms))
-        self._pressure_high_ms = max(0, int(high_watermark_ms))
-        self._pressure_max_ms = max(self._pressure_high_ms, int(max_ms))
-
     def accept(self, frame: AudioFrame, utterance_id: str) -> list[AsrSegment]:
-        self._analysis_frames.append(frame)
-        self._trim_analysis_frames()
-        self._since_eval_ms += frame.duration_ms
+        smoothed_voice = self._smoothed_voice_decision(frame)
 
         if self.active:
             self._utterance_frames.append(frame)
-            if self._is_voice_frame(frame):
+            if smoothed_voice:
                 self._last_voice_frame_index = len(self._utterance_frames)
         else:
             self._remember_pre_roll(frame)
 
         segments: list[AsrSegment] = []
-        if self._since_eval_ms < self.hop_ms or self._window_duration_ms() < self.window_ms:
-            return segments
-
-        self._since_eval_ms = 0
-        speech_ratio = self._speech_ratio()
-        is_voice = speech_ratio >= self.active_ratio
-        if is_voice:
+        if smoothed_voice:
             self.silence_ms = 0
+            self._consecutive_silence_frames = 0
+            self._consecutive_speech_frames += 1
             if not self.active:
+                if self._consecutive_speech_frames < self.start_speech_frames:
+                    return segments
                 self.active = True
+                self.state = "SPEAKING"
+                self._speech_started = True
                 self._utterance_frames = list(self._pre_roll)
+                if (
+                    not self._utterance_frames
+                    or self._utterance_frames[-1].sequence != frame.sequence
+                ):
+                    self._utterance_frames.append(frame)
                 self._pre_roll.clear()
-                self._commit_cursor = 0
                 self._last_voice_frame_index = self._last_voice_index(self._utterance_frames)
-            segments.extend(self._commit_ready_segments(utterance_id))
             return segments
 
         if self.active:
-            if speech_ratio <= self.silence_ratio:
-                self.silence_ms += self.hop_ms
-            else:
-                self.silence_ms = max(0, self.silence_ms - self.hop_ms)
-            if self.silence_ms >= self.end_silence_ms:
+            self._consecutive_speech_frames = 0
+            self._consecutive_silence_frames += 1
+            self.silence_ms = self._consecutive_silence_frames * frame.duration_ms
+            if self._consecutive_silence_frames >= self.end_silence_frames:
+                self.state = "END_OF_UTTERANCE"
                 segments.extend(self._commit_final_segment(utterance_id))
                 self._reset_utterance()
+        else:
+            self._consecutive_speech_frames = 0
         return segments
 
-    def _commit_ready_segments(self, utterance_id: str) -> list[AsrSegment]:
-        if self._suppress_partial_commits():
-            return []
-        pending = self._utterance_frames[self._commit_cursor :]
-        if _duration_ms(pending) < self._effective_partial_commit_ms():
-            return []
-        if not self._contains_voice(pending):
-            return []
-        segment = self._segment(pending, utterance_id, is_final=False, commit_reason="partial")
-        self._commit_cursor = len(self._utterance_frames)
-        return [segment]
+    def consume_speech_started(self) -> bool:
+        started = self._speech_started
+        self._speech_started = False
+        return started
 
     def _commit_final_segment(self, utterance_id: str) -> list[AsrSegment]:
         final_end_index = self._final_commit_end_index()
-        pending = self._utterance_frames[self._commit_cursor : final_end_index]
+        pending = self._utterance_frames[:final_end_index]
         if not pending:
             return [self._final_marker(utterance_id)]
         if not self._contains_voice(pending):
             return [self._final_marker(utterance_id)]
-        self._commit_cursor = len(self._utterance_frames)
         return [self._segment(pending, utterance_id, is_final=True, commit_reason="vad_end")]
 
     def _segment(
@@ -141,17 +161,13 @@ class SlidingVadSegmenter:
             last_frame_seq=frames[-1].sequence if frames else 0,
             segment_id=f"{utterance_id}_seg_{self._segment_index}",
             is_final=is_final,
-            vad_source="sliding_rms",
+            vad_source="frame_smoothed_rms",
             commit_reason=commit_reason,
         )
 
-    def _speech_ratio(self) -> float:
-        window = list(self._analysis_frames)
-        total_ms = _duration_ms(window)
-        if total_ms <= 0:
-            return 0.0
-        voice_ms = sum(frame.duration_ms for frame in window if self._is_voice_frame(frame))
-        return voice_ms / total_ms
+    def _smoothed_voice_decision(self, frame: AudioFrame) -> bool:
+        self._decision_window.append(self._is_voice_frame(frame))
+        return sum(1 for is_voice in self._decision_window if is_voice) >= self.smooth_speech_frames
 
     def _is_voice_frame(self, frame: AudioFrame) -> bool:
         if frame.pre_class == "rms_voice" or frame.vad_state in {"speech", "active"}:
@@ -166,21 +182,6 @@ class SlidingVadSegmenter:
         self._pre_roll.append(frame)
         while _duration_ms(self._pre_roll) > self.pre_roll_ms and self._pre_roll:
             self._pre_roll.popleft()
-
-    def _trim_analysis_frames(self) -> None:
-        while _duration_ms(self._analysis_frames) > self.window_ms and self._analysis_frames:
-            self._analysis_frames.popleft()
-
-    def _window_duration_ms(self) -> int:
-        return _duration_ms(self._analysis_frames)
-
-    def _effective_partial_commit_ms(self) -> int:
-        if self._pressure_high_ms and self._pressure_queued_ms >= self._pressure_high_ms:
-            return self.partial_commit_ms * 2
-        return self.partial_commit_ms
-
-    def _suppress_partial_commits(self) -> bool:
-        return bool(self._pressure_max_ms and self._pressure_queued_ms >= self._pressure_max_ms)
 
     def _final_commit_end_index(self) -> int:
         end_index = min(self._last_voice_frame_index, len(self._utterance_frames))
@@ -206,7 +207,7 @@ class SlidingVadSegmenter:
             last_frame_seq=sequence,
             segment_id=f"{utterance_id}_seg_{self._segment_index}",
             is_final=True,
-            vad_source="sliding_rms",
+            vad_source="frame_smoothed_rms",
             commit_reason="vad_end_marker",
         )
 
@@ -217,24 +218,35 @@ class SlidingVadSegmenter:
 
     def _last_voice_index(self, frames: list[AudioFrame]) -> int:
         for index in range(len(frames), 0, -1):
-            if self._is_voice_frame(frames[index - 1]):
+            if frames[index - 1].pre_class == "rms_voice" or frames[index - 1].vad_state in {
+                "speech",
+                "active",
+            }:
                 return index
         return 0
 
     def _contains_voice(self, frames: list[AudioFrame]) -> bool:
-        return any(self._is_voice_frame(frame) for frame in frames)
+        return any(
+            frame.pre_class == "rms_voice" or frame.vad_state in {"speech", "active"}
+            for frame in frames
+        )
 
     def _reset_utterance(self) -> None:
+        self.state = "IDLE"
         self.active = False
         self.silence_ms = 0
         self._utterance_frames = []
-        self._commit_cursor = 0
         self._last_voice_frame_index = 0
-        self._since_eval_ms = 0
+        self._consecutive_speech_frames = 0
+        self._consecutive_silence_frames = 0
 
 
 def _duration_ms(frames) -> int:
     return sum(frame.duration_ms for frame in frames)
+
+
+def _ceil_div(value: int, divisor: int) -> int:
+    return (int(value) + int(divisor) - 1) // int(divisor)
 
 
 def _pcm_bytes_to_float(audio: bytes) -> np.ndarray:

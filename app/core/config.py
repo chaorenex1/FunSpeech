@@ -138,6 +138,12 @@ class Settings:
     REALTIME_TTS_GENERATOR_QUEUE_SIZE: int = 4
     REALTIME_TTS_PREFETCH_JOBS: int = 2
     REALTIME_TTS_DROP_ON_OVERLOAD: bool = False
+    REALTIME_VAD_FRAME_MS: int = 20
+    REALTIME_VAD_SMOOTH_WINDOW_FRAMES: int = 5
+    REALTIME_VAD_SMOOTH_SPEECH_FRAMES: int = 3
+    REALTIME_VAD_START_SPEECH_FRAMES: int = 3
+    REALTIME_VAD_END_SILENCE_FRAMES: int = 25
+    REALTIME_VAD_POST_PAD_MS: int = 100
     REALTIME_TEXT_STABLE_HYPOTHESES: int = 1
     REALTIME_TEXT_MIN_COMMIT_CHARS: int = 2
     REALTIME_TEXT_MAX_COMMIT_CHARS: int = 8
@@ -325,6 +331,36 @@ class Settings:
                 str(self.REALTIME_TTS_DROP_ON_OVERLOAD),
             ).lower()
             == "true"
+        )
+        self.REALTIME_VAD_FRAME_MS = int(
+            os.getenv("REALTIME_VAD_FRAME_MS", str(self.REALTIME_VAD_FRAME_MS))
+        )
+        self.REALTIME_VAD_SMOOTH_WINDOW_FRAMES = int(
+            os.getenv(
+                "REALTIME_VAD_SMOOTH_WINDOW_FRAMES",
+                str(self.REALTIME_VAD_SMOOTH_WINDOW_FRAMES),
+            )
+        )
+        self.REALTIME_VAD_SMOOTH_SPEECH_FRAMES = int(
+            os.getenv(
+                "REALTIME_VAD_SMOOTH_SPEECH_FRAMES",
+                str(self.REALTIME_VAD_SMOOTH_SPEECH_FRAMES),
+            )
+        )
+        self.REALTIME_VAD_START_SPEECH_FRAMES = int(
+            os.getenv(
+                "REALTIME_VAD_START_SPEECH_FRAMES",
+                str(self.REALTIME_VAD_START_SPEECH_FRAMES),
+            )
+        )
+        self.REALTIME_VAD_END_SILENCE_FRAMES = int(
+            os.getenv(
+                "REALTIME_VAD_END_SILENCE_FRAMES",
+                str(self.REALTIME_VAD_END_SILENCE_FRAMES),
+            )
+        )
+        self.REALTIME_VAD_POST_PAD_MS = int(
+            os.getenv("REALTIME_VAD_POST_PAD_MS", str(self.REALTIME_VAD_POST_PAD_MS))
         )
         self.REALTIME_TEXT_STABLE_HYPOTHESES = int(
             os.getenv(

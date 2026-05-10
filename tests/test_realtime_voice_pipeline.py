@@ -9,7 +9,7 @@ from app.services.realtime_voice.backpressure import AsrSegmentQueue, BoundedAud
 from app.services.realtime_voice.text_commit import StableTextCommitter
 from app.services.realtime_voice.tts_dispatcher import RealtimeTTSDispatcher
 from app.services.realtime_voice.types import AsrSegment, AudioFrame, AsrHypothesis, TtsJob
-from app.services.realtime_voice.vad_segmenter import SlidingVadSegmenter
+from app.services.realtime_voice.vad_segmenter import FixedPcmFrameBuffer, SlidingVadSegmenter
 
 
 def _pcm_frame(amplitude: int, duration_ms: int = 20, sample_rate: int = 16_000) -> bytes:
@@ -41,148 +41,131 @@ def _asr_segment(sequence: int, duration_ms: int = 40, final: bool = False) -> A
     )
 
 
-def test_sliding_vad_segmenter_emits_preroll_once_before_voice():
-    segmenter = SlidingVadSegmenter(window_ms=40, pre_roll_ms=80, end_silence_ms=40, partial_commit_ms=40)
+def test_fixed_pcm_frame_buffer_splits_arbitrary_input_into_20ms_frames():
+    buffer = FixedPcmFrameBuffer(sample_rate=1000, frame_ms=20)
 
-    assert segmenter.accept(_audio_frame(1, 0), "utt_1") == []
-    assert segmenter.accept(_audio_frame(2, 0), "utt_1") == []
-    assert segmenter.accept(_audio_frame(3, 2400), "utt_1") == []
-    segments = segmenter.accept(_audio_frame(4, 2400), "utt_1")
+    frames = buffer.accept(b"\x01\x00" * 25)
+    assert len(frames) == 1
+    assert frames[0] == b"\x01\x00" * 20
 
-    assert len(segments) == 1
-    assert segments[0].first_frame_seq == 1
-    assert segments[0].last_frame_seq == 4
-    assert segments[0].frame_count == 4
-    assert segments[0].duration_ms == 80
-    assert segments[0].is_final is False
+    frames = buffer.accept(b"\x02\x00" * 15)
+    assert len(frames) == 1
+    assert frames[0] == b"\x01\x00" * 5 + b"\x02\x00" * 15
 
 
-def test_sliding_vad_segmenter_keeps_continuous_voice_smooth_and_finalizes_on_silence():
-    segmenter = SlidingVadSegmenter(window_ms=40, pre_roll_ms=40, end_silence_ms=40, partial_commit_ms=40)
-
-    segmenter.accept(_audio_frame(1, 2400), "utt_1")
-    first = segmenter.accept(_audio_frame(2, 2400), "utt_1")
-    segmenter.accept(_audio_frame(3, 2400), "utt_1")
-    second = segmenter.accept(_audio_frame(4, 2400), "utt_1")
-    segmenter.accept(_audio_frame(5, 0), "utt_1")
-    final = segmenter.accept(_audio_frame(6, 0), "utt_1")
-
-    assert [segment.first_frame_seq for segment in first + second] == [1, 3]
-    assert [segment.last_frame_seq for segment in first + second] == [2, 4]
-    assert final == []
-
-    marker = segmenter.accept(_audio_frame(7, 0), "utt_1")
-    assert marker and marker[0].is_final is True
-    assert marker[0].payload == b""
-    assert marker[0].frame_count == 0
-    assert marker[0].first_frame_seq == 4
-    assert marker[0].last_frame_seq == 4
-    assert marker[0].commit_reason == "vad_end_marker"
+def test_fixed_pcm_frame_buffer_accepts_only_20ms_or_30ms_windows():
+    try:
+        FixedPcmFrameBuffer(sample_rate=16000, frame_ms=25)
+    except ValueError as exc:
+        assert "20ms or 30ms" in str(exc)
+    else:
+        raise AssertionError("25ms VAD frames should be rejected")
 
 
-def test_sliding_vad_segmenter_commits_accumulated_contiguous_audio_not_detection_windows():
+def test_sliding_vad_segmenter_smooths_last_five_frames_by_majority():
     segmenter = SlidingVadSegmenter(
-        window_ms=40,
-        pre_roll_ms=40,
+        window_ms=20,
+        pre_roll_ms=0,
         end_silence_ms=40,
-        partial_commit_ms=100,
+        smooth_window_frames=5,
+        smooth_speech_frames=3,
+        start_speech_frames=1,
+    )
+
+    raw_pattern = [0, 1, 1, 1, 0]
+    for sequence, raw_voice in enumerate(raw_pattern, start=1):
+        segmenter.accept(_audio_frame(sequence, 2400 if raw_voice else 0), "utt_1")
+
+    assert segmenter.active is True
+    assert segmenter.consume_speech_started() is True
+
+
+def test_sliding_vad_segmenter_waits_for_consecutive_smoothed_speech_before_speaking():
+    segmenter = SlidingVadSegmenter(
+        window_ms=20,
+        pre_roll_ms=80,
+        end_silence_ms=40,
+        smooth_window_frames=5,
+        smooth_speech_frames=3,
+        start_speech_frames=2,
+    )
+
+    for sequence, raw_voice in enumerate([0, 1, 1, 0, 0], start=1):
+        assert segmenter.accept(_audio_frame(sequence, 2400 if raw_voice else 0), "utt_1") == []
+
+    assert segmenter.active is False
+
+    segmenter.accept(_audio_frame(6, 2400), "utt_1")
+    segmenter.accept(_audio_frame(7, 2400), "utt_1")
+
+    assert segmenter.active is True
+
+
+def test_sliding_vad_segmenter_commits_one_final_utterance_with_pre_and_post_padding():
+    segmenter = SlidingVadSegmenter(
+        window_ms=20,
+        pre_roll_ms=80,
+        end_silence_ms=40,
+        post_pad_ms=40,
+        smooth_window_frames=1,
+        smooth_speech_frames=1,
+        start_speech_frames=2,
     )
 
     emitted = []
-    for sequence in range(1, 7):
-        emitted.extend(segmenter.accept(_audio_frame(sequence, 2400), "utt_1"))
+    for sequence, amplitude in [
+        (1, 0),
+        (2, 0),
+        (3, 2400),
+        (4, 2400),
+        (5, 2400),
+        (6, 0),
+        (7, 0),
+    ]:
+        emitted.extend(segmenter.accept(_audio_frame(sequence, amplitude), "utt_1"))
 
-    assert len(emitted) == 1
-    assert emitted[0].first_frame_seq == 1
-    assert emitted[0].last_frame_seq == 5
-    assert emitted[0].frame_count == 5
-    assert emitted[0].duration_ms == 100
-    assert emitted[0].commit_reason == "partial"
-
-
-def test_sliding_vad_segmenter_final_commits_uncommitted_speech_tail_without_silence_only_chunk():
-    segmenter = SlidingVadSegmenter(
-        window_ms=40,
-        pre_roll_ms=40,
-        end_silence_ms=40,
-        partial_commit_ms=80,
-    )
-
-    emitted = []
-    for sequence in range(1, 7):
-        emitted.extend(segmenter.accept(_audio_frame(sequence, 2400), "utt_1"))
-    for sequence in range(7, 10):
-        emitted.extend(segmenter.accept(_audio_frame(sequence, 0), "utt_1"))
-
-    assert [(segment.first_frame_seq, segment.last_frame_seq) for segment in emitted] == [(1, 4), (5, 6)]
-    assert emitted[-1].is_final is True
-    assert emitted[-1].payload == _pcm_frame(2400) * 2
-    assert emitted[-1].commit_reason == "vad_end"
-
-
-def test_sliding_vad_segmenter_keeps_asr_ranges_monotonic_across_partials_and_final():
-    segmenter = SlidingVadSegmenter(
-        window_ms=40,
-        pre_roll_ms=40,
-        end_silence_ms=40,
-        partial_commit_ms=100,
-    )
-
-    emitted = []
-    for sequence in range(1, 13):
-        emitted.extend(segmenter.accept(_audio_frame(sequence, 2400), "utt_1"))
-    for sequence in range(13, 16):
-        emitted.extend(segmenter.accept(_audio_frame(sequence, 0), "utt_1"))
-
-    ranges = [
-        (segment.first_frame_seq, segment.last_frame_seq, segment.is_final)
-        for segment in emitted
-        if segment.frame_count
-    ]
-    assert ranges == [(1, 5, False), (6, 10, False), (11, 12, True)]
-
-
-def test_sliding_vad_segmenter_slows_partial_commits_under_asr_pressure():
-    segmenter = SlidingVadSegmenter(
-        window_ms=40,
-        pre_roll_ms=40,
-        end_silence_ms=40,
-        partial_commit_ms=100,
-    )
-    segmenter.set_asr_pressure(queued_ms=120, high_watermark_ms=100, max_ms=300)
-
-    emitted = []
-    for sequence in range(1, 10):
-        emitted.extend(segmenter.accept(_audio_frame(sequence, 2400), "utt_1"))
-    assert emitted == []
-
-    emitted.extend(segmenter.accept(_audio_frame(10, 2400), "utt_1"))
-    assert len(emitted) == 1
-    assert emitted[0].first_frame_seq == 1
-    assert emitted[0].last_frame_seq == 10
-    assert emitted[0].duration_ms == 200
-
-
-def test_sliding_vad_segmenter_suppresses_partials_until_vad_end_at_asr_hard_pressure():
-    segmenter = SlidingVadSegmenter(
-        window_ms=40,
-        pre_roll_ms=40,
-        end_silence_ms=40,
-        partial_commit_ms=80,
-    )
-    segmenter.set_asr_pressure(queued_ms=300, high_watermark_ms=100, max_ms=300)
-
-    emitted = []
-    for sequence in range(1, 7):
-        emitted.extend(segmenter.accept(_audio_frame(sequence, 2400), "utt_1"))
-    assert emitted == []
-
-    for sequence in range(7, 10):
-        emitted.extend(segmenter.accept(_audio_frame(sequence, 0), "utt_1"))
     assert len(emitted) == 1
     assert emitted[0].is_final is True
     assert emitted[0].first_frame_seq == 1
-    assert emitted[0].last_frame_seq == 6
+    assert emitted[0].last_frame_seq == 7
+    assert emitted[0].frame_count == 7
+    assert (
+        emitted[0].payload
+        == _pcm_frame(0) * 2 + _pcm_frame(2400) * 3 + _pcm_frame(0) * 2
+    )
+    assert emitted[0].commit_reason == "vad_end"
+
+
+def test_sliding_vad_segmenter_ignores_short_silence_inside_speech():
+    segmenter = SlidingVadSegmenter(
+        window_ms=20,
+        pre_roll_ms=0,
+        end_silence_ms=60,
+        post_pad_ms=60,
+        smooth_window_frames=1,
+        smooth_speech_frames=1,
+        start_speech_frames=1,
+    )
+
+    emitted = []
+    for sequence, amplitude in [
+        (1, 2400),
+        (2, 2400),
+        (3, 0),
+        (4, 2400),
+        (5, 0),
+        (6, 0),
+    ]:
+        emitted.extend(segmenter.accept(_audio_frame(sequence, amplitude), "utt_1"))
+
+    assert emitted == []
+    assert segmenter.active is True
+
+    emitted.extend(segmenter.accept(_audio_frame(7, 0), "utt_1"))
+
+    assert len(emitted) == 1
+    assert emitted[0].first_frame_seq == 1
+    assert emitted[0].last_frame_seq == 7
 
 
 def test_stable_text_committer_emits_incremental_stable_text():
