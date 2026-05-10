@@ -1,27 +1,48 @@
 # -*- coding: utf-8 -*-
-"""Bounded queues and drop policies for realtime voice audio input."""
+"""Bounded queues for realtime voice audio input."""
 
 from __future__ import annotations
 
 import asyncio
 from collections import deque
-from typing import Deque, Optional
+from typing import Callable, Deque, Optional
 
 from .types import AsrSegment, AudioFrame, BackpressureEvent
 
 
 class BoundedAudioQueue:
-    """Audio queue budgeted by duration instead of item count.
+    """Realtime audio ingress ring buffer budgeted by duration.
 
-    Realtime audio can arrive faster than ASR/TTS can consume it. The queue
-    keeps latency bounded with a layered policy: VAD silence, RMS pre-silence,
-    already-covered speech, speech-like pending frames, then oldest speech.
+    Raw PCM bytes are accumulated until a fixed 20ms/30ms frame is available.
+    When the frame ring exceeds its duration budget, the oldest frames are
+    dropped first.
     """
 
-    def __init__(self, high_watermark_ms: int, max_ms: int, preserve_speech: bool = True):
-        self.high_watermark_ms = high_watermark_ms
-        self.max_ms = max_ms
-        self.preserve_speech = preserve_speech
+    def __init__(
+        self,
+        high_watermark_ms: int,
+        max_ms: int,
+        *,
+        sample_rate: int | None = None,
+        frame_ms: int | None = None,
+        frame_factory: Callable[[bytes], AudioFrame] | None = None,
+    ):
+        self.high_watermark_ms = int(high_watermark_ms)
+        self.max_ms = _clamp_ring_ms(max_ms) if frame_ms is not None else int(max_ms)
+        self.sample_rate = int(sample_rate or 0)
+        self.frame_ms = int(frame_ms or 0)
+        self.frame_factory = frame_factory
+        self._frame_bytes = 0
+        self._pcm_buffer = bytearray()
+        if frame_ms is not None:
+            if self.frame_ms not in {20, 30}:
+                raise ValueError("Realtime VAD frame_ms must be 20ms or 30ms")
+            if self.sample_rate <= 0:
+                raise ValueError(
+                    "sample_rate must be positive when frame_ms is configured"
+                )
+            samples_per_frame = self.sample_rate * self.frame_ms // 1000
+            self._frame_bytes = max(2, samples_per_frame * 2)
         self._frames: Deque[AudioFrame] = deque()
         self._queued_ms = 0
         self._condition = asyncio.Condition()
@@ -30,27 +51,30 @@ class BoundedAudioQueue:
     def queued_ms(self) -> int:
         return self._queued_ms
 
-    async def put(self, frame: AudioFrame) -> list[BackpressureEvent]:
+    async def put_audio(self, audio: bytes) -> list[BackpressureEvent]:
+        if not self._frame_bytes:
+            raise RuntimeError("BoundedAudioQueue requires frame_ms to accept raw audio")
+
+        frames: list[AudioFrame] = []
+        if audio:
+            self._pcm_buffer.extend(audio)
+        while len(self._pcm_buffer) >= self._frame_bytes:
+            frame_audio = bytes(self._pcm_buffer[: self._frame_bytes])
+            del self._pcm_buffer[: self._frame_bytes]
+            frames.append(self._build_audio_frame(frame_audio))
+
         events: list[BackpressureEvent] = []
         async with self._condition:
-            incoming_drop_reason = _incoming_drop_reason(frame)
-            if self._queued_ms >= self.high_watermark_ms and incoming_drop_reason is not None:
-                events.append(
-                    _drop_event(incoming_drop_reason, self._queued_ms, frame)
-                )
-                return events
-
-            self._frames.append(frame)
-            self._queued_ms += frame.duration_ms
-
-            if self._queued_ms >= self.high_watermark_ms:
+            for frame in frames:
+                self._frames.append(frame)
+                self._queued_ms += frame.duration_ms
+            events.extend(self._drop_oldest_until_within_budget())
+            if not events and self._queued_ms >= self.high_watermark_ms:
                 events.append(
                     BackpressureEvent(type="input_throttle", queue_ms=self._queued_ms)
                 )
-
-            events.extend(self._drop_until_within_budget())
-
-            self._condition.notify()
+            if frames:
+                self._condition.notify()
         return events
 
     async def get(self) -> AudioFrame:
@@ -71,93 +95,36 @@ class BoundedAudioQueue:
     def clear(self) -> None:
         self._frames.clear()
         self._queued_ms = 0
+        self._pcm_buffer.clear()
 
-    def _drop_until_within_budget(self) -> list[BackpressureEvent]:
+    def _build_audio_frame(self, audio: bytes) -> AudioFrame:
+        if self.frame_factory is not None:
+            return self.frame_factory(audio)
+        return AudioFrame(payload=audio, duration_ms=self.frame_ms, is_silence=False)
+
+    def _drop_oldest_until_within_budget(self) -> list[BackpressureEvent]:
         events: list[BackpressureEvent] = []
         while self._queued_ms > self.max_ms and self._frames:
-            index, reason = self._find_best_drop_candidate()
-            if self.preserve_speech and reason == "drop_oldest_speech":
-                frame = self._frames[index]
-                events.append(
-                    BackpressureEvent(
-                        type="input_preserve_speech_backpressure",
-                        queue_ms=self._queued_ms,
-                        message=f"preserve speech seq={frame.sequence}",
-                        vad_state=frame.vad_state,
-                        pre_class=frame.pre_class,
-                        utterance_id=frame.utterance_id,
-                        first_dropped_seq=frame.sequence or None,
-                        last_dropped_seq=frame.sequence or None,
-                    )
-                )
-                break
-            frame = self._remove_at(index)
+            frame = self._frames.popleft()
             self._queued_ms = max(0, self._queued_ms - frame.duration_ms)
-            events.append(_drop_event(reason, self._queued_ms, frame))
+            events.append(_drop_oldest_audio_event(self._queued_ms, frame))
         return events
 
-    def _find_best_drop_candidate(self) -> tuple[int, str]:
-        best_index = 0
-        best_priority = 10_000
-        best_reason = "drop_oldest_speech"
-        for index, frame in enumerate(self._frames):
-            priority, reason = _drop_priority(frame)
-            if priority < best_priority:
-                best_index = index
-                best_priority = priority
-                best_reason = reason
-                if priority == 0:
-                    break
-        return best_index, best_reason
 
-    def _remove_at(self, index: int) -> AudioFrame:
-        if index == 0:
-            return self._frames.popleft()
-        self._frames.rotate(-index)
-        frame = self._frames.popleft()
-        self._frames.rotate(index)
-        return frame
+def _clamp_ring_ms(value: int) -> int:
+    return min(3000, max(1000, int(value)))
 
 
-def _incoming_drop_reason(frame: AudioFrame) -> Optional[str]:
-    """Only drop incoming frames early when they are silence-like."""
-    priority, reason = _drop_priority(frame)
-    return reason if priority <= 1 else None
-
-
-def _drop_priority(frame: AudioFrame) -> tuple[int, str]:
-    """Lower priority values are safer to drop under input backpressure."""
-    if frame.vad_state == "silence":
-        return 0, "drop_vad_silence"
-    if _is_pre_silence(frame):
-        return 1, "drop_pre_silence"
-    if frame.covered_by_asr:
-        return 2, "drop_covered_speech"
-    if _is_speech_like(frame):
-        return 3, "drop_speech_like"
-    return 4, "drop_oldest_speech"
-
-
-def _is_pre_silence(frame: AudioFrame) -> bool:
-    if frame.speech_active or frame.vad_state in {"speech", "active"}:
-        return False
-    return frame.pre_class == "rms_silence" or (
-        frame.vad_state in {"pending", "unknown"} and frame.is_silence
-    )
-
-
-def _is_speech_like(frame: AudioFrame) -> bool:
-    if frame.speech_active or frame.vad_state in {"speech", "active"}:
-        return False
-    return frame.vad_state == "speech_like" or frame.pre_class == "rms_voice"
-
-
-def _drop_event(reason: str, queue_ms: int, frame: AudioFrame) -> BackpressureEvent:
+def _drop_oldest_audio_event(queue_ms: int, frame: AudioFrame) -> BackpressureEvent:
     return BackpressureEvent(
-        type=reason,
+        type="drop_oldest_audio",
         queue_ms=queue_ms,
         dropped_ms=frame.duration_ms,
-        message=f"{reason} seq={frame.sequence}" if frame.sequence else reason,
+        message=(
+            f"drop_oldest_audio seq={frame.sequence}"
+            if frame.sequence
+            else "drop_oldest_audio"
+        ),
         vad_state=frame.vad_state,
         pre_class=frame.pre_class,
         utterance_id=frame.utterance_id,

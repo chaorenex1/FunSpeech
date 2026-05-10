@@ -12,27 +12,6 @@ from ...core.config import settings
 from .types import AsrSegment, AudioFrame
 
 
-class FixedPcmFrameBuffer:
-    """Accumulate arbitrary PCM bytes and emit fixed 20ms/30ms frames."""
-
-    def __init__(self, sample_rate: int, frame_ms: int):
-        self.sample_rate = int(sample_rate or 16000)
-        self.frame_ms = int(frame_ms)
-        if self.frame_ms not in {20, 30}:
-            raise ValueError("Realtime VAD frame_ms must be 20ms or 30ms")
-        samples_per_frame = self.sample_rate * self.frame_ms // 1000
-        self.frame_bytes = max(2, samples_per_frame * 2)
-        self._buffer = bytearray()
-
-    def accept(self, audio: bytes) -> list[bytes]:
-        if audio:
-            self._buffer.extend(audio)
-        frames: list[bytes] = []
-        while len(self._buffer) >= self.frame_bytes:
-            frames.append(bytes(self._buffer[: self.frame_bytes]))
-            del self._buffer[: self.frame_bytes]
-        return frames
-
 class SlidingVadSegmenter:
     """Detect utterance boundaries from fixed-size frames.
 

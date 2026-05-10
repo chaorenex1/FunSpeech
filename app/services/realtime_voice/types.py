@@ -20,7 +20,6 @@ class AudioFrame:
     vad_state: str = "unknown"
     utterance_id: str | None = None
     speech_active: bool = False
-    covered_by_asr: bool = False
     created_at: float = field(default_factory=monotonic)
 
 

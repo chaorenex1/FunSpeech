@@ -9,7 +9,7 @@ from app.services.realtime_voice.backpressure import AsrSegmentQueue, BoundedAud
 from app.services.realtime_voice.text_commit import StableTextCommitter
 from app.services.realtime_voice.tts_dispatcher import RealtimeTTSDispatcher
 from app.services.realtime_voice.types import AsrSegment, AudioFrame, AsrHypothesis, TtsJob
-from app.services.realtime_voice.vad_segmenter import FixedPcmFrameBuffer, SlidingVadSegmenter
+from app.services.realtime_voice.vad_segmenter import SlidingVadSegmenter
 
 
 def _pcm_frame(amplitude: int, duration_ms: int = 20, sample_rate: int = 16_000) -> bytes:
@@ -41,25 +41,113 @@ def _asr_segment(sequence: int, duration_ms: int = 40, final: bool = False) -> A
     )
 
 
-def test_fixed_pcm_frame_buffer_splits_arbitrary_input_into_20ms_frames():
-    buffer = FixedPcmFrameBuffer(sample_rate=1000, frame_ms=20)
+def _bounded_audio_queue_from_frames(
+    frames: list[AudioFrame],
+    *,
+    high_watermark_ms: int,
+    max_ms: int,
+) -> BoundedAudioQueue:
+    frame_iter = iter(frames)
+    return BoundedAudioQueue(
+        high_watermark_ms=high_watermark_ms,
+        max_ms=max_ms,
+        sample_rate=1000,
+        frame_ms=20,
+        frame_factory=lambda _audio: next(frame_iter),
+    )
 
-    frames = buffer.accept(b"\x01\x00" * 25)
-    assert len(frames) == 1
-    assert frames[0] == b"\x01\x00" * 20
 
-    frames = buffer.accept(b"\x02\x00" * 15)
-    assert len(frames) == 1
-    assert frames[0] == b"\x01\x00" * 5 + b"\x02\x00" * 15
+def _dummy_pcm_frames(frame_count: int) -> bytes:
+    return b"\x00\x00" * 20 * frame_count
 
 
-def test_fixed_pcm_frame_buffer_accepts_only_20ms_or_30ms_windows():
+def test_bounded_audio_queue_splits_arbitrary_pcm_into_20ms_frames():
+    async def run():
+        queue = BoundedAudioQueue(
+            high_watermark_ms=1000,
+            max_ms=1000,
+            sample_rate=1000,
+            frame_ms=20,
+            frame_factory=lambda audio: AudioFrame(
+                payload=audio,
+                duration_ms=20,
+                is_silence=False,
+            ),
+        )
+
+        assert await queue.put_audio(b"\x01\x00" * 25) == []
+        assert queue.queued_ms == 20
+        assert (await queue.get()).payload == b"\x01\x00" * 20
+
+        assert await queue.put_audio(b"\x02\x00" * 15) == []
+        assert queue.queued_ms == 20
+        assert (await queue.get()).payload == b"\x01\x00" * 5 + b"\x02\x00" * 15
+
+    asyncio.run(run())
+
+
+def test_bounded_audio_queue_accepts_only_20ms_or_30ms_windows():
     try:
-        FixedPcmFrameBuffer(sample_rate=16000, frame_ms=25)
+        BoundedAudioQueue(
+            high_watermark_ms=1000,
+            max_ms=1000,
+            sample_rate=16000,
+            frame_ms=25,
+        )
     except ValueError as exc:
         assert "20ms or 30ms" in str(exc)
     else:
         raise AssertionError("25ms VAD frames should be rejected")
+
+
+def test_bounded_audio_queue_clamps_pcm_ring_cache_to_one_to_three_seconds():
+    assert (
+        BoundedAudioQueue(
+            high_watermark_ms=500,
+            max_ms=500,
+            sample_rate=16000,
+            frame_ms=20,
+        ).max_ms
+        == 1000
+    )
+    assert (
+        BoundedAudioQueue(
+            high_watermark_ms=1200,
+            max_ms=6000,
+            sample_rate=16000,
+            frame_ms=20,
+        ).max_ms
+        == 3000
+    )
+
+
+def test_bounded_audio_queue_ring_buffer_drops_oldest_pcm_frames_when_full():
+    async def run():
+        queue = BoundedAudioQueue(
+            high_watermark_ms=1000,
+            max_ms=1000,
+            sample_rate=1000,
+            frame_ms=20,
+            frame_factory=lambda audio: AudioFrame(
+                payload=audio,
+                duration_ms=20,
+                is_silence=False,
+            ),
+        )
+
+        audio = b"".join(
+            value.to_bytes(2, "little", signed=True) * 20
+            for value in range(1, 53)
+        )
+        events = await queue.put_audio(audio)
+
+        dropped = [event for event in events if event.type == "drop_oldest_audio"]
+        assert len(dropped) == 2
+        assert queue.queued_ms == 1000
+        first_remaining = await queue.get()
+        assert first_remaining.payload == (3).to_bytes(2, "little", signed=True) * 20
+
+    asyncio.run(run())
 
 
 def test_sliding_vad_segmenter_smooths_last_five_frames_by_majority():
@@ -243,48 +331,72 @@ def test_stable_text_committer_bounds_speculative_delta_size():
     assert second.text == "一起去公"
 
 
-def test_bounded_audio_queue_drops_silence_before_speech_when_over_budget():
+def test_bounded_audio_queue_drops_oldest_frame_when_over_budget():
     async def run():
-        queue = BoundedAudioQueue(high_watermark_ms=60, max_ms=100)
+        frames = [
+            AudioFrame(b"voice-1", duration_ms=20, is_silence=False),
+            AudioFrame(b"silence", duration_ms=20, is_silence=True),
+            *[
+                AudioFrame(b"voice-2", duration_ms=20, is_silence=False)
+                for _ in range(49)
+            ],
+        ]
+        queue = _bounded_audio_queue_from_frames(
+            frames,
+            high_watermark_ms=1000,
+            max_ms=1000,
+        )
 
-        await queue.put(AudioFrame(b"voice-1", duration_ms=50, is_silence=False))
-        await queue.put(AudioFrame(b"silence", duration_ms=50, is_silence=True))
-        events = await queue.put(AudioFrame(b"voice-2", duration_ms=50, is_silence=False))
+        events = await queue.put_audio(_dummy_pcm_frames(len(frames)))
 
-        assert any(event.type == "drop_pre_silence" for event in events)
-        assert queue.queued_ms == 100
-        assert (await queue.get()).payload == b"voice-1"
+        assert any(event.type == "drop_oldest_audio" for event in events)
+        assert queue.queued_ms == 1000
+        assert (await queue.get()).payload == b"silence"
         assert (await queue.get()).payload == b"voice-2"
 
     asyncio.run(run())
 
 
-def test_bounded_audio_queue_preserves_vad_metadata_on_backpressure():
+def test_bounded_audio_queue_reports_oldest_drop_metadata():
     async def run():
-        queue = BoundedAudioQueue(high_watermark_ms=10, max_ms=20)
-
-        await queue.put(AudioFrame(b"voice", duration_ms=10, is_silence=False))
-        events = await queue.put(
+        frames = [
             AudioFrame(
-                b"silence",
+                b"old",
                 duration_ms=20,
                 is_silence=True,
                 sequence=7,
                 vad_state="silence",
-            )
+            ),
+            *[
+                AudioFrame(
+                    b"new",
+                    duration_ms=20,
+                    is_silence=False,
+                    sequence=8 + index,
+                    vad_state="speech",
+                )
+                for index in range(50)
+            ],
+        ]
+        queue = _bounded_audio_queue_from_frames(
+            frames,
+            high_watermark_ms=1000,
+            max_ms=1000,
         )
 
-        assert events[0].type == "drop_vad_silence"
-        assert queue.queued_ms == 10
+        events = await queue.put_audio(_dummy_pcm_frames(len(frames)))
+
+        assert events[0].type == "drop_oldest_audio"
+        assert events[0].first_dropped_seq == 7
+        assert events[0].last_dropped_seq == 7
+        assert queue.queued_ms == 1000
 
     asyncio.run(run())
 
 
-def test_bounded_audio_queue_drops_speech_like_before_active_speech():
+def test_bounded_audio_queue_drops_oldest_speech_like_before_newer_active_speech():
     async def run():
-        queue = BoundedAudioQueue(high_watermark_ms=20, max_ms=40)
-
-        await queue.put(
+        frames = [
             AudioFrame(
                 b"active",
                 duration_ms=20,
@@ -292,9 +404,7 @@ def test_bounded_audio_queue_drops_speech_like_before_active_speech():
                 sequence=1,
                 vad_state="speech",
                 speech_active=True,
-            )
-        )
-        await queue.put(
+            ),
             AudioFrame(
                 b"speech-like",
                 duration_ms=20,
@@ -302,53 +412,122 @@ def test_bounded_audio_queue_drops_speech_like_before_active_speech():
                 sequence=2,
                 pre_class="rms_voice",
                 vad_state="pending",
-            )
+            ),
+            *[
+                AudioFrame(
+                    b"active-2",
+                    duration_ms=20,
+                    is_silence=False,
+                    sequence=3 + index,
+                    vad_state="speech",
+                    speech_active=True,
+                )
+                for index in range(49)
+            ],
+        ]
+        queue = _bounded_audio_queue_from_frames(
+            frames,
+            high_watermark_ms=1000,
+            max_ms=1000,
         )
-        events = await queue.put(
-            AudioFrame(
-                b"active-2",
-                duration_ms=20,
-                is_silence=False,
-                sequence=3,
-                vad_state="speech",
-                speech_active=True,
-            )
-        )
+        events = await queue.put_audio(_dummy_pcm_frames(len(frames)))
 
-        assert any(event.type == "drop_speech_like" for event in events)
-        assert queue.queued_ms == 40
-        assert (await queue.get()).payload == b"active"
+        assert any(event.type == "drop_oldest_audio" for event in events)
+        assert queue.queued_ms == 1000
+        assert (await queue.get()).payload == b"speech-like"
         assert (await queue.get()).payload == b"active-2"
 
     asyncio.run(run())
 
 
-def test_bounded_audio_queue_reports_oldest_speech_when_no_lower_layer_exists():
+def test_bounded_audio_queue_drops_oldest_speech_when_no_lower_layer_exists():
     async def run():
-        queue = BoundedAudioQueue(high_watermark_ms=20, max_ms=40, preserve_speech=False)
+        frames = [
+            AudioFrame(
+                b"one",
+                duration_ms=20,
+                is_silence=False,
+                sequence=1,
+                vad_state="speech",
+                speech_active=True,
+            ),
+            AudioFrame(
+                b"two",
+                duration_ms=20,
+                is_silence=False,
+                sequence=2,
+                vad_state="speech",
+                speech_active=True,
+            ),
+            *[
+                AudioFrame(
+                    b"three",
+                    duration_ms=20,
+                    is_silence=False,
+                    sequence=3 + index,
+                    vad_state="speech",
+                    speech_active=True,
+                )
+                for index in range(49)
+            ],
+        ]
+        queue = _bounded_audio_queue_from_frames(
+            frames,
+            high_watermark_ms=1000,
+            max_ms=1000,
+        )
+        events = await queue.put_audio(_dummy_pcm_frames(len(frames)))
 
-        await queue.put(AudioFrame(b"one", duration_ms=20, is_silence=False, sequence=1, vad_state="speech", speech_active=True))
-        await queue.put(AudioFrame(b"two", duration_ms=20, is_silence=False, sequence=2, vad_state="speech", speech_active=True))
-        events = await queue.put(AudioFrame(b"three", duration_ms=20, is_silence=False, sequence=3, vad_state="speech", speech_active=True))
-
-        dropped = [event for event in events if event.type == "drop_oldest_speech"]
+        dropped = [event for event in events if event.type == "drop_oldest_audio"]
         assert dropped
         assert dropped[0].first_dropped_seq == 1
-        assert queue.queued_ms == 40
+        assert queue.queued_ms == 1000
 
     asyncio.run(run())
 
 
-def test_bounded_audio_queue_preserves_active_speech_by_default():
+def test_bounded_audio_queue_never_preserves_old_speech_over_ring_budget():
     async def run():
-        queue = BoundedAudioQueue(high_watermark_ms=20, max_ms=40)
+        frames = [
+            AudioFrame(
+                b"one",
+                duration_ms=20,
+                is_silence=False,
+                sequence=1,
+                vad_state="speech",
+                speech_active=True,
+            ),
+            AudioFrame(
+                b"two",
+                duration_ms=20,
+                is_silence=False,
+                sequence=2,
+                vad_state="speech",
+                speech_active=True,
+            ),
+            *[
+                AudioFrame(
+                    b"three",
+                    duration_ms=20,
+                    is_silence=False,
+                    sequence=3 + index,
+                    vad_state="speech",
+                    speech_active=True,
+                )
+                for index in range(49)
+            ],
+        ]
+        queue = _bounded_audio_queue_from_frames(
+            frames,
+            high_watermark_ms=1000,
+            max_ms=1000,
+        )
+        events = await queue.put_audio(_dummy_pcm_frames(len(frames)))
 
-        await queue.put(AudioFrame(b"one", duration_ms=20, is_silence=False, sequence=1, vad_state="speech", speech_active=True))
-        await queue.put(AudioFrame(b"two", duration_ms=20, is_silence=False, sequence=2, vad_state="speech", speech_active=True))
-        events = await queue.put(AudioFrame(b"three", duration_ms=20, is_silence=False, sequence=3, vad_state="speech", speech_active=True))
-
-        assert any(event.type == "input_preserve_speech_backpressure" for event in events)
-        assert queue.queued_ms == 60
+        assert any(event.type == "drop_oldest_audio" for event in events)
+        assert queue.queued_ms == 1000
+        assert (await queue.get()).payload == b"two"
+        assert (await queue.get()).payload == b"three"
 
     asyncio.run(run())
 

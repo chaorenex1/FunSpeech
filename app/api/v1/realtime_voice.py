@@ -23,7 +23,7 @@ from ...services.realtime_voice.events import RealtimeVoiceEventBuilder
 from ...services.realtime_voice.text_commit import StableTextCommitter
 from ...services.realtime_voice.tts_dispatcher import get_realtime_tts_dispatcher
 from ...services.realtime_voice.types import AsrSegment, AudioFrame, AsrHypothesis, TtsJob
-from ...services.realtime_voice.vad_segmenter import FixedPcmFrameBuffer, SlidingVadSegmenter
+from ...services.realtime_voice.vad_segmenter import SlidingVadSegmenter
 
 
 logger = logging.getLogger(__name__)
@@ -113,16 +113,14 @@ class RealtimeVoiceAsrTtsSession:
         self.audio_queue = BoundedAudioQueue(
             settings.REALTIME_AUDIO_INPUT_HIGH_WATERMARK_MS,
             settings.REALTIME_AUDIO_INPUT_MAX_MS,
-            preserve_speech=settings.REALTIME_PRESERVE_SPEECH_UNDER_PRESSURE,
+            sample_rate=self.sample_rate,
+            frame_ms=settings.REALTIME_VAD_FRAME_MS,
+            frame_factory=self._build_audio_frame,
         )
         self.asr_queue = AsrSegmentQueue(
             settings.REALTIME_AUDIO_INPUT_HIGH_WATERMARK_MS,
             settings.REALTIME_AUDIO_INPUT_MAX_MS,
             preserve_speech=settings.REALTIME_PRESERVE_SPEECH_UNDER_PRESSURE,
-        )
-        self.frame_buffer = FixedPcmFrameBuffer(
-            sample_rate=self.sample_rate,
-            frame_ms=settings.REALTIME_VAD_FRAME_MS,
         )
         self.vad_segmenter = SlidingVadSegmenter(
             window_ms=settings.REALTIME_VAD_FRAME_MS,
@@ -163,11 +161,6 @@ class RealtimeVoiceAsrTtsSession:
         self._audio_chunk_index = 0
         self._input_frame_index = 0
         self._speech_active = False
-        self._pending_vad_speech_frames = 0
-        self._pending_vad_speech_ms = 0
-        self._pending_vad_first_seq: int | None = None
-        self._pending_vad_last_seq: int | None = None
-        self._last_vad_frame_event_at = monotonic()
         self._last_client_playback_backpressure_at = 0.0
         self.config_version = 1
 
@@ -284,35 +277,30 @@ class RealtimeVoiceAsrTtsSession:
         if not self._started or self._websocket is None or self._task_id is None:
             raise RuntimeError("RealtimeVoiceAsrTtsSession.start() must be called first")
 
-        for frame_audio in self.frame_buffer.accept(audio):
-            frame = self._build_audio_frame(frame_audio)
-            for event in await self.audio_queue.put(frame):
-                await self._send_json(
-                    self._event(
-                        "backpressure.applied",
-                        payload={
-                            "scope": "input",
-                            "level": "warning",
-                            "reason": event.type,
-                            "queue_ms": event.queue_ms,
-                            "dropped_ms": event.dropped_ms,
-                            "action": event.type,
-                            "message": event.message,
-                            "pre_class": frame.pre_class,
-                            "vad_state": frame.vad_state,
-                            "speech_active": frame.speech_active,
-                            "drop_pre_class": event.pre_class,
-                            "drop_vad_state": event.vad_state,
-                            "utterance_id": event.utterance_id,
-                            "first_dropped_seq": event.first_dropped_seq,
-                            "last_dropped_seq": event.last_dropped_seq,
-                        },
-                        type=event.type,
-                        queue_ms=event.queue_ms,
-                        dropped_ms=event.dropped_ms,
-                        message=event.message,
-                    )
+        for event in await self.audio_queue.put_audio(audio):
+            await self._send_json(
+                self._event(
+                    "backpressure.applied",
+                    payload={
+                        "scope": "input",
+                        "level": "warning",
+                        "reason": event.type,
+                        "queue_ms": event.queue_ms,
+                        "dropped_ms": event.dropped_ms,
+                        "action": event.type,
+                        "message": event.message,
+                        "drop_pre_class": event.pre_class,
+                        "drop_vad_state": event.vad_state,
+                        "utterance_id": event.utterance_id,
+                        "first_dropped_seq": event.first_dropped_seq,
+                        "last_dropped_seq": event.last_dropped_seq,
+                    },
+                    type=event.type,
+                    queue_ms=event.queue_ms,
+                    dropped_ms=event.dropped_ms,
+                    message=event.message,
                 )
+            )
         return True
 
     async def process_audio(self, websocket: WebSocket, task_id: str, audio: bytes) -> bool:
@@ -385,20 +373,6 @@ class RealtimeVoiceAsrTtsSession:
                     )
                 )
             for segment in segments:
-                if not self._speech_active and not segment.is_final:
-                    self._speech_active = True
-                    await self._send_json(
-                        self._event(
-                            "vad.speech_started",
-                            payload={
-                                "utterance_id": segment.utterance_id,
-                                "speech_begin_ms": 0,
-                                "source": segment.vad_source,
-                            },
-                        )
-                    )
-                if not segment.is_final:
-                    await self._record_vad_speech_segment(segment)
                 await self._send_json(
                     self._event(
                         "asr.segment_committed",
@@ -428,7 +402,6 @@ class RealtimeVoiceAsrTtsSession:
                 is_final=segment.is_final,
             )
             if segment.is_final:
-                await self._flush_vad_speech_frames()
                 if self._speech_active:
                     await self._send_json(
                         self._event(
@@ -467,7 +440,6 @@ class RealtimeVoiceAsrTtsSession:
             return
         if hypothesis.kind == "end":
             if self._speech_active:
-                await self._flush_vad_speech_frames()
                 await self._send_json(
                     self._event(
                         "vad.speech_ended",
@@ -596,47 +568,6 @@ class RealtimeVoiceAsrTtsSession:
             )
             self.text_committer.reset_sentence()
             self._utterance_index += 1
-
-    async def _record_vad_speech_frame(self, frame: AudioFrame) -> None:
-        self._pending_vad_speech_frames += 1
-        self._pending_vad_speech_ms += frame.duration_ms
-        self._pending_vad_first_seq = self._pending_vad_first_seq or frame.sequence
-        self._pending_vad_last_seq = frame.sequence
-        elapsed_ms = int((monotonic() - self._last_vad_frame_event_at) * 1000)
-        if self._pending_vad_speech_frames >= 10 or elapsed_ms >= 200:
-            await self._flush_vad_speech_frames()
-
-    async def _record_vad_speech_segment(self, segment: AsrSegment) -> None:
-        self._pending_vad_speech_frames += segment.frame_count
-        self._pending_vad_speech_ms += segment.duration_ms
-        self._pending_vad_first_seq = self._pending_vad_first_seq or segment.first_frame_seq
-        self._pending_vad_last_seq = segment.last_frame_seq
-        elapsed_ms = int((monotonic() - self._last_vad_frame_event_at) * 1000)
-        if self._pending_vad_speech_frames >= 10 or elapsed_ms >= 200:
-            await self._flush_vad_speech_frames()
-
-    async def _flush_vad_speech_frames(self) -> None:
-        if not self._pending_vad_speech_frames:
-            return
-        await self._send_json(
-            self._event(
-                "vad.speech_frame",
-                payload={
-                    "utterance_id": self._current_utterance_id(),
-                    "frames": self._pending_vad_speech_frames,
-                    "first_input_frame_index": self._pending_vad_first_seq,
-                    "last_input_frame_index": self._pending_vad_last_seq,
-                    "duration_ms": self._pending_vad_speech_ms,
-                    "vad_state": "speech",
-                    "source": "vad",
-                },
-            )
-        )
-        self._pending_vad_speech_frames = 0
-        self._pending_vad_speech_ms = 0
-        self._pending_vad_first_seq = None
-        self._pending_vad_last_seq = None
-        self._last_vad_frame_event_at = monotonic()
 
     async def _tts_worker(self) -> None:
         assert self._websocket is not None
