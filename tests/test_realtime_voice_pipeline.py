@@ -4,12 +4,12 @@ import asyncio
 
 import numpy as np
 
-from app.api.v1.realtime_voice import SlidingVadSegmenter
 from app.services.realtime_voice.audio_pacer import AudioPacer
 from app.services.realtime_voice.backpressure import AsrSegmentQueue, BoundedAudioQueue, TtsJobQueue
 from app.services.realtime_voice.text_commit import StableTextCommitter
 from app.services.realtime_voice.tts_dispatcher import RealtimeTTSDispatcher
 from app.services.realtime_voice.types import AsrSegment, AudioFrame, AsrHypothesis, TtsJob
+from app.services.realtime_voice.vad_segmenter import SlidingVadSegmenter
 
 
 def _pcm_frame(amplitude: int, duration_ms: int = 20, sample_rate: int = 16_000) -> bytes:
@@ -42,7 +42,7 @@ def _asr_segment(sequence: int, duration_ms: int = 40, final: bool = False) -> A
 
 
 def test_sliding_vad_segmenter_emits_preroll_once_before_voice():
-    segmenter = SlidingVadSegmenter(window_ms=40, pre_roll_ms=40, end_silence_ms=40)
+    segmenter = SlidingVadSegmenter(window_ms=40, pre_roll_ms=80, end_silence_ms=40, partial_commit_ms=40)
 
     assert segmenter.accept(_audio_frame(1, 0), "utt_1") == []
     assert segmenter.accept(_audio_frame(2, 0), "utt_1") == []
@@ -58,7 +58,7 @@ def test_sliding_vad_segmenter_emits_preroll_once_before_voice():
 
 
 def test_sliding_vad_segmenter_keeps_continuous_voice_smooth_and_finalizes_on_silence():
-    segmenter = SlidingVadSegmenter(window_ms=40, pre_roll_ms=40, end_silence_ms=40)
+    segmenter = SlidingVadSegmenter(window_ms=40, pre_roll_ms=40, end_silence_ms=40, partial_commit_ms=40)
 
     segmenter.accept(_audio_frame(1, 2400), "utt_1")
     first = segmenter.accept(_audio_frame(2, 2400), "utt_1")
@@ -69,9 +69,120 @@ def test_sliding_vad_segmenter_keeps_continuous_voice_smooth_and_finalizes_on_si
 
     assert [segment.first_frame_seq for segment in first + second] == [1, 3]
     assert [segment.last_frame_seq for segment in first + second] == [2, 4]
-    assert final and final[0].is_final is True
-    assert final[0].first_frame_seq == 5
-    assert final[0].last_frame_seq == 6
+    assert final == []
+
+    marker = segmenter.accept(_audio_frame(7, 0), "utt_1")
+    assert marker and marker[0].is_final is True
+    assert marker[0].payload == b""
+    assert marker[0].frame_count == 0
+    assert marker[0].first_frame_seq == 4
+    assert marker[0].last_frame_seq == 4
+    assert marker[0].commit_reason == "vad_end_marker"
+
+
+def test_sliding_vad_segmenter_commits_accumulated_contiguous_audio_not_detection_windows():
+    segmenter = SlidingVadSegmenter(
+        window_ms=40,
+        pre_roll_ms=40,
+        end_silence_ms=40,
+        partial_commit_ms=100,
+    )
+
+    emitted = []
+    for sequence in range(1, 7):
+        emitted.extend(segmenter.accept(_audio_frame(sequence, 2400), "utt_1"))
+
+    assert len(emitted) == 1
+    assert emitted[0].first_frame_seq == 1
+    assert emitted[0].last_frame_seq == 5
+    assert emitted[0].frame_count == 5
+    assert emitted[0].duration_ms == 100
+    assert emitted[0].commit_reason == "partial"
+
+
+def test_sliding_vad_segmenter_final_commits_uncommitted_speech_tail_without_silence_only_chunk():
+    segmenter = SlidingVadSegmenter(
+        window_ms=40,
+        pre_roll_ms=40,
+        end_silence_ms=40,
+        partial_commit_ms=80,
+    )
+
+    emitted = []
+    for sequence in range(1, 7):
+        emitted.extend(segmenter.accept(_audio_frame(sequence, 2400), "utt_1"))
+    for sequence in range(7, 10):
+        emitted.extend(segmenter.accept(_audio_frame(sequence, 0), "utt_1"))
+
+    assert [(segment.first_frame_seq, segment.last_frame_seq) for segment in emitted] == [(1, 4), (5, 6)]
+    assert emitted[-1].is_final is True
+    assert emitted[-1].payload == _pcm_frame(2400) * 2
+    assert emitted[-1].commit_reason == "vad_end"
+
+
+def test_sliding_vad_segmenter_keeps_asr_ranges_monotonic_across_partials_and_final():
+    segmenter = SlidingVadSegmenter(
+        window_ms=40,
+        pre_roll_ms=40,
+        end_silence_ms=40,
+        partial_commit_ms=100,
+    )
+
+    emitted = []
+    for sequence in range(1, 13):
+        emitted.extend(segmenter.accept(_audio_frame(sequence, 2400), "utt_1"))
+    for sequence in range(13, 16):
+        emitted.extend(segmenter.accept(_audio_frame(sequence, 0), "utt_1"))
+
+    ranges = [
+        (segment.first_frame_seq, segment.last_frame_seq, segment.is_final)
+        for segment in emitted
+        if segment.frame_count
+    ]
+    assert ranges == [(1, 5, False), (6, 10, False), (11, 12, True)]
+
+
+def test_sliding_vad_segmenter_slows_partial_commits_under_asr_pressure():
+    segmenter = SlidingVadSegmenter(
+        window_ms=40,
+        pre_roll_ms=40,
+        end_silence_ms=40,
+        partial_commit_ms=100,
+    )
+    segmenter.set_asr_pressure(queued_ms=120, high_watermark_ms=100, max_ms=300)
+
+    emitted = []
+    for sequence in range(1, 10):
+        emitted.extend(segmenter.accept(_audio_frame(sequence, 2400), "utt_1"))
+    assert emitted == []
+
+    emitted.extend(segmenter.accept(_audio_frame(10, 2400), "utt_1"))
+    assert len(emitted) == 1
+    assert emitted[0].first_frame_seq == 1
+    assert emitted[0].last_frame_seq == 10
+    assert emitted[0].duration_ms == 200
+
+
+def test_sliding_vad_segmenter_suppresses_partials_until_vad_end_at_asr_hard_pressure():
+    segmenter = SlidingVadSegmenter(
+        window_ms=40,
+        pre_roll_ms=40,
+        end_silence_ms=40,
+        partial_commit_ms=80,
+    )
+    segmenter.set_asr_pressure(queued_ms=300, high_watermark_ms=100, max_ms=300)
+
+    emitted = []
+    for sequence in range(1, 7):
+        emitted.extend(segmenter.accept(_audio_frame(sequence, 2400), "utt_1"))
+    assert emitted == []
+
+    for sequence in range(7, 10):
+        emitted.extend(segmenter.accept(_audio_frame(sequence, 0), "utt_1"))
+    assert len(emitted) == 1
+    assert emitted[0].is_final is True
+    assert emitted[0].first_frame_seq == 1
+    assert emitted[0].last_frame_seq == 6
 
 
 def test_stable_text_committer_emits_incremental_stable_text():
@@ -308,7 +419,21 @@ def test_asr_segment_queue_preserves_speech_by_default_under_pressure():
     asyncio.run(run())
 
 
-def test_tts_job_queue_drops_stale_stable_jobs_and_prefers_final():
+def test_asr_segment_queue_drops_nonfinal_speech_at_hard_limit_even_when_preserving():
+    async def run():
+        queue = AsrSegmentQueue(high_watermark_ms=40, max_ms=80, hard_max_ms=100)
+
+        await queue.put(_asr_segment(1, duration_ms=40))
+        await queue.put(_asr_segment(2, duration_ms=40))
+        events = await queue.put(_asr_segment(3, duration_ms=40))
+
+        assert any(event.type == "drop_asr_speech_hard_limit" for event in events)
+        assert queue.queued_ms <= 100
+
+    asyncio.run(run())
+
+
+def test_tts_job_queue_drops_stale_stable_jobs_without_final_reordering():
     async def run():
         queue = TtsJobQueue(maxsize=2, drop_on_overload=True)
         await queue.put(TtsJob(1, "旧", "voice", {}, "stable"))
@@ -318,9 +443,41 @@ def test_tts_job_queue_drops_stale_stable_jobs_and_prefers_final():
         first = await queue.get()
         second = await queue.get()
 
-        assert first.priority == "final"
-        assert first.text == "最终"
-        assert second.revision_id == 2
+        assert first.revision_id == 2
+        assert first.text == "新"
+        assert second.priority == "final"
+        assert second.text == "最终"
+
+    asyncio.run(run())
+
+
+def test_tts_job_queue_applies_hard_limit_after_soft_preserve():
+    async def run():
+        queue = TtsJobQueue(maxsize=2, hard_limit=3)
+        await queue.put(TtsJob(1, "甲", "voice", {}, "final"))
+        await queue.put(TtsJob(2, "乙", "voice", {}, "final"))
+        await queue.put(TtsJob(3, "丙", "voice", {}, "final"))
+        events = await queue.put(TtsJob(4, "丁", "voice", {}, "final"))
+
+        assert any(event.type == "tts_queue_preserved" for event in events)
+        assert any(event.type == "tts_job_dropped_hard_limit" for event in events)
+        assert [queue.get_nowait().revision_id for _ in range(3)] == [2, 3, 4]
+        assert queue.get_nowait() is None
+
+    asyncio.run(run())
+
+
+def test_tts_job_queue_coalesces_stable_tail_under_soft_pressure():
+    async def run():
+        queue = TtsJobQueue(maxsize=2)
+        await queue.put(TtsJob(1, "你", "voice", {}, "stable"))
+        await queue.put(TtsJob(2, "好", "voice", {}, "stable"))
+        queued_job, events = await queue.put_with_result(TtsJob(3, "呀", "voice", {}, "stable"))
+
+        assert queued_job.text == "你好呀"
+        assert any(event.type == "tts_jobs_coalesced" for event in events)
+        assert (await queue.get()).revision_id == 3
+        assert queue.get_nowait() is None
 
     asyncio.run(run())
 
@@ -340,18 +497,18 @@ def test_tts_job_queue_preserves_jobs_by_default_when_overloaded():
     asyncio.run(run())
 
 
-def test_tts_job_queue_preserves_small_stable_jobs_when_waiting():
+def test_tts_job_queue_coalesces_small_stable_jobs_when_waiting_under_pressure():
     async def run():
         queue = TtsJobQueue(maxsize=1)
 
         await queue.put(TtsJob(1, "你", "voice", {}, "stable"))
         events = await queue.put(TtsJob(2, "好", "voice", {}, "stable"))
 
-        assert any(event.type == "tts_queue_preserved" for event in events)
+        assert any(event.type == "tts_jobs_coalesced" for event in events)
         first = await queue.get()
-        second = await queue.get()
-        assert first.text == "你"
-        assert second.text == "好"
+        assert first.text == "你好"
+        assert first.revision_id == 2
+        assert queue.get_nowait() is None
 
     asyncio.run(run())
 

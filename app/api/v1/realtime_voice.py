@@ -23,6 +23,7 @@ from ...services.realtime_voice.events import RealtimeVoiceEventBuilder
 from ...services.realtime_voice.text_commit import StableTextCommitter
 from ...services.realtime_voice.tts_dispatcher import get_realtime_tts_dispatcher
 from ...services.realtime_voice.types import AsrSegment, AudioFrame, AsrHypothesis, TtsJob
+from ...services.realtime_voice.vad_segmenter import SlidingVadSegmenter
 
 
 logger = logging.getLogger(__name__)
@@ -36,89 +37,6 @@ class PrefetchedTtsJob:
     audio_queue: asyncio.Queue
     done_sentinel: object
     task: asyncio.Task
-
-
-class SlidingVadSegmenter:
-    """Build ASR speech segments from fixed input frames using a sliding window."""
-
-    def __init__(self, window_ms: int, pre_roll_ms: int, end_silence_ms: int):
-        self.window_ms = max(20, window_ms)
-        self.pre_roll_ms = max(0, pre_roll_ms)
-        self.end_silence_ms = max(20, end_silence_ms)
-        self.active = False
-        self.silence_ms = 0
-        self.window: list[AudioFrame] = []
-        self.pre_roll: list[AudioFrame] = []
-
-    def accept(self, frame: AudioFrame, utterance_id: str) -> list[AsrSegment]:
-        self.window.append(frame)
-        if sum(item.duration_ms for item in self.window) < self.window_ms:
-            return []
-
-        window = self.window
-        self.window = []
-        is_voice = self._is_voice_window(window)
-        duration_ms = sum(item.duration_ms for item in window)
-        segments: list[AsrSegment] = []
-
-        if is_voice:
-            self.silence_ms = 0
-            if not self.active:
-                self.active = True
-                segment_frames = [*self.pre_roll, *window]
-                self.pre_roll = []
-            else:
-                segment_frames = window
-            segments.append(self._segment(segment_frames, utterance_id, is_final=False))
-            return segments
-
-        if self.active:
-            self.silence_ms += duration_ms
-            if self.silence_ms >= self.end_silence_ms:
-                self.active = False
-                self.silence_ms = 0
-                segments.append(self._segment(window, utterance_id, is_final=True))
-            return segments
-
-        for item in window:
-            self._remember_pre_roll(item)
-        return segments
-
-    def _remember_pre_roll(self, frame: AudioFrame) -> None:
-        self.pre_roll.append(frame)
-        while sum(item.duration_ms for item in self.pre_roll) > self.pre_roll_ms and self.pre_roll:
-            self.pre_roll.pop(0)
-
-    def _is_voice_window(self, frames: list[AudioFrame]) -> bool:
-        if not frames or not any(frame.pre_class == "rms_voice" for frame in frames):
-            return False
-        samples = np.concatenate([_pcm_bytes_to_float(frame.payload) for frame in frames])
-        if samples.size == 0:
-            return False
-        rms = float(np.sqrt(np.mean(np.square(samples))))
-        return rms >= settings.ASR_NEARFIELD_RMS_THRESHOLD
-
-    @staticmethod
-    def _segment(frames: list[AudioFrame], utterance_id: str, is_final: bool) -> AsrSegment:
-        payload = b"".join(frame.payload for frame in frames)
-        duration_ms = sum(frame.duration_ms for frame in frames)
-        return AsrSegment(
-            payload=payload,
-            duration_ms=duration_ms,
-            frame_count=len(frames),
-            utterance_id=utterance_id,
-            first_frame_seq=frames[0].sequence if frames else 0,
-            last_frame_seq=frames[-1].sequence if frames else 0,
-            is_final=is_final,
-            vad_source="sliding_rms",
-        )
-
-
-def _pcm_bytes_to_float(audio: bytes) -> np.ndarray:
-    if len(audio) < 2:
-        return np.array([], dtype=np.float32)
-    pcm = np.frombuffer(audio, dtype=np.int16)
-    return pcm.astype(np.float32) / 32768.0
 
 
 async def _send_error(
@@ -437,6 +355,11 @@ class RealtimeVoiceAsrTtsSession:
                         queue_ms=self.audio_queue.queued_ms,
                     )
                 )
+            self.vad_segmenter.set_asr_pressure(
+                self.asr_queue.queued_ms,
+                settings.REALTIME_AUDIO_INPUT_HIGH_WATERMARK_MS,
+                settings.REALTIME_AUDIO_INPUT_MAX_MS,
+            )
             segments = self.vad_segmenter.accept(frame, self._current_utterance_id())
             for segment in segments:
                 if not self._speech_active and not segment.is_final:
@@ -453,6 +376,22 @@ class RealtimeVoiceAsrTtsSession:
                     )
                 if not segment.is_final:
                     await self._record_vad_speech_segment(segment)
+                await self._send_json(
+                    self._event(
+                        "asr.segment_committed",
+                        payload={
+                            "segment_id": segment.segment_id,
+                            "utterance_id": segment.utterance_id,
+                            "first_input_frame_index": segment.first_frame_seq,
+                            "last_input_frame_index": segment.last_frame_seq,
+                            "duration_ms": segment.duration_ms,
+                            "frame_count": segment.frame_count,
+                            "is_final": segment.is_final,
+                            "commit_reason": segment.commit_reason,
+                            "queue_ms": self.asr_queue.queued_ms,
+                        },
+                    )
+                )
                 for event in await self.asr_queue.put(segment):
                     await self._send_backpressure_event("asr", event)
 
@@ -925,6 +864,28 @@ class RealtimeVoiceAsrTtsSession:
         return ""
 
     async def _transcribe_events(self, audio: bytes, task_id: str, is_final: bool = False) -> list[AsrHypothesis]:
+        if is_final and not audio:
+            if self.streaming_session is not None and hasattr(self.streaming_session, "flush"):
+                events = await self.streaming_session.flush()
+                return [
+                    AsrHypothesis(
+                        text=event.text.strip(),
+                        is_final=event.kind == "end",
+                        kind=event.kind,
+                        time_ms=getattr(event, "time_ms", 0),
+                        begin_time_ms=getattr(event, "begin_time_ms", 0),
+                        speech_begin_ms=getattr(event, "speech_begin_ms", None),
+                        speech_end_ms=getattr(event, "speech_end_ms", None),
+                        vad_source=getattr(event, "vad_source", None),
+                        speech_active=getattr(event, "speech_active", False),
+                        emotion=getattr(event, "emotion", None),
+                        emotion_confidence=getattr(event, "emotion_confidence", None),
+                        raw_rich_text=getattr(event, "raw_rich_text", None),
+                    )
+                    for event in events
+                    if event.kind in {"begin", "end", "partial"}
+                ]
+            return []
         incoming = self.asr_service._convert_audio_bytes_to_array(
             audio,
             self.audio_format,

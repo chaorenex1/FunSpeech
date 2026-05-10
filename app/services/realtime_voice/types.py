@@ -34,8 +34,10 @@ class AsrSegment:
     utterance_id: str
     first_frame_seq: int
     last_frame_seq: int
+    segment_id: str = ""
     is_final: bool = False
     vad_source: str = "vad"
+    commit_reason: str = "partial"
     created_at: float = field(default_factory=monotonic)
 
 

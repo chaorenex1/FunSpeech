@@ -167,14 +167,16 @@ def _drop_event(reason: str, queue_ms: int, frame: AudioFrame) -> BackpressureEv
 
 
 class TtsJobQueue:
-    """Small revision-aware TTS job queue.
+    """Small revision-aware FIFO TTS job queue.
 
-    It keeps the newest stable/final jobs and drops stale speculative work when
-    synthesis cannot keep up.
+    Synthesis may prefetch later jobs, but queue admission must preserve text
+    revision order. Final revisions are not allowed to jump ahead of stable
+    revisions that were committed earlier.
     """
 
-    def __init__(self, maxsize: int, drop_on_overload: bool = False):
+    def __init__(self, maxsize: int, drop_on_overload: bool = False, hard_limit: int | None = None):
         self.maxsize = max(1, maxsize)
+        self.hard_limit = max(self.maxsize, int(hard_limit or self.maxsize * 2))
         self.drop_on_overload = drop_on_overload
         self._jobs: Deque = deque()
         self._condition = asyncio.Condition()
@@ -186,10 +188,13 @@ class TtsJobQueue:
     async def put_with_result(self, job) -> tuple[object, list[BackpressureEvent]]:
         events: list[BackpressureEvent] = []
         async with self._condition:
-            if self.drop_on_overload and job.priority == "stable" and len(self._jobs) >= self.maxsize:
-                stable_jobs = [existing for existing in self._jobs if existing.priority == "stable"]
-                if stable_jobs:
-                    merged_text = "".join(existing.text for existing in stable_jobs) + job.text
+            if job.priority == "stable" and len(self._jobs) >= self.maxsize:
+                stable_tail = []
+                while self._jobs and self._jobs[-1].priority == "stable":
+                    stable_tail.append(self._jobs.pop())
+                if stable_tail:
+                    stable_tail.reverse()
+                    merged_text = "".join(existing.text for existing in stable_tail) + job.text
                     job = type(job)(
                         revision_id=job.revision_id,
                         text=merged_text,
@@ -197,11 +202,10 @@ class TtsJobQueue:
                         parameters=job.parameters,
                         priority=job.priority,
                     )
-                    self._jobs = deque(existing for existing in self._jobs if existing.priority != "stable")
                     events.append(
                         BackpressureEvent(
                             type="tts_jobs_coalesced",
-                            message=f"merged={len(stable_jobs) + 1} revision={job.revision_id}",
+                            message=f"merged={len(stable_tail) + 1} revision={job.revision_id}",
                         )
                     )
             while self.drop_on_overload and len(self._jobs) >= self.maxsize:
@@ -220,6 +224,14 @@ class TtsJobQueue:
                     )
                 )
             self._jobs.append(job)
+            while len(self._jobs) > self.hard_limit:
+                dropped = self._drop_lowest_priority()
+                events.append(
+                    BackpressureEvent(
+                        type="tts_job_dropped_hard_limit",
+                        message=f"revision={dropped.revision_id}",
+                    )
+                )
             self._condition.notify()
         return job, events
 
@@ -227,17 +239,11 @@ class TtsJobQueue:
         async with self._condition:
             while not self._jobs:
                 await self._condition.wait()
-            final_jobs = [i for i, job in enumerate(self._jobs) if job.priority == "final"]
-            if final_jobs:
-                return self._remove_at(final_jobs[0])
             return self._jobs.popleft()
 
     def get_nowait(self):
         if not self._jobs:
             return None
-        final_jobs = [i for i, job in enumerate(self._jobs) if job.priority == "final"]
-        if final_jobs:
-            return self._remove_at(final_jobs[0])
         return self._jobs.popleft()
 
     def clear(self) -> None:
@@ -261,9 +267,16 @@ class TtsJobQueue:
 class AsrSegmentQueue:
     """Bounded ASR queue that coalesces speech before dropping it."""
 
-    def __init__(self, high_watermark_ms: int, max_ms: int, preserve_speech: bool = True):
+    def __init__(
+        self,
+        high_watermark_ms: int,
+        max_ms: int,
+        preserve_speech: bool = True,
+        hard_max_ms: int | None = None,
+    ):
         self.high_watermark_ms = max(1, high_watermark_ms)
         self.max_ms = max(self.high_watermark_ms, max_ms)
+        self.hard_max_ms = max(self.max_ms, int(hard_max_ms or self.max_ms * 2))
         self.preserve_speech = preserve_speech
         self._segments: Deque[AsrSegment] = deque()
         self._queued_ms = 0
@@ -287,8 +300,10 @@ class AsrSegmentQueue:
                         utterance_id=segment.utterance_id,
                         first_frame_seq=previous.first_frame_seq,
                         last_frame_seq=segment.last_frame_seq,
+                        segment_id=f"{previous.segment_id}+{segment.segment_id}".strip("+"),
                         is_final=False,
                         vad_source=segment.vad_source,
+                        commit_reason="pressure_coalesced",
                     )
                     events.append(
                         BackpressureEvent(
@@ -324,7 +339,7 @@ class AsrSegmentQueue:
     def _drop_until_within_budget(self) -> list[BackpressureEvent]:
         events: list[BackpressureEvent] = []
         while self._queued_ms > self.max_ms and self._segments:
-            if self.preserve_speech:
+            if self.preserve_speech and self._queued_ms <= self.hard_max_ms:
                 segment = self._segments[0]
                 events.append(
                     BackpressureEvent(
@@ -342,7 +357,7 @@ class AsrSegmentQueue:
             self._queued_ms = max(0, self._queued_ms - segment.duration_ms)
             events.append(
                 BackpressureEvent(
-                    type="drop_asr_speech",
+                    type="drop_asr_speech_hard_limit" if self.preserve_speech else "drop_asr_speech",
                     queue_ms=self._queued_ms,
                     dropped_ms=segment.duration_ms,
                     message=f"frames={segment.first_frame_seq}-{segment.last_frame_seq}",
