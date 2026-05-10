@@ -74,16 +74,6 @@ class AsrHypothesis:
 
 
 @dataclass(frozen=True)
-class CommittedText:
-    """Text that is stable enough to synthesize."""
-
-    revision_id: int
-    text: str
-    full_text: str
-    is_final: bool = False
-
-
-@dataclass(frozen=True)
 class TtsJob:
     """A cancellable TTS unit."""
 
@@ -91,4 +81,4 @@ class TtsJob:
     text: str
     voice_name: str
     parameters: dict
-    priority: Literal["stable", "final"] = "stable"
+    priority: Literal["final"] = "final"

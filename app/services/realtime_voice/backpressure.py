@@ -134,12 +134,7 @@ def _drop_oldest_audio_event(queue_ms: int, frame: AudioFrame) -> BackpressureEv
 
 
 class TtsJobQueue:
-    """Small revision-aware FIFO TTS job queue.
-
-    Synthesis may prefetch later jobs, but queue admission must preserve text
-    revision order. Final revisions are not allowed to jump ahead of stable
-    revisions that were committed earlier.
-    """
+    """Small revision-aware FIFO TTS job queue for final utterance text."""
 
     def __init__(self, maxsize: int, drop_on_overload: bool = False, hard_limit: int | None = None):
         self.maxsize = max(1, maxsize)
@@ -155,28 +150,8 @@ class TtsJobQueue:
     async def put_with_result(self, job) -> tuple[object, list[BackpressureEvent]]:
         events: list[BackpressureEvent] = []
         async with self._condition:
-            if job.priority == "stable" and len(self._jobs) >= self.maxsize:
-                stable_tail = []
-                while self._jobs and self._jobs[-1].priority == "stable":
-                    stable_tail.append(self._jobs.pop())
-                if stable_tail:
-                    stable_tail.reverse()
-                    merged_text = "".join(existing.text for existing in stable_tail) + job.text
-                    job = type(job)(
-                        revision_id=job.revision_id,
-                        text=merged_text,
-                        voice_name=job.voice_name,
-                        parameters=job.parameters,
-                        priority=job.priority,
-                    )
-                    events.append(
-                        BackpressureEvent(
-                            type="tts_jobs_coalesced",
-                            message=f"merged={len(stable_tail) + 1} revision={job.revision_id}",
-                        )
-                    )
             while self.drop_on_overload and len(self._jobs) >= self.maxsize:
-                dropped = self._drop_lowest_priority()
+                dropped = self._jobs.popleft()
                 events.append(
                     BackpressureEvent(
                         type="tts_job_dropped",
@@ -192,7 +167,7 @@ class TtsJobQueue:
                 )
             self._jobs.append(job)
             while len(self._jobs) > self.hard_limit:
-                dropped = self._drop_lowest_priority()
+                dropped = self._jobs.popleft()
                 events.append(
                     BackpressureEvent(
                         type="tts_job_dropped_hard_limit",
@@ -215,20 +190,6 @@ class TtsJobQueue:
 
     def clear(self) -> None:
         self._jobs.clear()
-
-    def _drop_lowest_priority(self):
-        for index, job in enumerate(self._jobs):
-            if job.priority == "stable":
-                return self._remove_at(index)
-        return self._jobs.popleft()
-
-    def _remove_at(self, index: int):
-        if index == 0:
-            return self._jobs.popleft()
-        self._jobs.rotate(-index)
-        job = self._jobs.popleft()
-        self._jobs.rotate(index)
-        return job
 
 
 class AsrSegmentQueue:

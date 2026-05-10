@@ -509,16 +509,8 @@ def test_realtime_voice_websocket_supports_internal_asr_tts_pipeline(monkeypatch
 def test_realtime_voice_session_pins_multigpu_asr_session_engine(monkeypatch):
     import app.api.v1.realtime_voice as realtime_voice_api
 
-    class FakeStreamingSession:
-        pass
-
     class FakeSingleASREngine:
-        def __init__(self):
-            self.params = None
-
-        def create_streaming_session(self, params):
-            self.params = params
-            return FakeStreamingSession()
+        pass
 
     class FakeMultiASREngine:
         def __init__(self):
@@ -552,9 +544,7 @@ def test_realtime_voice_session_pins_multigpu_asr_session_engine(monkeypatch):
 
     session = realtime_voice_api.RealtimeVoiceAsrTtsSession("desktop_voice")
 
-    assert isinstance(session.streaming_session, FakeStreamingSession)
     assert session.session_asr_engine is fake_multi_engine.engine
-    assert fake_multi_engine.engine.params["sample_rate"] == 16000
 
     session.close()
     session.close()

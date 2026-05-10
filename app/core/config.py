@@ -144,10 +144,6 @@ class Settings:
     REALTIME_VAD_START_SPEECH_FRAMES: int = 3
     REALTIME_VAD_END_SILENCE_FRAMES: int = 25
     REALTIME_VAD_POST_PAD_MS: int = 100
-    REALTIME_TEXT_STABLE_HYPOTHESES: int = 1
-    REALTIME_TEXT_MIN_COMMIT_CHARS: int = 2
-    REALTIME_TEXT_MAX_COMMIT_CHARS: int = 8
-    REALTIME_TEXT_MAX_COMMIT_WAIT_MS: int = 120
     REALTIME_PACER_FRAME_MS: int = 20
     REALTIME_PACER_BURST_MS: int = 160
     REALTIME_OUTPUT_TARGET_QUEUE_MS: int = 800
@@ -361,30 +357,6 @@ class Settings:
         )
         self.REALTIME_VAD_POST_PAD_MS = int(
             os.getenv("REALTIME_VAD_POST_PAD_MS", str(self.REALTIME_VAD_POST_PAD_MS))
-        )
-        self.REALTIME_TEXT_STABLE_HYPOTHESES = int(
-            os.getenv(
-                "REALTIME_TEXT_STABLE_HYPOTHESES",
-                str(self.REALTIME_TEXT_STABLE_HYPOTHESES),
-            )
-        )
-        self.REALTIME_TEXT_MIN_COMMIT_CHARS = int(
-            os.getenv(
-                "REALTIME_TEXT_MIN_COMMIT_CHARS",
-                str(self.REALTIME_TEXT_MIN_COMMIT_CHARS),
-            )
-        )
-        self.REALTIME_TEXT_MAX_COMMIT_CHARS = int(
-            os.getenv(
-                "REALTIME_TEXT_MAX_COMMIT_CHARS",
-                str(self.REALTIME_TEXT_MAX_COMMIT_CHARS),
-            )
-        )
-        self.REALTIME_TEXT_MAX_COMMIT_WAIT_MS = int(
-            os.getenv(
-                "REALTIME_TEXT_MAX_COMMIT_WAIT_MS",
-                str(self.REALTIME_TEXT_MAX_COMMIT_WAIT_MS),
-            )
         )
         self.REALTIME_PACER_FRAME_MS = int(
             os.getenv("REALTIME_PACER_FRAME_MS", str(self.REALTIME_PACER_FRAME_MS))

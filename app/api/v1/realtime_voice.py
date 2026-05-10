@@ -12,6 +12,7 @@ import numpy as np
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from ...core.config import settings
+from ...core.executor import run_sync
 from ...utils.common import convert_speech_rate_to_speed
 from ...utils.common import generate_task_id
 from ...services.tts.engine import get_tts_engine
@@ -21,7 +22,6 @@ from ...services.asr.vad import StreamingVADEndpointDetector
 from ...services.realtime_voice.audio_pacer import AudioPacer
 from ...services.realtime_voice.backpressure import AsrSegmentQueue, BoundedAudioQueue, TtsJobQueue
 from ...services.realtime_voice.events import RealtimeVoiceEventBuilder
-from ...services.realtime_voice.text_commit import StableTextCommitter
 from ...services.realtime_voice.tts_dispatcher import get_realtime_tts_dispatcher
 from ...services.realtime_voice.types import AsrSegment, AudioFrame, AsrHypothesis, TtsJob
 from ...services.realtime_voice.vad_segmenter import SlidingVadSegmenter
@@ -103,18 +103,7 @@ class RealtimeVoiceAsrTtsSession:
             self.sample_rate,
         )
 
-        if hasattr(self.session_asr_engine, "create_streaming_session"):
-            self.streaming_session = self.session_asr_engine.create_streaming_session(
-                self.asr_params
-            )
-        else:
-            self.streaming_session = None
         self._closed = False
-        self.audio_buffer = np.array([], dtype=np.float32)
-        self.audio_cache = {}
-        self.punc_cache = {}
-        self.audio_time = 0
-        self.last_text = ""
         self.audio_queue = BoundedAudioQueue(
             settings.REALTIME_AUDIO_INPUT_HIGH_WATERMARK_MS,
             settings.REALTIME_AUDIO_INPUT_MAX_MS,
@@ -141,12 +130,6 @@ class RealtimeVoiceAsrTtsSession:
             settings.REALTIME_TTS_JOB_QUEUE_SIZE,
             drop_on_overload=settings.REALTIME_TTS_DROP_ON_OVERLOAD,
         )
-        self.text_committer = StableTextCommitter(
-            stable_hypotheses=settings.REALTIME_TEXT_STABLE_HYPOTHESES,
-            min_commit_chars=settings.REALTIME_TEXT_MIN_COMMIT_CHARS,
-            max_commit_chars=settings.REALTIME_TEXT_MAX_COMMIT_CHARS,
-            max_commit_wait_ms=settings.REALTIME_TEXT_MAX_COMMIT_WAIT_MS,
-        )
         self.audio_pacer = AudioPacer(
             self.sample_rate,
             frame_ms=settings.REALTIME_PACER_FRAME_MS,
@@ -163,6 +146,7 @@ class RealtimeVoiceAsrTtsSession:
         self._started = False
         self._utterance_index = 1
         self._hypothesis_index = 0
+        self._tts_revision_id = 0
         self._audio_chunk_index = 0
         self._input_frame_index = 0
         self._speech_active = False
@@ -186,10 +170,6 @@ class RealtimeVoiceAsrTtsSession:
             "vad_post_pad_ms": settings.REALTIME_VAD_POST_PAD_MS,
             "tts_global_max_inflight": settings.REALTIME_TTS_GLOBAL_MAX_INFLIGHT,
             "tts_audio_queue_size": settings.REALTIME_TTS_AUDIO_QUEUE_SIZE,
-            "text_stable_hypotheses": settings.REALTIME_TEXT_STABLE_HYPOTHESES,
-            "text_min_commit_chars": settings.REALTIME_TEXT_MIN_COMMIT_CHARS,
-            "text_max_commit_chars": settings.REALTIME_TEXT_MAX_COMMIT_CHARS,
-            "text_max_commit_wait_ms": settings.REALTIME_TEXT_MAX_COMMIT_WAIT_MS,
             "pacer_frame_ms": settings.REALTIME_PACER_FRAME_MS,
             "pacer_burst_ms": settings.REALTIME_PACER_BURST_MS,
             "output_target_queue_ms": settings.REALTIME_OUTPUT_TARGET_QUEUE_MS,
@@ -426,154 +406,111 @@ class RealtimeVoiceAsrTtsSession:
     async def _handle_asr_hypothesis(self, hypothesis: AsrHypothesis) -> None:
         assert self._task_id is not None
         utterance_id = self._current_utterance_id()
-        if hypothesis.kind == "begin":
-            if self._speech_active:
-                return
-            self._speech_active = True
-            await self._send_json(
-                self._event(
-                    "vad.speech_started",
-                    payload={
-                        "utterance_id": utterance_id,
-                        "speech_begin_ms": hypothesis.speech_begin_ms
-                        if hypothesis.speech_begin_ms is not None
-                        else hypothesis.begin_time_ms,
-                        "time_ms": hypothesis.time_ms,
-                        "source": hypothesis.vad_source or "vad",
-                    },
-                )
-            )
+
+        if not hypothesis.is_final:
             return
-        if hypothesis.kind == "end":
-            if self._speech_active:
-                await self._send_json(
-                    self._event(
-                        "vad.speech_ended",
-                        payload={
-                            "utterance_id": utterance_id,
-                            "speech_end_ms": hypothesis.speech_end_ms
-                            if hypothesis.speech_end_ms is not None
-                            else hypothesis.time_ms,
-                            "time_ms": hypothesis.time_ms,
-                            "source": hypothesis.vad_source or "vad",
-                        },
-                    )
-                )
-                self._speech_active = False
-        if not hypothesis.text:
+
+        text = (hypothesis.text or "").strip()
+        if not text:
+            self._utterance_index += 1
             return
+
         self._hypothesis_index += 1
-        hypothesis_id = f"{utterance_id}_hyp_{self._hypothesis_index}"
-        await self._send_json(
-            self._event(
-                "asr.hypothesis",
-                payload={
-                    "utterance_id": utterance_id,
-                    "hypothesis_id": hypothesis_id,
-                    "text": hypothesis.text,
-                    "is_final": hypothesis.is_final,
-                    "time_ms": hypothesis.time_ms,
-                    "begin_time_ms": hypothesis.begin_time_ms,
-                    "speech_active": self._speech_active,
-                    "emotion": hypothesis.emotion,
-                    "emotion_confidence": hypothesis.emotion_confidence,
-                    "raw_rich_text": hypothesis.raw_rich_text,
-                },
-            )
-        )
+        hypothesis_id = f"{utterance_id}_final_{self._hypothesis_index}"
+        self._tts_revision_id += 1
+        tts_job_id = f"tts_{self._tts_revision_id}"
+
         await self._send_json(
             self._event(
                 "asr_result",
                 payload={
-                    "protocol_event": "asr.hypothesis",
+                    "protocol_event": "asr.utterance_final",
                     "utterance_id": utterance_id,
                     "hypothesis_id": hypothesis_id,
-                    "text": hypothesis.text,
-                    "is_final": hypothesis.is_final,
-                    "speech_active": self._speech_active,
+                    "text": text,
+                    "is_final": True,
+                    "speech_active": False,
                     "emotion": hypothesis.emotion,
                     "emotion_confidence": hypothesis.emotion_confidence,
                     "raw_rich_text": hypothesis.raw_rich_text,
                 },
                 stage="asr_text_received",
-                text=hypothesis.text,
-                is_final=hypothesis.is_final,
+                text=text,
+                is_final=True,
             )
         )
-        committed = self.text_committer.update(hypothesis)
-        if committed:
-            tts_job_id = f"tts_{committed.revision_id}"
-            await self._send_json(
-                self._event(
-                    "asr.text_committed",
-                    payload={
-                        "utterance_id": utterance_id,
-                        "revision_id": committed.revision_id,
-                        "delta_text": committed.text,
-                        "full_text": committed.full_text,
-                        "is_final": committed.is_final,
-                        "tts_job_id": tts_job_id,
-                    },
-                )
+        await self._send_json(
+            self._event(
+                "asr.utterance_final",
+                payload={
+                    "utterance_id": utterance_id,
+                    "revision_id": self._tts_revision_id,
+                    "text": text,
+                    "is_final": True,
+                    "tts_job_id": tts_job_id,
+                    "emotion": hypothesis.emotion,
+                    "emotion_confidence": hypothesis.emotion_confidence,
+                    "raw_rich_text": hypothesis.raw_rich_text,
+                },
             )
-            job_parameters = dict(self.parameters)
-            if (
-                hypothesis.emotion
-                and job_parameters.get("emotion_control", "asr") != "off"
-                and not job_parameters.get("emotion")
-            ):
-                job_parameters["emotion"] = hypothesis.emotion
-                job_parameters["emotion_intensity"] = job_parameters.get("emotion_intensity")
-                job_parameters["emotion_source"] = "asr"
+        )
 
-            job = TtsJob(
-                revision_id=committed.revision_id,
-                text=committed.text,
-                voice_name=self.voice_name,
-                parameters=job_parameters,
-                priority="final" if committed.is_final else "stable",
-            )
-            queued_job, queue_events = await self.tts_jobs.put_with_result(job)
-            queued_tts_job_id = f"tts_{queued_job.revision_id}"
-            for event in queue_events:
-                await self._send_json(
-                    self._event(
-                        "backpressure.applied",
-                        payload={
-                            "scope": "tts",
-                            "level": "warning",
-                            "reason": event.type,
-                            "action": event.type,
-                            "message": event.message,
-                        },
-                        type=event.type,
-                        message=event.message,
-                    )
-                )
+        job_parameters = dict(self.parameters)
+        if (
+            hypothesis.emotion
+            and job_parameters.get("emotion_control", "asr") != "off"
+            and not job_parameters.get("emotion")
+        ):
+            job_parameters["emotion"] = hypothesis.emotion
+            job_parameters["emotion_intensity"] = job_parameters.get("emotion_intensity")
+            job_parameters["emotion_source"] = "asr"
+
+        job = TtsJob(
+            revision_id=self._tts_revision_id,
+            text=text,
+            voice_name=self.voice_name,
+            parameters=job_parameters,
+            priority="final",
+        )
+        queued_job, queue_events = await self.tts_jobs.put_with_result(job)
+        queued_tts_job_id = f"tts_{queued_job.revision_id}"
+        for event in queue_events:
             await self._send_json(
                 self._event(
-                    "tts.job_queued",
+                    "backpressure.applied",
                     payload={
-                        "tts_job_id": queued_tts_job_id,
-                        "revision_id": queued_job.revision_id,
-                        "utterance_id": utterance_id,
-                        "text": queued_job.text,
-                        "text_chars": len(queued_job.text),
-                        "voice_name": self.voice_name,
-                        "config_version": self.config_version,
-                        "priority": queued_job.priority,
+                        "scope": "tts",
+                        "level": "warning",
+                        "reason": event.type,
+                        "action": event.type,
+                        "message": event.message,
                     },
+                    type=event.type,
+                    message=event.message,
                 )
             )
-        if hypothesis.is_final:
-            await self._send_json(
-                self._event(
-                    "asr.sentence_finalized",
-                    payload={"utterance_id": utterance_id, "text": hypothesis.text},
-                )
+        await self._send_json(
+            self._event(
+                "tts.job_queued",
+                payload={
+                    "tts_job_id": queued_tts_job_id,
+                    "revision_id": queued_job.revision_id,
+                    "utterance_id": utterance_id,
+                    "text": queued_job.text,
+                    "text_chars": len(queued_job.text),
+                    "voice_name": self.voice_name,
+                    "config_version": self.config_version,
+                    "priority": queued_job.priority,
+                },
             )
-            self.text_committer.reset_sentence()
-            self._utterance_index += 1
+        )
+        await self._send_json(
+            self._event(
+                "asr.sentence_finalized",
+                payload={"utterance_id": utterance_id, "text": text},
+            )
+        )
+        self._utterance_index += 1
 
     async def _tts_worker(self) -> None:
         assert self._websocket is not None
@@ -824,86 +761,88 @@ class RealtimeVoiceAsrTtsSession:
         return ""
 
     async def _transcribe_events(self, audio: bytes, task_id: str, is_final: bool = False) -> list[AsrHypothesis]:
-        if is_final and not audio:
-            if self.streaming_session is not None and hasattr(self.streaming_session, "flush"):
-                events = await self.streaming_session.flush()
-                return [
-                    AsrHypothesis(
-                        text=event.text.strip(),
-                        is_final=event.kind == "end",
-                        kind=event.kind,
-                        time_ms=getattr(event, "time_ms", 0),
-                        begin_time_ms=getattr(event, "begin_time_ms", 0),
-                        speech_begin_ms=getattr(event, "speech_begin_ms", None),
-                        speech_end_ms=getattr(event, "speech_end_ms", None),
-                        vad_source=getattr(event, "vad_source", None),
-                        speech_active=getattr(event, "speech_active", False),
-                        emotion=getattr(event, "emotion", None),
-                        emotion_confidence=getattr(event, "emotion_confidence", None),
-                        raw_rich_text=getattr(event, "raw_rich_text", None),
-                    )
-                    for event in events
-                    if event.kind in {"begin", "end", "partial"}
-                ]
+        if not is_final or not audio:
             return []
+
         incoming = self.asr_service._convert_audio_bytes_to_array(
             audio,
             self.audio_format,
             self.sample_rate,
             task_id,
         )
-        if self.streaming_session is not None:
-            events = await self.streaming_session.accept_audio(incoming, is_final=is_final)
-            if is_final and hasattr(self.streaming_session, "flush"):
-                events = [*events, *await self.streaming_session.flush()]
-            return [
-                AsrHypothesis(
-                    text=event.text.strip(),
-                    is_final=event.kind == "end",
-                    kind=event.kind,
-                    time_ms=getattr(event, "time_ms", 0),
-                    begin_time_ms=getattr(event, "begin_time_ms", 0),
-                    speech_begin_ms=getattr(event, "speech_begin_ms", None),
-                    speech_end_ms=getattr(event, "speech_end_ms", None),
-                    vad_source=getattr(event, "vad_source", None),
-                    speech_active=getattr(event, "speech_active", False),
-                    emotion=getattr(event, "emotion", None),
-                    emotion_confidence=getattr(event, "emotion_confidence", None),
-                    raw_rich_text=getattr(event, "raw_rich_text", None),
-                )
-                for event in events
-                if event.kind in {"begin", "end", "partial"}
-            ]
-
-        self.audio_buffer = np.concatenate([self.audio_buffer, incoming])
-        standard_chunk_sizes = [3840, 9600]
-        selected_chunk_size = next(
-            (size for size in sorted(standard_chunk_sizes, reverse=True) if len(self.audio_buffer) >= size),
-            None,
-        )
-        if selected_chunk_size is None:
-            logger.debug(
-                "[%s] realtime voice ASR buffer waiting: %s samples",
-                task_id,
-                len(self.audio_buffer),
-            )
+        if incoming.size == 0:
             return []
 
-        audio_chunk = self.audio_buffer[:selected_chunk_size]
-        self.audio_buffer = self.audio_buffer[selected_chunk_size:]
-        audio_bytes = (audio_chunk * 32768.0).astype(np.int16).tobytes()
-        result_text, _, _, _, self.audio_cache, self.audio_time = await self.asr_service._process_audio_chunk(
+        duration_ms = int(len(incoming) / self.sample_rate * 1000)
+        hypothesis = await self._transcribe_final_utterance(incoming, audio, task_id)
+        if hypothesis is None:
+            return []
+        return [
+            replace(
+                hypothesis,
+                is_final=True,
+                kind="end",
+                time_ms=duration_ms,
+                begin_time_ms=0,
+                speech_end_ms=duration_ms,
+                speech_active=False,
+                vad_source=hypothesis.vad_source or "utterance_vad",
+            )
+        ]
+
+    async def _transcribe_final_utterance(
+        self,
+        audio_array: np.ndarray,
+        audio_bytes: bytes,
+        task_id: str,
+    ) -> AsrHypothesis | None:
+        if hasattr(self.session_asr_engine, "transcribe_array_with_metadata"):
+            result = await run_sync(
+                self.session_asr_engine.transcribe_array_with_metadata,
+                audio_array,
+                sample_rate=self.sample_rate,
+                enable_itn=self.asr_params.get("enable_inverse_text_normalization", True),
+                enable_vad=False,
+                enable_emotion=self.asr_params.get("enable_emotion", False),
+                return_rich_text=self.asr_params.get("return_rich_text", False),
+            )
+            text = (getattr(result, "text", "") or "").strip()
+            if not text:
+                return None
+            return AsrHypothesis(
+                text=text,
+                is_final=True,
+                kind="end",
+                emotion=getattr(result, "emotion", None),
+                emotion_confidence=getattr(result, "emotion_confidence", None),
+                raw_rich_text=getattr(result, "raw_rich_text", None),
+            )
+
+        if hasattr(self.session_asr_engine, "transcribe_array"):
+            text = (
+                await run_sync(
+                    self.session_asr_engine.transcribe_array,
+                    audio_array,
+                    sample_rate=self.sample_rate,
+                    enable_itn=self.asr_params.get("enable_inverse_text_normalization", True),
+                    enable_vad=False,
+                )
+                or ""
+            ).strip()
+            return AsrHypothesis(text=text, is_final=True, kind="end") if text else None
+
+        result_text, _, _, _, _, _ = await self.asr_service._process_audio_chunk(
             audio_bytes,
-            self.audio_cache,
-            self.punc_cache,
+            {},
+            {},
             self.asr_params,
-            self.audio_time,
+            0,
             task_id,
-            is_final=is_final,
+            is_final=True,
             session_engine=self.session_asr_engine,
         )
         text = (result_text or "").strip()
-        return [AsrHypothesis(text=text, is_final=is_final)] if text else []
+        return AsrHypothesis(text=text, is_final=True, kind="end") if text else None
 
     async def _synthesize(
         self,

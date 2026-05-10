@@ -8,7 +8,7 @@ from app.api.v1 import realtime_voice as realtime_voice_api
 from app.services.asr.vad import VADEvent
 from app.services.realtime_voice.audio_pacer import AudioPacer
 from app.services.realtime_voice.backpressure import AsrSegmentQueue, BoundedAudioQueue, TtsJobQueue
-from app.services.realtime_voice.text_commit import StableTextCommitter
+from app.services.realtime_voice.events import RealtimeVoiceEventBuilder
 from app.services.realtime_voice.tts_dispatcher import RealtimeTTSDispatcher
 from app.services.realtime_voice.types import AsrSegment, AudioFrame, AsrHypothesis, TtsJob
 from app.services.realtime_voice.vad_segmenter import SlidingVadSegmenter
@@ -343,80 +343,88 @@ def test_sliding_vad_segmenter_ignores_short_silence_inside_speech():
     assert emitted[0].last_frame_seq == 7
 
 
-def test_stable_text_committer_emits_incremental_stable_text():
-    committer = StableTextCommitter(
-        stable_hypotheses=2,
-        min_commit_chars=3,
-        max_commit_wait_ms=10_000,
-    )
 
-    assert committer.update(AsrHypothesis("你好今")) is None
+def test_realtime_voice_ignores_nonfinal_asr_text_for_tts_and_display():
+    class FakeWebSocket:
+        def __init__(self):
+            self.json_messages = []
 
-    committed = committer.update(AsrHypothesis("你好今天"))
-    assert committed is not None
-    assert committed.text == "你好今"
-    assert committed.full_text == "你好今"
-    assert committed.is_final is False
+        async def send_json(self, payload):
+            self.json_messages.append(payload)
 
-    assert committer.update(AsrHypothesis("你好")) is None
+    async def run():
+        websocket = FakeWebSocket()
+        session = realtime_voice_api.RealtimeVoiceAsrTtsSession.__new__(
+            realtime_voice_api.RealtimeVoiceAsrTtsSession
+        )
+        session._task_id = "task-1"
+        session._event_builder = RealtimeVoiceEventBuilder("task-1")
+        session._websocket = websocket
+        session._send_lock = asyncio.Lock()
+        session._utterance_index = 1
+        session._hypothesis_index = 0
+        session._tts_revision_id = 0
+        session.tts_jobs = TtsJobQueue(maxsize=3)
 
-    final = committer.update(AsrHypothesis("你好今天。", is_final=True))
-    assert final is not None
-    assert final.text == "天。"
-    assert final.is_final is True
+        await session._handle_asr_hypothesis(AsrHypothesis("中间结果", is_final=False))
 
+        assert websocket.json_messages == []
+        assert session.tts_jobs.get_nowait() is None
 
-def test_stable_text_committer_resets_sentence_after_final():
-    committer = StableTextCommitter(stable_hypotheses=1, min_commit_chars=1)
-
-    first = committer.update(AsrHypothesis("你好。", is_final=True))
-    assert first is not None
-    committer.reset_sentence()
-
-    second = committer.update(AsrHypothesis("再见。", is_final=True))
-    assert second is not None
-    assert second.text == "再见。"
-    assert second.full_text == "再见。"
+    asyncio.run(run())
 
 
-def test_stable_text_committer_appends_rolling_window_overlap():
-    committer = StableTextCommitter(stable_hypotheses=1, min_commit_chars=1)
+def test_realtime_voice_queues_one_tts_job_from_final_utterance_text():
+    class FakeWebSocket:
+        def __init__(self):
+            self.json_messages = []
 
-    first = committer.update(AsrHypothesis("今天我们去公园"))
-    assert first is not None
-    assert first.text == "今天我们去公园"
+        async def send_json(self, payload):
+            self.json_messages.append(payload)
 
-    rolling = committer.update(AsrHypothesis("去公园散步聊天"))
+    async def run():
+        websocket = FakeWebSocket()
+        session = realtime_voice_api.RealtimeVoiceAsrTtsSession.__new__(
+            realtime_voice_api.RealtimeVoiceAsrTtsSession
+        )
+        session._task_id = "task-1"
+        session._event_builder = RealtimeVoiceEventBuilder("task-1")
+        session._websocket = websocket
+        session._send_lock = asyncio.Lock()
+        session._utterance_index = 1
+        session._hypothesis_index = 0
+        session._tts_revision_id = 0
+        session._speech_active = False
+        session.parameters = {}
+        session.voice_name = "voice-1"
+        session.config_version = 1
+        session.tts_jobs = TtsJobQueue(maxsize=3)
 
-    assert rolling is not None
-    assert rolling.text == "散步聊天"
-    assert rolling.full_text == "今天我们去公园散步聊天"
+        await session._handle_asr_hypothesis(
+            AsrHypothesis(
+                "完整的一句话",
+                is_final=True,
+                kind="end",
+                emotion="happy",
+                emotion_confidence=0.8,
+            )
+        )
 
+        events = [message["event"] for message in websocket.json_messages]
+        assert "asr.hypothesis" not in events
+        assert events == [
+            "asr_result",
+            "asr.utterance_final",
+            "tts.job_queued",
+            "asr.sentence_finalized",
+        ]
+        queued = session.tts_jobs.get_nowait()
+        assert queued.text == "完整的一句话"
+        assert queued.priority == "final"
+        assert queued.revision_id == 1
+        assert session._utterance_index == 2
 
-def test_stable_text_committer_does_not_recommit_rolling_window_subset():
-    committer = StableTextCommitter(stable_hypotheses=1, min_commit_chars=1)
-
-    assert committer.update(AsrHypothesis("今天我们去公园")) is not None
-
-    assert committer.update(AsrHypothesis("我们去公园")) is None
-
-
-def test_stable_text_committer_bounds_speculative_delta_size():
-    committer = StableTextCommitter(
-        stable_hypotheses=1,
-        min_commit_chars=2,
-        max_commit_chars=4,
-        max_commit_wait_ms=10_000,
-    )
-
-    first = committer.update(AsrHypothesis("今天我们一起去公园"))
-    second = committer.update(AsrHypothesis("今天我们一起去公园"))
-
-    assert first is not None
-    assert first.text == "今天我们"
-    assert second is not None
-    assert second.text == "一起去公"
-
+    asyncio.run(run())
 
 def test_bounded_audio_queue_drops_oldest_frame_when_over_budget():
     async def run():
@@ -682,20 +690,17 @@ def test_asr_segment_queue_drops_nonfinal_speech_at_hard_limit_even_when_preserv
     asyncio.run(run())
 
 
-def test_tts_job_queue_drops_stale_stable_jobs_without_final_reordering():
+
+def test_tts_job_queue_drops_oldest_final_job_when_drop_on_overload():
     async def run():
         queue = TtsJobQueue(maxsize=2, drop_on_overload=True)
-        await queue.put(TtsJob(1, "旧", "voice", {}, "stable"))
-        await queue.put(TtsJob(2, "新", "voice", {}, "stable"))
-        await queue.put(TtsJob(3, "最终", "voice", {}, "final"))
+        await queue.put(TtsJob(1, "甲", "voice", {}, "final"))
+        await queue.put(TtsJob(2, "乙", "voice", {}, "final"))
+        events = await queue.put(TtsJob(3, "丙", "voice", {}, "final"))
 
-        first = await queue.get()
-        second = await queue.get()
-
-        assert first.revision_id == 2
-        assert first.text == "新"
-        assert second.priority == "final"
-        assert second.text == "最终"
+        assert any(event.type == "tts_job_dropped" for event in events)
+        assert [queue.get_nowait().revision_id for _ in range(2)] == [2, 3]
+        assert queue.get_nowait() is None
 
     asyncio.run(run())
 
@@ -716,27 +721,12 @@ def test_tts_job_queue_applies_hard_limit_after_soft_preserve():
     asyncio.run(run())
 
 
-def test_tts_job_queue_coalesces_stable_tail_under_soft_pressure():
-    async def run():
-        queue = TtsJobQueue(maxsize=2)
-        await queue.put(TtsJob(1, "你", "voice", {}, "stable"))
-        await queue.put(TtsJob(2, "好", "voice", {}, "stable"))
-        queued_job, events = await queue.put_with_result(TtsJob(3, "呀", "voice", {}, "stable"))
-
-        assert queued_job.text == "你好呀"
-        assert any(event.type == "tts_jobs_coalesced" for event in events)
-        assert (await queue.get()).revision_id == 3
-        assert queue.get_nowait() is None
-
-    asyncio.run(run())
-
-
 def test_tts_job_queue_preserves_jobs_by_default_when_overloaded():
     async def run():
         queue = TtsJobQueue(maxsize=2)
         await queue.put(TtsJob(1, "甲", "voice", {}, "final"))
         await queue.put(TtsJob(2, "乙", "voice", {}, "final"))
-        events = await queue.put(TtsJob(3, "丙", "voice", {}, "stable"))
+        events = await queue.put(TtsJob(3, "丙", "voice", {}, "final"))
 
         assert any(event.type == "tts_queue_preserved" for event in events)
         assert (await queue.get()).text == "甲"
@@ -744,38 +734,6 @@ def test_tts_job_queue_preserves_jobs_by_default_when_overloaded():
         assert (await queue.get()).text == "丙"
 
     asyncio.run(run())
-
-
-def test_tts_job_queue_coalesces_small_stable_jobs_when_waiting_under_pressure():
-    async def run():
-        queue = TtsJobQueue(maxsize=1)
-
-        await queue.put(TtsJob(1, "你", "voice", {}, "stable"))
-        events = await queue.put(TtsJob(2, "好", "voice", {}, "stable"))
-
-        assert any(event.type == "tts_jobs_coalesced" for event in events)
-        first = await queue.get()
-        assert first.text == "你好"
-        assert first.revision_id == 2
-        assert queue.get_nowait() is None
-
-    asyncio.run(run())
-
-
-def test_tts_job_queue_keeps_small_stable_jobs_separate_before_pressure():
-    async def run():
-        queue = TtsJobQueue(maxsize=3)
-
-        assert await queue.put(TtsJob(1, "你", "voice", {}, "stable")) == []
-        assert await queue.put(TtsJob(2, "好", "voice", {}, "stable")) == []
-
-        first = await queue.get()
-        second = await queue.get()
-        assert first.text == "你"
-        assert second.text == "好"
-
-    asyncio.run(run())
-
 
 def test_realtime_tts_dispatcher_rejects_when_global_queue_is_full():
     async def run():
