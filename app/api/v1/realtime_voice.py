@@ -129,7 +129,6 @@ class RealtimeVoiceAsrTtsSession:
             smooth_speech_frames=settings.REALTIME_VAD_SMOOTH_SPEECH_FRAMES,
             start_speech_frames=settings.REALTIME_VAD_START_SPEECH_FRAMES,
             end_silence_frames=settings.REALTIME_VAD_END_SILENCE_FRAMES,
-            max_segment_ms=settings.REALTIME_ASR_SEGMENT_MAX_MS,
         )
         self.tts_jobs = TtsJobQueue(
             settings.REALTIME_TTS_JOB_QUEUE_SIZE,
@@ -174,7 +173,6 @@ class RealtimeVoiceAsrTtsSession:
             "vad_start_speech_frames": settings.REALTIME_VAD_START_SPEECH_FRAMES,
             "vad_end_silence_frames": settings.REALTIME_VAD_END_SILENCE_FRAMES,
             "vad_post_pad_ms": settings.REALTIME_VAD_POST_PAD_MS,
-            "asr_segment_max_ms": settings.REALTIME_ASR_SEGMENT_MAX_MS,
             "tts_global_max_inflight": settings.REALTIME_TTS_GLOBAL_MAX_INFLIGHT,
             "tts_audio_queue_size": settings.REALTIME_TTS_AUDIO_QUEUE_SIZE,
             "playback_queue_size": settings.REALTIME_PLAYBACK_QUEUE_SIZE,

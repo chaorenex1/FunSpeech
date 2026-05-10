@@ -200,11 +200,9 @@ class AsrSegmentQueue:
         high_watermark_ms: int,
         max_ms: int,
         preserve_speech: bool = True,
-        hard_max_ms: int | None = None,
     ):
         self.high_watermark_ms = max(1, high_watermark_ms)
         self.max_ms = max(self.high_watermark_ms, max_ms)
-        self.hard_max_ms = max(self.max_ms, int(hard_max_ms or self.max_ms * 2))
         self.preserve_speech = preserve_speech
         self._segments: Deque[AsrSegment] = deque()
         self._queued_ms = 0
@@ -241,7 +239,7 @@ class AsrSegmentQueue:
     def _drop_until_within_budget(self) -> list[BackpressureEvent]:
         events: list[BackpressureEvent] = []
         while self._queued_ms > self.max_ms and self._segments:
-            if self.preserve_speech and self._queued_ms <= self.hard_max_ms:
+            if self.preserve_speech:
                 segment = self._segments[0]
                 events.append(
                     BackpressureEvent(
@@ -259,7 +257,7 @@ class AsrSegmentQueue:
             self._queued_ms = max(0, self._queued_ms - segment.duration_ms)
             events.append(
                 BackpressureEvent(
-                    type="drop_asr_speech_hard_limit" if self.preserve_speech else "drop_asr_speech",
+                    type="drop_asr_speech",
                     queue_ms=self._queued_ms,
                     dropped_ms=segment.duration_ms,
                     message=f"frames={segment.first_frame_seq}-{segment.last_frame_seq}",

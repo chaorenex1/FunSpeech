@@ -766,16 +766,17 @@ def test_asr_segment_queue_preserves_speech_by_default_under_pressure():
     asyncio.run(run())
 
 
-def test_asr_segment_queue_drops_speech_at_hard_limit_even_when_preserving():
+def test_asr_segment_queue_has_no_hard_drop_when_preserving_speech():
     async def run():
-        queue = AsrSegmentQueue(high_watermark_ms=40, max_ms=80, hard_max_ms=100)
+        queue = AsrSegmentQueue(high_watermark_ms=40, max_ms=80)
 
         await queue.put(_asr_segment(1, duration_ms=40))
         await queue.put(_asr_segment(2, duration_ms=40))
         events = await queue.put(_asr_segment(3, duration_ms=40))
 
-        assert any(event.type == "drop_asr_speech_hard_limit" for event in events)
-        assert queue.queued_ms <= 100
+        assert any(event.type == "asr_preserve_speech_backpressure" for event in events)
+        assert not any(event.type == "drop_asr_speech" for event in events)
+        assert queue.queued_ms == 120
 
     asyncio.run(run())
 

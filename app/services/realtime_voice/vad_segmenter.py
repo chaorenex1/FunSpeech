@@ -33,7 +33,7 @@ class SlidingVadSegmenter:
         smooth_speech_frames: int = 3,
         start_speech_frames: int | None = None,
         end_silence_frames: int | None = None,
-        max_segment_ms: int = 60_000,
+        max_segment_ms: int = 10_000,
     ):
         self.window_ms = max(20, int(window_ms))
         self.pre_roll_ms = max(0, int(pre_roll_ms))
