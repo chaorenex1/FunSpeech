@@ -5,7 +5,7 @@ import json
 import logging
 import asyncio
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from time import monotonic
 
 import numpy as np
@@ -17,6 +17,7 @@ from ...utils.common import generate_task_id
 from ...services.tts.engine import get_tts_engine
 from ...services.websocket_asr import get_aliyun_websocket_asr_service
 from ...services.websocket_tts import get_aliyun_websocket_tts_service
+from ...services.asr.vad import StreamingVADEndpointDetector
 from ...services.realtime_voice.audio_pacer import AudioPacer
 from ...services.realtime_voice.backpressure import AsrSegmentQueue, BoundedAudioQueue, TtsJobQueue
 from ...services.realtime_voice.events import RealtimeVoiceEventBuilder
@@ -97,6 +98,10 @@ class RealtimeVoiceAsrTtsSession:
             )
         else:
             self.session_asr_engine = asr_engine
+        self.realtime_vad_detector = StreamingVADEndpointDetector(
+            self.session_asr_engine,
+            self.sample_rate,
+        )
 
         if hasattr(self.session_asr_engine, "create_streaming_session"):
             self.streaming_session = self.session_asr_engine.create_streaming_session(
@@ -342,6 +347,7 @@ class RealtimeVoiceAsrTtsSession:
         assert self._task_id is not None
         while not self._closed:
             frame = await self.audio_queue.get()
+            frame = await self._classify_audio_frame(frame)
             if frame.sequence == 1 or frame.sequence % 10 == 0 or self.audio_queue.queued_ms:
                 await self._send_json(
                     self._event(
@@ -368,7 +374,7 @@ class RealtimeVoiceAsrTtsSession:
                         payload={
                             "utterance_id": self._current_utterance_id(),
                             "speech_begin_ms": 0,
-                            "source": "frame_smoothed_rms",
+                            "source": "frame_smoothed_vad_rms",
                         },
                     )
                 )
@@ -928,16 +934,38 @@ class RealtimeVoiceAsrTtsSession:
 
     def _build_audio_frame(self, audio: bytes) -> AudioFrame:
         duration_ms = self._estimate_duration_ms(audio)
-        is_silence = self._is_silence(audio)
+        rms_voice = self._is_voice_by_rms(self._pcm_bytes_to_float_array(audio))
         self._input_frame_index += 1
         return AudioFrame(
             payload=audio,
             duration_ms=duration_ms,
-            is_silence=is_silence,
+            is_silence=not rms_voice,
             sequence=self._input_frame_index,
-            pre_class="rms_silence" if is_silence else "rms_voice",
+            pre_class="rms_voice" if rms_voice else "rms_silence",
             vad_state="pending",
             speech_active=False,
+        )
+
+    async def _classify_audio_frame(self, frame: AudioFrame) -> AudioFrame:
+        audio_array = self._pcm_bytes_to_float_array(frame.payload)
+        rms_voice = self._is_voice_by_rms(audio_array)
+        vad_event = await self.realtime_vad_detector.accept_audio(audio_array)
+        detector_started = vad_event.speech_begin_ms is not None
+        detector_active = bool(vad_event.is_speech_active)
+        detector_ended = (
+            vad_event.speech_end_ms is not None
+            and not detector_started
+            and not detector_active
+        )
+        is_voice = (
+            rms_voice or detector_started or detector_active
+        ) and not detector_ended
+        return replace(
+            frame,
+            is_silence=not is_voice,
+            pre_class="rms_voice" if rms_voice else "rms_silence",
+            vad_state="speech" if is_voice else "silence",
+            speech_active=detector_started or detector_active,
         )
 
     def _estimate_duration_ms(self, audio: bytes) -> int:
@@ -946,15 +974,19 @@ class RealtimeVoiceAsrTtsSession:
         samples = max(1, len(audio) // 2)
         return max(1, int(samples / self.sample_rate * 1000))
 
-    def _is_silence(self, audio: bytes) -> bool:
+    def _pcm_bytes_to_float_array(self, audio: bytes) -> np.ndarray:
         if self.audio_format != "pcm" or len(audio) < 2:
-            return False
+            return np.array([], dtype=np.float32)
         pcm = np.frombuffer(audio, dtype=np.int16)
         if pcm.size == 0:
-            return True
-        audio_array = pcm.astype(np.float32) / 32768.0
+            return np.array([], dtype=np.float32)
+        return pcm.astype(np.float32) / 32768.0
+
+    def _is_voice_by_rms(self, audio_array: np.ndarray) -> bool:
+        if audio_array.size == 0:
+            return False
         rms = float(np.sqrt(np.mean(np.square(audio_array))))
-        return rms < settings.ASR_NEARFIELD_RMS_THRESHOLD
+        return rms >= settings.ASR_NEARFIELD_RMS_THRESHOLD
 
     async def _send_json(self, payload: dict) -> None:
         if self._websocket is None:

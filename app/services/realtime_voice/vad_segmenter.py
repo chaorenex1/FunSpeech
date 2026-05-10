@@ -6,8 +6,6 @@ from __future__ import annotations
 from collections import deque
 from typing import Deque
 
-import numpy as np
-
 from ...core.config import settings
 from .types import AsrSegment, AudioFrame
 
@@ -140,7 +138,7 @@ class SlidingVadSegmenter:
             last_frame_seq=frames[-1].sequence if frames else 0,
             segment_id=f"{utterance_id}_seg_{self._segment_index}",
             is_final=is_final,
-            vad_source="frame_smoothed_rms",
+            vad_source="frame_smoothed_vad_rms",
             commit_reason=commit_reason,
         )
 
@@ -149,13 +147,7 @@ class SlidingVadSegmenter:
         return sum(1 for is_voice in self._decision_window if is_voice) >= self.smooth_speech_frames
 
     def _is_voice_frame(self, frame: AudioFrame) -> bool:
-        if frame.pre_class == "rms_voice" or frame.vad_state in {"speech", "active"}:
-            return True
-        samples = _pcm_bytes_to_float(frame.payload)
-        if samples.size == 0:
-            return False
-        rms = float(np.sqrt(np.mean(np.square(samples))))
-        return rms >= settings.ASR_NEARFIELD_RMS_THRESHOLD
+        return _is_marked_voice(frame)
 
     def _remember_pre_roll(self, frame: AudioFrame) -> None:
         self._pre_roll.append(frame)
@@ -186,7 +178,7 @@ class SlidingVadSegmenter:
             last_frame_seq=sequence,
             segment_id=f"{utterance_id}_seg_{self._segment_index}",
             is_final=True,
-            vad_source="frame_smoothed_rms",
+            vad_source="frame_smoothed_vad_rms",
             commit_reason="vad_end_marker",
         )
 
@@ -197,18 +189,12 @@ class SlidingVadSegmenter:
 
     def _last_voice_index(self, frames: list[AudioFrame]) -> int:
         for index in range(len(frames), 0, -1):
-            if frames[index - 1].pre_class == "rms_voice" or frames[index - 1].vad_state in {
-                "speech",
-                "active",
-            }:
+            if _is_marked_voice(frames[index - 1]):
                 return index
         return 0
 
     def _contains_voice(self, frames: list[AudioFrame]) -> bool:
-        return any(
-            frame.pre_class == "rms_voice" or frame.vad_state in {"speech", "active"}
-            for frame in frames
-        )
+        return any(_is_marked_voice(frame) for frame in frames)
 
     def _reset_utterance(self) -> None:
         self.state = "IDLE"
@@ -228,8 +214,9 @@ def _ceil_div(value: int, divisor: int) -> int:
     return (int(value) + int(divisor) - 1) // int(divisor)
 
 
-def _pcm_bytes_to_float(audio: bytes) -> np.ndarray:
-    if len(audio) < 2:
-        return np.array([], dtype=np.float32)
-    pcm = np.frombuffer(audio, dtype=np.int16)
-    return pcm.astype(np.float32) / 32768.0
+def _is_marked_voice(frame: AudioFrame) -> bool:
+    return (
+        frame.speech_active
+        or frame.pre_class == "rms_voice"
+        or frame.vad_state in {"speech", "active"}
+    )

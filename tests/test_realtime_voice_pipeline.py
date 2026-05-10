@@ -4,6 +4,8 @@ import asyncio
 
 import numpy as np
 
+from app.api.v1 import realtime_voice as realtime_voice_api
+from app.services.asr.vad import VADEvent
 from app.services.realtime_voice.audio_pacer import AudioPacer
 from app.services.realtime_voice.backpressure import AsrSegmentQueue, BoundedAudioQueue, TtsJobQueue
 from app.services.realtime_voice.text_commit import StableTextCommitter
@@ -166,6 +168,91 @@ def test_sliding_vad_segmenter_smooths_last_five_frames_by_majority():
 
     assert segmenter.active is True
     assert segmenter.consume_speech_started() is True
+
+
+def test_sliding_vad_segmenter_uses_frame_vad_metadata_without_recomputing_rms():
+    segmenter = SlidingVadSegmenter(
+        window_ms=20,
+        pre_roll_ms=0,
+        end_silence_ms=40,
+        smooth_window_frames=1,
+        smooth_speech_frames=1,
+        start_speech_frames=1,
+    )
+    loud_but_vad_silence = AudioFrame(
+        payload=_pcm_frame(2400),
+        duration_ms=20,
+        is_silence=True,
+        sequence=1,
+        pre_class="rms_silence",
+        vad_state="silence",
+    )
+
+    assert segmenter.accept(loud_but_vad_silence, "utt_1") == []
+    assert segmenter.active is False
+
+
+def test_realtime_voice_frame_classifier_uses_streaming_vad_over_rms_silence():
+    class FakeDetector:
+        async def accept_audio(self, audio_array, is_final=False):
+            assert audio_array.dtype == np.float32
+            return VADEvent(is_speech_active=True, source="vad")
+
+    async def run():
+        session = realtime_voice_api.RealtimeVoiceAsrTtsSession.__new__(
+            realtime_voice_api.RealtimeVoiceAsrTtsSession
+        )
+        session.audio_format = "pcm"
+        session.sample_rate = 1000
+        session.realtime_vad_detector = FakeDetector()
+        frame = AudioFrame(
+            payload=_pcm_frame(0, sample_rate=1000),
+            duration_ms=20,
+            is_silence=True,
+            sequence=1,
+            pre_class="rms_silence",
+            vad_state="pending",
+        )
+
+        classified = await session._classify_audio_frame(frame)
+
+        assert classified.vad_state == "speech"
+        assert classified.pre_class == "rms_silence"
+        assert classified.speech_active is True
+        assert classified.is_silence is False
+
+    asyncio.run(run())
+
+
+def test_realtime_voice_frame_classifier_uses_rms_when_streaming_vad_is_inactive():
+    class FakeDetector:
+        async def accept_audio(self, audio_array, is_final=False):
+            return VADEvent(is_speech_active=False, source="fallback")
+
+    async def run():
+        session = realtime_voice_api.RealtimeVoiceAsrTtsSession.__new__(
+            realtime_voice_api.RealtimeVoiceAsrTtsSession
+        )
+        session.audio_format = "pcm"
+        session.sample_rate = 1000
+        session.realtime_vad_detector = FakeDetector()
+        frame = AudioFrame(
+            payload=_pcm_frame(2400, sample_rate=1000),
+            duration_ms=20,
+            is_silence=True,
+            sequence=1,
+            pre_class="rms_silence",
+            vad_state="pending",
+        )
+
+        classified = await session._classify_audio_frame(frame)
+
+        assert classified.vad_state == "speech"
+        assert classified.pre_class == "rms_voice"
+        assert classified.speech_active is False
+        assert classified.is_silence is False
+
+    asyncio.run(run())
 
 
 def test_sliding_vad_segmenter_waits_for_consecutive_smoothed_speech_before_speaking():
