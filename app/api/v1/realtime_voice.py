@@ -6,7 +6,6 @@ import logging
 import asyncio
 import contextlib
 from dataclasses import dataclass, replace
-from time import monotonic
 
 import numpy as np
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -19,9 +18,9 @@ from ...services.tts.engine import get_tts_engine
 from ...services.websocket_asr import get_aliyun_websocket_asr_service
 from ...services.websocket_tts import get_aliyun_websocket_tts_service
 from ...services.asr.vad import StreamingVADEndpointDetector
-from ...services.realtime_voice.audio_pacer import AudioPacer
 from ...services.realtime_voice.backpressure import AsrSegmentQueue, BoundedAudioQueue, TtsJobQueue
 from ...services.realtime_voice.events import RealtimeVoiceEventBuilder
+from ...services.realtime_voice.playback_queue import PlaybackChunk, TtsPlaybackQueue
 from ...services.realtime_voice.tts_dispatcher import get_realtime_tts_dispatcher
 from ...services.realtime_voice.types import AsrSegment, AudioFrame, AsrHypothesis, TtsJob
 from ...services.realtime_voice.vad_segmenter import SlidingVadSegmenter
@@ -132,13 +131,10 @@ class RealtimeVoiceAsrTtsSession:
             settings.REALTIME_TTS_JOB_QUEUE_SIZE,
             drop_on_overload=settings.REALTIME_TTS_DROP_ON_OVERLOAD,
         )
-        self.audio_pacer = AudioPacer(
-            self.sample_rate,
-            frame_ms=settings.REALTIME_PACER_FRAME_MS,
-            burst_ms=settings.REALTIME_PACER_BURST_MS,
-            target_queue_ms=settings.REALTIME_OUTPUT_TARGET_QUEUE_MS,
-            high_queue_ms=settings.REALTIME_OUTPUT_HIGH_QUEUE_MS,
-            max_backpressure_sleep_ms=settings.REALTIME_OUTPUT_BACKPRESSURE_MAX_SLEEP_MS,
+        self.playback_queue = TtsPlaybackQueue(
+            settings.REALTIME_PLAYBACK_QUEUE_SIZE,
+            settings.REALTIME_PLAYBACK_MAX_INFLIGHT,
+            backpressure_sleep_ms=settings.REALTIME_PLAYBACK_BACKPRESSURE_SLEEP_MS,
         )
         self._tasks: list[asyncio.Task] = []
         self._websocket: WebSocket | None = None
@@ -150,9 +146,13 @@ class RealtimeVoiceAsrTtsSession:
         self._hypothesis_index = 0
         self._tts_revision_id = 0
         self._audio_chunk_index = 0
+        self._first_audio_sent_jobs: set[str] = set()
+        self._playback_job_chunks: dict[str, set[str]] = {}
+        self._playback_job_meta: dict[str, TtsJob] = {}
+        self._playback_jobs_done_queueing: set[str] = set()
+        self._playback_flush_lock = asyncio.Lock()
         self._input_frame_index = 0
         self._speech_active = False
-        self._last_client_playback_backpressure_at = 0.0
         self.config_version = 1
 
     def realtime_config_snapshot(self) -> dict:
@@ -172,48 +172,35 @@ class RealtimeVoiceAsrTtsSession:
             "vad_post_pad_ms": settings.REALTIME_VAD_POST_PAD_MS,
             "tts_global_max_inflight": settings.REALTIME_TTS_GLOBAL_MAX_INFLIGHT,
             "tts_audio_queue_size": settings.REALTIME_TTS_AUDIO_QUEUE_SIZE,
-            "pacer_frame_ms": settings.REALTIME_PACER_FRAME_MS,
-            "pacer_burst_ms": settings.REALTIME_PACER_BURST_MS,
-            "output_target_queue_ms": settings.REALTIME_OUTPUT_TARGET_QUEUE_MS,
-            "output_high_queue_ms": settings.REALTIME_OUTPUT_HIGH_QUEUE_MS,
-            "output_backpressure_max_sleep_ms": settings.REALTIME_OUTPUT_BACKPRESSURE_MAX_SLEEP_MS,
+            "playback_queue_size": settings.REALTIME_PLAYBACK_QUEUE_SIZE,
+            "playback_max_inflight": settings.REALTIME_PLAYBACK_MAX_INFLIGHT,
+            "playback_backpressure_sleep_ms": settings.REALTIME_PLAYBACK_BACKPRESSURE_SLEEP_MS,
         }
 
-    async def update_client_audio_ack(self, payload: dict) -> None:
-        last = payload.get("last") if isinstance(payload.get("last"), dict) else {}
-        ack_items = payload.get("acks") if isinstance(payload.get("acks"), list) else []
-        queue_values = [
-            int(item["playback_queue_ms"])
-            for item in ack_items
-            if isinstance(item, dict) and isinstance(item.get("playback_queue_ms"), (int, float))
-        ]
-        if isinstance(last.get("playback_queue_ms"), (int, float)):
-            queue_values.append(int(last["playback_queue_ms"]))
-        if not queue_values:
+    async def update_client_audio_backpressure(self, payload: dict) -> None:
+        playback_queue_ms = payload.get("playback_queue_ms")
+        level = payload.get("level")
+        if not level:
+            level = "high" if isinstance(playback_queue_ms, (int, float)) and playback_queue_ms > 0 else "normal"
+        self.playback_queue.set_backpressure(
+            str(level),
+            int(playback_queue_ms) if isinstance(playback_queue_ms, (int, float)) else None,
+        )
+        await self._flush_playback_queue()
+
+    async def mark_client_audio_played(self, payload: dict) -> None:
+        chunk_id = str(payload.get("chunk_id") or "")
+        if not chunk_id:
             return
-        playback_queue_ms = max(queue_values)
-        self.audio_pacer.update_client_queue_ms(playback_queue_ms)
-        now = monotonic()
-        if (
-            playback_queue_ms >= settings.REALTIME_OUTPUT_HIGH_QUEUE_MS
-            and now - self._last_client_playback_backpressure_at >= 1.0
-        ):
-            self._last_client_playback_backpressure_at = now
-            await self._send_json(
-                self._event(
-                    "backpressure.applied",
-                    payload={
-                        "scope": "client_playback",
-                        "level": "warning",
-                        "reason": "client_playback_queue_high",
-                        "action": "slow_output_pacer",
-                        "message": f"playback_queue_ms={playback_queue_ms}",
-                        "playback_queue_ms": playback_queue_ms,
-                    },
-                    type="client_playback_queue_high",
-                    message=f"playback_queue_ms={playback_queue_ms}",
-                )
-            )
+        chunk = await self.playback_queue.mark_played(chunk_id)
+        if chunk is None:
+            logger.debug("[%s] unknown played audio chunk: %s", self._task_id, chunk_id)
+            return
+        job_chunks = self._playback_job_chunks.get(chunk.tts_job_id)
+        if job_chunks is not None:
+            job_chunks.discard(chunk.chunk_id)
+        await self._maybe_complete_playback_job(chunk.tts_job_id)
+        await self._flush_playback_queue()
 
     def close(self):
         """Cancel workers and release a session-pinned ASR engine."""
@@ -738,7 +725,8 @@ class RealtimeVoiceAsrTtsSession:
     async def _drain_prefetched_tts(self, prefetched: PrefetchedTtsJob) -> None:
         job = prefetched.job
         emitted = False
-        first_audio_sent = False
+        self._playback_job_meta[prefetched.tts_job_id] = job
+        self._playback_job_chunks.setdefault(prefetched.tts_job_id, set())
         try:
             while True:
                 chunk = await prefetched.audio_queue.get()
@@ -746,26 +734,8 @@ class RealtimeVoiceAsrTtsSession:
                     break
                 if isinstance(chunk, BaseException):
                     raise chunk
-                async for frame in self.audio_pacer.iter_frames(chunk):
-                    self._audio_chunk_index += 1
-                    if not first_audio_sent:
-                        await self._send_json(
-                            self._event(
-                                "tts.first_audio",
-                                payload={
-                                    "tts_job_id": prefetched.tts_job_id,
-                                    "revision_id": job.revision_id,
-                                    "audio_chunk_index": self._audio_chunk_index,
-                                    "prefetched": True,
-                                },
-                            )
-                        )
-                        first_audio_sent = True
-                    await self._send_audio_frame(
-                        tts_job_id=prefetched.tts_job_id,
-                        revision_id=job.revision_id,
-                        frame=frame,
-                    )
+                if chunk:
+                    await self._enqueue_playback_chunk(prefetched, chunk)
                     emitted = True
         finally:
             if not prefetched.task.done():
@@ -773,53 +743,87 @@ class RealtimeVoiceAsrTtsSession:
             with contextlib.suppress(BaseException):
                 await prefetched.task
 
-        async for frame in self.audio_pacer.flush():
-            self._audio_chunk_index += 1
-            if not first_audio_sent:
-                await self._send_json(
-                    self._event(
-                        "tts.first_audio",
-                        payload={
-                            "tts_job_id": prefetched.tts_job_id,
-                            "revision_id": job.revision_id,
-                            "audio_chunk_index": self._audio_chunk_index,
-                            "prefetched": True,
-                        },
-                    )
-                )
-                first_audio_sent = True
-            await self._send_audio_frame(
-                tts_job_id=prefetched.tts_job_id,
-                revision_id=job.revision_id,
-                frame=frame,
-            )
-            emitted = True
         if emitted:
+            self._playback_jobs_done_queueing.add(prefetched.tts_job_id)
+            await self._maybe_complete_playback_job(prefetched.tts_job_id)
+
+    async def _enqueue_playback_chunk(
+        self,
+        prefetched: PrefetchedTtsJob,
+        payload: bytes,
+    ) -> PlaybackChunk:
+        self._audio_chunk_index += 1
+        chunk = PlaybackChunk(
+            chunk_id=f"{prefetched.tts_job_id}_chunk_{self._audio_chunk_index}",
+            tts_job_id=prefetched.tts_job_id,
+            revision_id=prefetched.job.revision_id,
+            audio_chunk_index=self._audio_chunk_index,
+            payload=payload,
+            sample_rate=self.sample_rate,
+        )
+        self._playback_job_chunks.setdefault(prefetched.tts_job_id, set()).add(chunk.chunk_id)
+        await self.playback_queue.put(chunk)
+        await self._flush_playback_queue()
+        return chunk
+
+    async def _flush_playback_queue(self) -> None:
+        async with self._playback_flush_lock:
+            for chunk in await self.playback_queue.ready_chunks():
+                await self._send_playback_chunk(chunk)
+
+    async def _send_playback_chunk(self, chunk: PlaybackChunk) -> None:
+        if chunk.tts_job_id not in self._first_audio_sent_jobs:
             await self._send_json(
                 self._event(
-                    "tts.job_completed",
+                    "tts.first_audio",
                     payload={
-                        "tts_job_id": prefetched.tts_job_id,
-                        "revision_id": job.revision_id,
-                        "text": job.text,
-                        "text_chars": len(job.text),
+                        "tts_job_id": chunk.tts_job_id,
+                        "revision_id": chunk.revision_id,
+                        "audio_chunk_index": chunk.audio_chunk_index,
+                        "chunk_id": chunk.chunk_id,
+                        "prefetched": True,
                     },
                 )
             )
-            await self._send_json(
-                self._event(
-                    "tts_completed",
-                    payload={
-                        "protocol_event": "tts.job_completed",
-                        "tts_job_id": prefetched.tts_job_id,
-                        "revision_id": job.revision_id,
-                        "text": job.text,
-                        "text_chars": len(job.text),
-                    },
-                    stage="tts_audio_sent",
-                    revision_id=job.revision_id,
-                )
+            self._first_audio_sent_jobs.add(chunk.tts_job_id)
+        await self._send_audio_frame(chunk)
+
+    async def _maybe_complete_playback_job(self, tts_job_id: str) -> None:
+        if tts_job_id not in self._playback_jobs_done_queueing:
+            return
+        if self._playback_job_chunks.get(tts_job_id):
+            return
+        job = self._playback_job_meta.pop(tts_job_id, None)
+        self._playback_jobs_done_queueing.discard(tts_job_id)
+        self._playback_job_chunks.pop(tts_job_id, None)
+        self._first_audio_sent_jobs.discard(tts_job_id)
+        if job is None:
+            return
+        await self._send_json(
+            self._event(
+                "tts.job_completed",
+                payload={
+                    "tts_job_id": tts_job_id,
+                    "revision_id": job.revision_id,
+                    "text": job.text,
+                    "text_chars": len(job.text),
+                },
             )
+        )
+        await self._send_json(
+            self._event(
+                "tts_completed",
+                payload={
+                    "protocol_event": "tts.job_completed",
+                    "tts_job_id": tts_job_id,
+                    "revision_id": job.revision_id,
+                    "text": job.text,
+                    "text_chars": len(job.text),
+                },
+                stage="tts_audio_sent",
+                revision_id=job.revision_id,
+            )
+        )
 
     async def _transcribe(self, audio: bytes, task_id: str) -> str:
         events = await self._transcribe_events(audio, task_id)
@@ -1007,31 +1011,29 @@ class RealtimeVoiceAsrTtsSession:
         async with self._send_lock:
             await self._websocket.send_bytes(payload)
 
-    async def _send_audio_frame(
-        self,
-        *,
-        tts_job_id: str,
-        revision_id: int,
-        frame: bytes,
-    ) -> None:
+    async def _send_audio_frame(self, chunk: PlaybackChunk) -> None:
         """Send audio metadata and binary bytes without interleaving events."""
         if self._websocket is None:
             return
+        stats = self.playback_queue.stats()
         async with self._send_lock:
             await self._websocket.send_json(
                 self._event(
                     "tts.audio_chunk",
                     payload={
-                        "tts_job_id": tts_job_id,
-                        "revision_id": revision_id,
-                        "audio_chunk_index": self._audio_chunk_index,
-                        "bytes": len(frame),
-                        "sample_rate": self.sample_rate,
-                        "format": "PCM",
+                        "chunk_id": chunk.chunk_id,
+                        "tts_job_id": chunk.tts_job_id,
+                        "revision_id": chunk.revision_id,
+                        "audio_chunk_index": chunk.audio_chunk_index,
+                        "bytes": len(chunk.payload),
+                        "sample_rate": chunk.sample_rate,
+                        "format": chunk.format,
+                        "pending": stats["pending"],
+                        "in_flight": stats["in_flight"],
                     },
                 )
             )
-            await self._websocket.send_bytes(frame)
+            await self._websocket.send_bytes(chunk.payload)
 
     def _event(self, event: str, *, payload: dict | None = None, **fields) -> dict:
         if self._event_builder is None:
@@ -1217,16 +1219,24 @@ async def realtime_voice_endpoint(websocket: WebSocket):
                     )
                 )
                 break
-            elif event == "client.audio_ack":
+            elif event == "client.audio_backpressure":
                 payload = data.get("payload") or {}
-                ack_count = payload.get("count") or len(payload.get("acks") or [])
-                if asr_tts_session is not None and hasattr(asr_tts_session, "update_client_audio_ack"):
-                    await asr_tts_session.update_client_audio_ack(payload)
+                if asr_tts_session is not None and hasattr(asr_tts_session, "update_client_audio_backpressure"):
+                    await asr_tts_session.update_client_audio_backpressure(payload)
                 logger.debug(
-                    "[%s] client audio ack received: count=%s last=%s",
+                    "[%s] client audio backpressure received: level=%s queue_ms=%s",
                     task_id,
-                    ack_count,
-                    payload.get("last"),
+                    payload.get("level"),
+                    payload.get("playback_queue_ms"),
+                )
+            elif event == "client.audio_played":
+                payload = data.get("payload") or {}
+                if asr_tts_session is not None and hasattr(asr_tts_session, "mark_client_audio_played"):
+                    await asr_tts_session.mark_client_audio_played(payload)
+                logger.debug(
+                    "[%s] client audio played received: chunk_id=%s",
+                    task_id,
+                    payload.get("chunk_id"),
                 )
             else:
                 await _send_error(websocket, task_id, f"不支持的事件: {event}", event_builder)

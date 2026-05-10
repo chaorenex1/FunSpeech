@@ -6,9 +6,9 @@ import numpy as np
 
 from app.api.v1 import realtime_voice as realtime_voice_api
 from app.services.asr.vad import VADEvent
-from app.services.realtime_voice.audio_pacer import AudioPacer
 from app.services.realtime_voice.backpressure import AsrSegmentQueue, BoundedAudioQueue, TtsJobQueue
 from app.services.realtime_voice.events import RealtimeVoiceEventBuilder
+from app.services.realtime_voice.playback_queue import PlaybackChunk, TtsPlaybackQueue
 from app.services.realtime_voice.tts_dispatcher import RealtimeTTSDispatcher
 from app.services.realtime_voice.types import AsrSegment, AudioFrame, AsrHypothesis, TtsJob
 from app.services.realtime_voice.vad_segmenter import SlidingVadSegmenter
@@ -837,37 +837,109 @@ def test_realtime_tts_dispatcher_times_out_waiting_for_slot():
     asyncio.run(run())
 
 
-def test_audio_pacer_can_burst_initial_frames_to_seed_client_jitter_buffer():
-    async def run():
-        pacer = AudioPacer(sample_rate=1000, frame_ms=20, burst_ms=100)
-        audio = b"\x01\x00" * 100
-        started = asyncio.get_running_loop().time()
-        frames = [frame async for frame in pacer.iter_frames(audio)]
-        elapsed_ms = int((asyncio.get_running_loop().time() - started) * 1000)
 
-        assert len(frames) == 5
-        assert elapsed_ms < 50
+def test_tts_playback_queue_allows_multiple_inflight_chunks():
+    async def run():
+        queue = TtsPlaybackQueue(maxsize=4, max_inflight=2)
+        chunks = [
+            PlaybackChunk(f"chunk-{index}", "tts_1", 1, index, bytes([index]), 1000)
+            for index in range(1, 4)
+        ]
+        for chunk in chunks:
+            await queue.put(chunk)
+
+        ready = await queue.ready_chunks()
+        assert [chunk.chunk_id for chunk in ready] == ["chunk-1", "chunk-2"]
+        assert queue.pending_count == 1
+        assert queue.in_flight_count == 2
+
+        played = await queue.mark_played("chunk-1")
+        assert played is chunks[0]
+        ready = await queue.ready_chunks()
+        assert [chunk.chunk_id for chunk in ready] == ["chunk-3"]
+        assert queue.pending_count == 0
+        assert queue.in_flight_count == 2
 
     asyncio.run(run())
 
 
-def test_audio_pacer_slows_when_client_playback_queue_is_high():
+def test_tts_playback_queue_backpressure_delays_raw_chunk_put():
     async def run():
-        pacer = AudioPacer(
-            sample_rate=1000,
-            frame_ms=20,
-            burst_ms=0,
-            target_queue_ms=10,
-            high_queue_ms=20,
-            max_backpressure_sleep_ms=20,
+        queue = TtsPlaybackQueue(
+            maxsize=4,
+            max_inflight=2,
+            backpressure_sleep_ms=10,
         )
-        pacer.update_client_queue_ms(20)
-        audio = b"\x01\x00" * 20
+        queue.set_backpressure("high", playback_queue_ms=1800)
+        chunk = PlaybackChunk("chunk-1", "tts_1", 1, 1, b"a", 1000)
+
         started = asyncio.get_running_loop().time()
-        frames = [frame async for frame in pacer.iter_frames(audio)]
+        await queue.put(chunk)
         elapsed_ms = int((asyncio.get_running_loop().time() - started) * 1000)
 
-        assert len(frames) == 1
-        assert elapsed_ms >= 15
+        assert elapsed_ms >= 8
+        assert queue.pending_count == 1
+        assert queue.stats()["playback_queue_ms"] == 1800
+
+    asyncio.run(run())
+
+
+def test_realtime_voice_flushes_playback_queue_by_inflight_window():
+    class FakeWebSocket:
+        def __init__(self):
+            self.json_messages = []
+            self.binary_messages = []
+
+        async def send_json(self, payload):
+            self.json_messages.append(payload)
+
+        async def send_bytes(self, payload):
+            self.binary_messages.append(payload)
+
+    async def run():
+        websocket = FakeWebSocket()
+        session = realtime_voice_api.RealtimeVoiceAsrTtsSession.__new__(
+            realtime_voice_api.RealtimeVoiceAsrTtsSession
+        )
+        session._task_id = "task-1"
+        session._event_builder = RealtimeVoiceEventBuilder("task-1")
+        session._websocket = websocket
+        session._send_lock = asyncio.Lock()
+        session._playback_flush_lock = asyncio.Lock()
+        session._first_audio_sent_jobs = set()
+        session._playback_job_chunks = {}
+        session._playback_job_meta = {}
+        session._playback_jobs_done_queueing = set()
+        session.playback_queue = TtsPlaybackQueue(maxsize=4, max_inflight=2)
+
+        chunks = [
+            PlaybackChunk(f"tts_1_chunk_{index}", "tts_1", 1, index, bytes([index]), 1000)
+            for index in range(1, 4)
+        ]
+        for chunk in chunks:
+            await session.playback_queue.put(chunk)
+
+        await session._flush_playback_queue()
+
+        audio_events = [
+            message for message in websocket.json_messages if message["event"] == "tts.audio_chunk"
+        ]
+        assert [event["payload"]["chunk_id"] for event in audio_events] == [
+            "tts_1_chunk_1",
+            "tts_1_chunk_2",
+        ]
+        assert websocket.binary_messages == [b"\x01", b"\x02"]
+
+        await session.mark_client_audio_played({"chunk_id": "tts_1_chunk_1"})
+
+        audio_events = [
+            message for message in websocket.json_messages if message["event"] == "tts.audio_chunk"
+        ]
+        assert [event["payload"]["chunk_id"] for event in audio_events] == [
+            "tts_1_chunk_1",
+            "tts_1_chunk_2",
+            "tts_1_chunk_3",
+        ]
+        assert websocket.binary_messages == [b"\x01", b"\x02", b"\x03"]
 
     asyncio.run(run())

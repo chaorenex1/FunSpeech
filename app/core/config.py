@@ -144,11 +144,9 @@ class Settings:
     REALTIME_VAD_START_SPEECH_FRAMES: int = 3
     REALTIME_VAD_END_SILENCE_FRAMES: int = 25
     REALTIME_VAD_POST_PAD_MS: int = 100
-    REALTIME_PACER_FRAME_MS: int = 20
-    REALTIME_PACER_BURST_MS: int = 160
-    REALTIME_OUTPUT_TARGET_QUEUE_MS: int = 800
-    REALTIME_OUTPUT_HIGH_QUEUE_MS: int = 1600
-    REALTIME_OUTPUT_BACKPRESSURE_MAX_SLEEP_MS: int = 80
+    REALTIME_PLAYBACK_QUEUE_SIZE: int = 32
+    REALTIME_PLAYBACK_MAX_INFLIGHT: int = 3
+    REALTIME_PLAYBACK_BACKPRESSURE_SLEEP_MS: int = 40
 
     def __init__(self):
         """从环境变量读取配置"""
@@ -358,22 +356,16 @@ class Settings:
         self.REALTIME_VAD_POST_PAD_MS = int(
             os.getenv("REALTIME_VAD_POST_PAD_MS", str(self.REALTIME_VAD_POST_PAD_MS))
         )
-        self.REALTIME_PACER_FRAME_MS = int(
-            os.getenv("REALTIME_PACER_FRAME_MS", str(self.REALTIME_PACER_FRAME_MS))
+        self.REALTIME_PLAYBACK_QUEUE_SIZE = int(
+            os.getenv("REALTIME_PLAYBACK_QUEUE_SIZE", str(self.REALTIME_PLAYBACK_QUEUE_SIZE))
         )
-        self.REALTIME_PACER_BURST_MS = int(
-            os.getenv("REALTIME_PACER_BURST_MS", str(self.REALTIME_PACER_BURST_MS))
+        self.REALTIME_PLAYBACK_MAX_INFLIGHT = int(
+            os.getenv("REALTIME_PLAYBACK_MAX_INFLIGHT", str(self.REALTIME_PLAYBACK_MAX_INFLIGHT))
         )
-        self.REALTIME_OUTPUT_TARGET_QUEUE_MS = int(
-            os.getenv("REALTIME_OUTPUT_TARGET_QUEUE_MS", str(self.REALTIME_OUTPUT_TARGET_QUEUE_MS))
-        )
-        self.REALTIME_OUTPUT_HIGH_QUEUE_MS = int(
-            os.getenv("REALTIME_OUTPUT_HIGH_QUEUE_MS", str(self.REALTIME_OUTPUT_HIGH_QUEUE_MS))
-        )
-        self.REALTIME_OUTPUT_BACKPRESSURE_MAX_SLEEP_MS = int(
+        self.REALTIME_PLAYBACK_BACKPRESSURE_SLEEP_MS = int(
             os.getenv(
-                "REALTIME_OUTPUT_BACKPRESSURE_MAX_SLEEP_MS",
-                str(self.REALTIME_OUTPUT_BACKPRESSURE_MAX_SLEEP_MS),
+                "REALTIME_PLAYBACK_BACKPRESSURE_SLEEP_MS",
+                str(self.REALTIME_PLAYBACK_BACKPRESSURE_SLEEP_MS),
             )
         )
 
