@@ -457,11 +457,11 @@ def test_realtime_voice_websocket_supports_internal_asr_tts_pipeline(monkeypatch
         async def process_audio(self, websocket, task_id, audio):
             await websocket.send_json(
                 {
-                    "event": "asr_result",
+                    "event": "asr.utterance_final",
                     "stage": "asr_text_received",
                     "task_id": task_id,
                     "text": "你好",
-                    "is_final": False,
+                    "is_final": True,
                 }
             )
             await websocket.send_bytes(b"tts-audio")
@@ -499,7 +499,7 @@ def test_realtime_voice_websocket_supports_internal_asr_tts_pipeline(monkeypatch
 
         websocket.send_bytes(b"\x00\x01\x02\x03")
         asr_result = websocket.receive_json()
-        assert asr_result["event"] == "asr_result"
+        assert asr_result["event"] == "asr.utterance_final"
         assert asr_result["text"] == "你好"
         assert websocket.receive_bytes() == b"tts-audio"
         completed = websocket.receive_json()

@@ -320,23 +320,22 @@ class RealtimeVoiceAsrTtsSession:
         while not self._closed:
             frame = await self.audio_queue.get()
             frame = await self._classify_audio_frame(frame)
-            if frame.sequence == 1 or frame.sequence % 10 == 0 or self.audio_queue.queued_ms:
-                await self._send_json(
-                    self._event(
-                        "input.audio_dequeued",
-                        payload={
-                            "queue_ms": self.audio_queue.queued_ms,
-                            "duration_ms": frame.duration_ms,
-                            "is_silence": frame.is_silence,
-                            "input_frame_index": frame.sequence,
-                            "pre_class": frame.pre_class,
-                            "vad_state": frame.vad_state,
-                            "speech_active": frame.speech_active,
-                        },
-                        stage="asr_receiving_audio",
-                        queue_ms=self.audio_queue.queued_ms,
-                    )
-                )
+            # await self._send_json(
+            #     self._event(
+            #         "input.audio_dequeued",
+            #         payload={
+            #             "queue_ms": self.audio_queue.queued_ms,
+            #             "duration_ms": frame.duration_ms,
+            #             "is_silence": frame.is_silence,
+            #             "input_frame_index": frame.sequence,
+            #             "pre_class": frame.pre_class,
+            #             "vad_state": frame.vad_state,
+            #             "speech_active": frame.speech_active,
+            #         },
+            #         stage="asr_receiving_audio",
+            #         queue_ms=self.audio_queue.queued_ms,
+            #     )
+            # )
             segments = self.vad_segmenter.accept(frame, self._current_utterance_id())
             if self.vad_segmenter.consume_speech_started() and not self._speech_active:
                 self._speech_active = True
@@ -424,36 +423,24 @@ class RealtimeVoiceAsrTtsSession:
 
         await self._send_json(
             self._event(
-                "asr_result",
+                "asr.utterance_final",
                 payload={
                     "protocol_event": "asr.utterance_final",
                     "utterance_id": utterance_id,
                     "hypothesis_id": hypothesis_id,
-                    "text": text,
-                    "is_final": True,
-                    "speech_active": False,
-                    "emotion": hypothesis.emotion,
-                    "emotion_confidence": hypothesis.emotion_confidence,
-                    "raw_rich_text": hypothesis.raw_rich_text,
-                },
-                stage="asr_text_received",
-                text=text,
-                is_final=True,
-            )
-        )
-        await self._send_json(
-            self._event(
-                "asr.utterance_final",
-                payload={
-                    "utterance_id": utterance_id,
                     "revision_id": self._tts_revision_id,
                     "text": text,
                     "is_final": True,
+                    "speech_active": False,
                     "tts_job_id": tts_job_id,
                     "emotion": hypothesis.emotion,
                     "emotion_confidence": hypothesis.emotion_confidence,
                     "raw_rich_text": hypothesis.raw_rich_text,
                 },
+                protocol_event="asr.utterance_final",
+                stage="asr_text_received",
+                text=text,
+                is_final=True,
             )
         )
 

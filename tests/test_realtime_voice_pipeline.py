@@ -260,6 +260,59 @@ def test_realtime_voice_frame_classifier_uses_rms_when_streaming_vad_is_inactive
     asyncio.run(run())
 
 
+def test_realtime_voice_does_not_emit_audio_dequeued_by_default():
+    class FakeWebSocket:
+        def __init__(self):
+            self.json_messages = []
+
+        async def send_json(self, payload):
+            self.json_messages.append(payload)
+
+    class OneFrameQueue:
+        queued_ms = 0
+
+        def __init__(self, session):
+            self.session = session
+
+        async def get(self):
+            self.session._closed = True
+            return _audio_frame(1, 2400)
+
+    class FakeSegmenter:
+        def accept(self, frame, utterance_id):
+            return []
+
+        def consume_speech_started(self):
+            return False
+
+    async def run(parameters):
+        websocket = FakeWebSocket()
+        session = realtime_voice_api.RealtimeVoiceAsrTtsSession.__new__(
+            realtime_voice_api.RealtimeVoiceAsrTtsSession
+        )
+        session._closed = False
+        session._websocket = websocket
+        session._task_id = "task-1"
+        session._event_builder = RealtimeVoiceEventBuilder("task-1")
+        session._send_lock = asyncio.Lock()
+        session._utterance_index = 1
+        session._speech_active = False
+        session.parameters = parameters
+        session.audio_queue = OneFrameQueue(session)
+        session.vad_segmenter = FakeSegmenter()
+
+        async def classify(frame):
+            return frame
+
+        session._classify_audio_frame = classify
+
+        await session._audio_worker()
+        return [message["event"] for message in websocket.json_messages]
+
+    assert asyncio.run(run({})) == []
+    assert asyncio.run(run({"emit_input_audio_dequeued": True})) == ["input.audio_dequeued"]
+
+
 def test_sliding_vad_segmenter_waits_for_consecutive_smoothed_speech_before_speaking():
     segmenter = SlidingVadSegmenter(
         window_ms=20,
@@ -500,12 +553,21 @@ def test_realtime_voice_queues_one_tts_job_from_final_utterance_text():
 
         events = [message["event"] for message in websocket.json_messages]
         assert "asr.hypothesis" not in events
+        assert "asr_result" not in events
         assert events == [
-            "asr_result",
             "asr.utterance_final",
             "tts.job_queued",
             "asr.sentence_finalized",
         ]
+        final_event = websocket.json_messages[0]
+        assert final_event["text"] == "完整的一句话"
+        assert final_event["is_final"] is True
+        assert final_event["stage"] == "asr_text_received"
+        assert final_event["protocol_event"] == "asr.utterance_final"
+        assert final_event["payload"]["protocol_event"] == "asr.utterance_final"
+        assert final_event["payload"]["hypothesis_id"] == "utt_1_final_1"
+        assert final_event["payload"]["tts_job_id"] == "tts_1"
+        assert final_event["payload"]["speech_active"] is False
         queued = session.tts_jobs.get_nowait()
         assert queued.text == "完整的一句话"
         assert queued.priority == "final"
