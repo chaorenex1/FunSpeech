@@ -144,6 +144,7 @@ class Settings:
     REALTIME_VAD_START_SPEECH_FRAMES: int = 3
     REALTIME_VAD_END_SILENCE_FRAMES: int = 25
     REALTIME_VAD_POST_PAD_MS: int = 100
+    REALTIME_ASR_SEGMENT_MAX_MS: int = 60000
     REALTIME_PLAYBACK_QUEUE_SIZE: int = 32
     REALTIME_PLAYBACK_MAX_INFLIGHT: int = 3
     REALTIME_PLAYBACK_BACKPRESSURE_SLEEP_MS: int = 40
@@ -355,6 +356,12 @@ class Settings:
         )
         self.REALTIME_VAD_POST_PAD_MS = int(
             os.getenv("REALTIME_VAD_POST_PAD_MS", str(self.REALTIME_VAD_POST_PAD_MS))
+        )
+        self.REALTIME_ASR_SEGMENT_MAX_MS = int(
+            os.getenv(
+                "REALTIME_ASR_SEGMENT_MAX_MS",
+                str(self.REALTIME_ASR_SEGMENT_MAX_MS),
+            )
         )
         self.REALTIME_PLAYBACK_QUEUE_SIZE = int(
             os.getenv("REALTIME_PLAYBACK_QUEUE_SIZE", str(self.REALTIME_PLAYBACK_QUEUE_SIZE))

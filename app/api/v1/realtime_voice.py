@@ -28,8 +28,7 @@ from ...services.realtime_voice.vad_segmenter import SlidingVadSegmenter
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/ws/v1/realtime", tags=["Realtime Voice"])
-MAX_ASR_SEGMENT_MS = 60_000
-PCM_SAMPLE_BYTES = 2
+UTTERANCE_END_REASONS = {"vad_end", "vad_end_marker"}
 
 
 @dataclass
@@ -39,6 +38,10 @@ class PrefetchedTtsJob:
     audio_queue: asyncio.Queue
     done_sentinel: object
     task: asyncio.Task
+
+
+def _is_utterance_end_segment(segment: AsrSegment) -> bool:
+    return segment.commit_reason in UTTERANCE_END_REASONS
 
 
 async def _send_error(
@@ -126,6 +129,7 @@ class RealtimeVoiceAsrTtsSession:
             smooth_speech_frames=settings.REALTIME_VAD_SMOOTH_SPEECH_FRAMES,
             start_speech_frames=settings.REALTIME_VAD_START_SPEECH_FRAMES,
             end_silence_frames=settings.REALTIME_VAD_END_SILENCE_FRAMES,
+            max_segment_ms=settings.REALTIME_ASR_SEGMENT_MAX_MS,
         )
         self.tts_jobs = TtsJobQueue(
             settings.REALTIME_TTS_JOB_QUEUE_SIZE,
@@ -170,6 +174,7 @@ class RealtimeVoiceAsrTtsSession:
             "vad_start_speech_frames": settings.REALTIME_VAD_START_SPEECH_FRAMES,
             "vad_end_silence_frames": settings.REALTIME_VAD_END_SILENCE_FRAMES,
             "vad_post_pad_ms": settings.REALTIME_VAD_POST_PAD_MS,
+            "asr_segment_max_ms": settings.REALTIME_ASR_SEGMENT_MAX_MS,
             "tts_global_max_inflight": settings.REALTIME_TTS_GLOBAL_MAX_INFLIGHT,
             "tts_audio_queue_size": settings.REALTIME_TTS_AUDIO_QUEUE_SIZE,
             "playback_queue_size": settings.REALTIME_PLAYBACK_QUEUE_SIZE,
@@ -348,9 +353,8 @@ class RealtimeVoiceAsrTtsSession:
                     )
                 )
             for segment in segments:
-                for queue_segment in self._split_asr_segment_for_queue(segment):
-                    await self._queue_asr_segment(queue_segment)
-                if segment.is_final:
+                await self._queue_asr_segment(segment)
+                if _is_utterance_end_segment(segment):
                     self._utterance_index += 1
 
     async def _queue_asr_segment(self, segment: AsrSegment) -> None:
@@ -364,7 +368,6 @@ class RealtimeVoiceAsrTtsSession:
                     "last_input_frame_index": segment.last_frame_seq,
                     "duration_ms": segment.duration_ms,
                     "frame_count": segment.frame_count,
-                    "is_final": segment.is_final,
                     "commit_reason": segment.commit_reason,
                     "queue_ms": self.asr_queue.queued_ms,
                 },
@@ -373,60 +376,6 @@ class RealtimeVoiceAsrTtsSession:
         for event in await self.asr_queue.put(segment):
             await self._send_backpressure_event("asr", event)
 
-    def _split_asr_segment_for_queue(self, segment: AsrSegment) -> list[AsrSegment]:
-        if (
-            segment.duration_ms <= MAX_ASR_SEGMENT_MS
-            or self.audio_format != "pcm"
-            or self.sample_rate <= 0
-            or not segment.payload
-        ):
-            return [segment]
-
-        max_payload_bytes = int(
-            self.sample_rate * MAX_ASR_SEGMENT_MS / 1000
-        ) * PCM_SAMPLE_BYTES
-        max_payload_bytes -= max_payload_bytes % PCM_SAMPLE_BYTES
-        if max_payload_bytes <= 0 or len(segment.payload) <= max_payload_bytes:
-            return [segment]
-
-        chunks = [
-            segment.payload[index : index + max_payload_bytes]
-            for index in range(0, len(segment.payload), max_payload_bytes)
-        ]
-        if len(chunks) <= 1:
-            return [segment]
-
-        split_segments: list[AsrSegment] = []
-        base_segment_id = segment.segment_id or f"{segment.utterance_id}_seg"
-        next_frame_seq = segment.first_frame_seq
-        for index, payload in enumerate(chunks, start=1):
-            duration_ms = self._estimate_duration_ms(payload)
-            frame_count = max(
-                1,
-                int(round(duration_ms / max(1, settings.REALTIME_VAD_FRAME_MS))),
-            )
-            last_frame_seq = (
-                segment.last_frame_seq
-                if index == len(chunks)
-                else next_frame_seq + frame_count - 1
-            )
-            split_segments.append(
-                AsrSegment(
-                    payload=payload,
-                    duration_ms=duration_ms,
-                    frame_count=frame_count,
-                    utterance_id=segment.utterance_id,
-                    first_frame_seq=next_frame_seq,
-                    last_frame_seq=last_frame_seq,
-                    segment_id=f"{base_segment_id}_part_{index}",
-                    is_final=segment.is_final,
-                    vad_source=segment.vad_source,
-                    commit_reason=f"{segment.commit_reason}_slice",
-                )
-            )
-            next_frame_seq = last_frame_seq + 1
-        return split_segments
-
     async def _asr_worker(self) -> None:
         assert self._task_id is not None
         while not self._closed:
@@ -434,9 +383,8 @@ class RealtimeVoiceAsrTtsSession:
             events = await self._transcribe_events(
                 segment.payload,
                 self._task_id,
-                is_final=segment.is_final,
             )
-            if segment.is_final:
+            if _is_utterance_end_segment(segment):
                 if self._speech_active:
                     await self._send_json(
                         self._event(
@@ -832,8 +780,8 @@ class RealtimeVoiceAsrTtsSession:
                 return event.text
         return ""
 
-    async def _transcribe_events(self, audio: bytes, task_id: str, is_final: bool = False) -> list[AsrHypothesis]:
-        if not is_final or not audio:
+    async def _transcribe_events(self, audio: bytes, task_id: str) -> list[AsrHypothesis]:
+        if not audio:
             return []
 
         incoming = self.asr_service._convert_audio_bytes_to_array(

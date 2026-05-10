@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import asyncio
+import logging
 
 import numpy as np
 
@@ -30,7 +31,11 @@ def _audio_frame(sequence: int, amplitude: int, duration_ms: int = 20) -> AudioF
     )
 
 
-def _asr_segment(sequence: int, duration_ms: int = 40, final: bool = False) -> AsrSegment:
+def _asr_segment(
+    sequence: int,
+    duration_ms: int = 40,
+    commit_reason: str = "max_duration",
+) -> AsrSegment:
     return AsrSegment(
         payload=f"seg-{sequence}".encode(),
         duration_ms=duration_ms,
@@ -38,8 +43,8 @@ def _asr_segment(sequence: int, duration_ms: int = 40, final: bool = False) -> A
         utterance_id="utt_1",
         first_frame_seq=sequence,
         last_frame_seq=sequence,
-        is_final=final,
         vad_source="test",
+        commit_reason=commit_reason,
     )
 
 
@@ -300,7 +305,6 @@ def test_sliding_vad_segmenter_commits_one_final_utterance_with_pre_and_post_pad
         emitted.extend(segmenter.accept(_audio_frame(sequence, amplitude), "utt_1"))
 
     assert len(emitted) == 1
-    assert emitted[0].is_final is True
     assert emitted[0].first_frame_seq == 1
     assert emitted[0].last_frame_seq == 7
     assert emitted[0].frame_count == 7
@@ -309,6 +313,90 @@ def test_sliding_vad_segmenter_commits_one_final_utterance_with_pre_and_post_pad
         == _pcm_frame(0) * 2 + _pcm_frame(2400) * 3 + _pcm_frame(0) * 2
     )
     assert emitted[0].commit_reason == "vad_end"
+
+
+def test_sliding_vad_segmenter_auto_commits_when_body_reaches_max_segment_ms():
+    segmenter = SlidingVadSegmenter(
+        window_ms=20,
+        pre_roll_ms=0,
+        end_silence_ms=40,
+        smooth_window_frames=1,
+        smooth_speech_frames=1,
+        start_speech_frames=1,
+        max_segment_ms=60,
+    )
+
+    emitted = []
+    for sequence in range(1, 4):
+        emitted.extend(segmenter.accept(_audio_frame(sequence, 2400), "utt_1"))
+
+    assert len(emitted) == 1
+    assert emitted[0].commit_reason == "max_duration"
+    assert emitted[0].duration_ms == 60
+    assert emitted[0].frame_count == 3
+    assert emitted[0].first_frame_seq == 1
+    assert emitted[0].last_frame_seq == 3
+    assert segmenter.active is True
+    assert realtime_voice_api._is_utterance_end_segment(emitted[0]) is False
+
+
+def test_sliding_vad_segmenter_emits_tail_after_auto_commit():
+    segmenter = SlidingVadSegmenter(
+        window_ms=20,
+        pre_roll_ms=0,
+        end_silence_ms=40,
+        post_pad_ms=40,
+        smooth_window_frames=1,
+        smooth_speech_frames=1,
+        start_speech_frames=1,
+        max_segment_ms=60,
+    )
+
+    emitted = []
+    for sequence, amplitude in [
+        (1, 2400),
+        (2, 2400),
+        (3, 2400),
+        (4, 2400),
+        (5, 0),
+        (6, 0),
+    ]:
+        emitted.extend(segmenter.accept(_audio_frame(sequence, amplitude), "utt_1"))
+
+    assert [segment.commit_reason for segment in emitted] == ["max_duration", "vad_end"]
+    assert [(segment.first_frame_seq, segment.last_frame_seq) for segment in emitted] == [
+        (1, 3),
+        (4, 6),
+    ]
+    assert segmenter.active is False
+
+
+def test_sliding_vad_segmenter_logs_state_machine(caplog):
+    caplog.set_level(
+        logging.DEBUG,
+        logger="app.services.realtime_voice.vad_segmenter",
+    )
+    segmenter = SlidingVadSegmenter(
+        window_ms=20,
+        pre_roll_ms=0,
+        end_silence_ms=40,
+        smooth_window_frames=1,
+        smooth_speech_frames=1,
+        start_speech_frames=1,
+        max_segment_ms=60,
+    )
+
+    for sequence, amplitude in [(1, 2400), (2, 0), (3, 0)]:
+        segmenter.accept(_audio_frame(sequence, amplitude), "utt_1")
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("vad.state_transition IDLE -> SPEAKING" in message for message in messages)
+    assert any(
+        "vad.state_transition SPEAKING -> END_OF_UTTERANCE" in message
+        for message in messages
+    )
+    assert any("vad.state_transition END_OF_UTTERANCE -> IDLE" in message for message in messages)
+    assert any("commit_reason=vad_end" in message for message in messages)
 
 
 def test_sliding_vad_segmenter_ignores_short_silence_inside_speech():
@@ -424,67 +512,6 @@ def test_realtime_voice_queues_one_tts_job_from_final_utterance_text():
         assert queued.revision_id == 1
 
     asyncio.run(run())
-
-
-def test_realtime_voice_does_not_split_asr_segment_at_sixty_seconds():
-    session = realtime_voice_api.RealtimeVoiceAsrTtsSession.__new__(
-        realtime_voice_api.RealtimeVoiceAsrTtsSession
-    )
-    session.audio_format = "pcm"
-    session.sample_rate = 1000
-    payload = b"\x01\x00" * 60_000
-    segment = AsrSegment(
-        payload=payload,
-        duration_ms=60_000,
-        frame_count=3000,
-        utterance_id="utt_1",
-        first_frame_seq=1,
-        last_frame_seq=3000,
-        segment_id="seg_1",
-        is_final=True,
-        vad_source="test",
-        commit_reason="vad_end",
-    )
-
-    assert session._split_asr_segment_for_queue(segment) == [segment]
-
-
-def test_realtime_voice_splits_long_pcm_asr_segment_into_sixty_second_chunks():
-    session = realtime_voice_api.RealtimeVoiceAsrTtsSession.__new__(
-        realtime_voice_api.RealtimeVoiceAsrTtsSession
-    )
-    session.audio_format = "pcm"
-    session.sample_rate = 1000
-    payload = b"\x01\x00" * 130_000
-    segment = AsrSegment(
-        payload=payload,
-        duration_ms=130_000,
-        frame_count=6500,
-        utterance_id="utt_1",
-        first_frame_seq=1,
-        last_frame_seq=6500,
-        segment_id="seg_1",
-        is_final=True,
-        vad_source="test",
-        commit_reason="vad_end",
-    )
-
-    chunks = session._split_asr_segment_for_queue(segment)
-
-    assert [chunk.duration_ms for chunk in chunks] == [60_000, 60_000, 10_000]
-    assert [len(chunk.payload) for chunk in chunks] == [120_000, 120_000, 20_000]
-    assert [chunk.segment_id for chunk in chunks] == [
-        "seg_1_part_1",
-        "seg_1_part_2",
-        "seg_1_part_3",
-    ]
-    assert [(chunk.first_frame_seq, chunk.last_frame_seq) for chunk in chunks] == [
-        (1, 3000),
-        (3001, 6000),
-        (6001, 6500),
-    ]
-    assert all(chunk.is_final for chunk in chunks)
-    assert all(chunk.commit_reason == "vad_end_slice" for chunk in chunks)
 
 
 def test_bounded_audio_queue_drops_oldest_frame_when_over_budget():
@@ -688,37 +715,39 @@ def test_bounded_audio_queue_never_preserves_old_speech_over_ring_budget():
     asyncio.run(run())
 
 
-def test_asr_segment_queue_coalesces_when_pressure_is_high():
+def test_asr_segment_queue_throttles_when_pressure_is_high():
     async def run():
         queue = AsrSegmentQueue(high_watermark_ms=40, max_ms=160)
 
         await queue.put(_asr_segment(1, duration_ms=40))
         events = await queue.put(_asr_segment(2, duration_ms=40))
 
-        assert any(event.type == "asr_segments_coalesced" for event in events)
+        assert any(event.type == "asr_input_throttle" for event in events)
         assert queue.queued_ms == 80
         segment = await queue.get()
-        assert segment.duration_ms == 80
-        assert segment.frame_count == 4
-        assert segment.payload == b"seg-1seg-2"
+        assert segment.duration_ms == 40
+        assert segment.frame_count == 2
+        assert segment.payload == b"seg-1"
         assert segment.first_frame_seq == 1
-        assert segment.last_frame_seq == 2
+        assert segment.last_frame_seq == 1
 
     asyncio.run(run())
 
 
-def test_asr_segment_queue_drops_speech_over_high_water_budget_but_keeps_final_marker():
+def test_asr_segment_queue_drops_speech_over_budget_but_keeps_vad_end():
     async def run():
         queue = AsrSegmentQueue(high_watermark_ms=40, max_ms=80, preserve_speech=False)
 
         await queue.put(_asr_segment(1, duration_ms=40))
         await queue.put(_asr_segment(2, duration_ms=40))
-        events = await queue.put(_asr_segment(3, duration_ms=40, final=True))
+        events = await queue.put(
+            _asr_segment(3, duration_ms=40, commit_reason="vad_end")
+        )
 
         assert any(event.type == "drop_asr_speech" for event in events)
         assert queue.queued_ms <= 80
-        queued = await queue.get()
-        assert queued.is_final is True
+        assert (await queue.get()).commit_reason == "max_duration"
+        assert (await queue.get()).commit_reason == "vad_end"
 
     asyncio.run(run())
 
@@ -737,7 +766,7 @@ def test_asr_segment_queue_preserves_speech_by_default_under_pressure():
     asyncio.run(run())
 
 
-def test_asr_segment_queue_drops_nonfinal_speech_at_hard_limit_even_when_preserving():
+def test_asr_segment_queue_drops_speech_at_hard_limit_even_when_preserving():
     async def run():
         queue = AsrSegmentQueue(high_watermark_ms=40, max_ms=80, hard_max_ms=100)
 

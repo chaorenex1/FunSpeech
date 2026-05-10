@@ -193,7 +193,7 @@ class TtsJobQueue:
 
 
 class AsrSegmentQueue:
-    """Bounded ASR queue that coalesces speech before dropping it."""
+    """Bounded ASR queue that preserves utterance boundary markers."""
 
     def __init__(
         self,
@@ -217,34 +217,8 @@ class AsrSegmentQueue:
     async def put(self, segment: AsrSegment) -> list[BackpressureEvent]:
         events: list[BackpressureEvent] = []
         async with self._condition:
-            if self._queued_ms >= self.high_watermark_ms and not segment.is_final:
-                if self._segments and not self._segments[-1].is_final:
-                    previous = self._segments.pop()
-                    self._queued_ms = max(0, self._queued_ms - previous.duration_ms)
-                    segment = AsrSegment(
-                        payload=previous.payload + segment.payload,
-                        duration_ms=previous.duration_ms + segment.duration_ms,
-                        frame_count=previous.frame_count + segment.frame_count,
-                        utterance_id=segment.utterance_id,
-                        first_frame_seq=previous.first_frame_seq,
-                        last_frame_seq=segment.last_frame_seq,
-                        segment_id=f"{previous.segment_id}+{segment.segment_id}".strip("+"),
-                        is_final=False,
-                        vad_source=segment.vad_source,
-                        commit_reason="pressure_coalesced",
-                    )
-                    events.append(
-                        BackpressureEvent(
-                            type="asr_segments_coalesced",
-                            queue_ms=self._queued_ms,
-                            message=f"frames={segment.first_frame_seq}-{segment.last_frame_seq}",
-                            utterance_id=segment.utterance_id,
-                            first_dropped_seq=segment.first_frame_seq,
-                            last_dropped_seq=segment.last_frame_seq,
-                        )
-                    )
-                else:
-                    events.append(BackpressureEvent(type="asr_input_throttle", queue_ms=self._queued_ms))
+            if self._queued_ms >= self.high_watermark_ms:
+                events.append(BackpressureEvent(type="asr_input_throttle", queue_ms=self._queued_ms))
 
             self._segments.append(segment)
             self._queued_ms += segment.duration_ms
@@ -298,7 +272,7 @@ class AsrSegmentQueue:
 
     def _find_drop_index(self) -> int:
         for index, segment in enumerate(self._segments):
-            if not segment.is_final:
+            if not _is_utterance_boundary_segment(segment):
                 return index
         return 0
 
@@ -309,3 +283,7 @@ class AsrSegmentQueue:
         segment = self._segments.popleft()
         self._segments.rotate(index)
         return segment
+
+
+def _is_utterance_boundary_segment(segment: AsrSegment) -> bool:
+    return segment.commit_reason in {"vad_end", "vad_end_marker"}
