@@ -29,6 +29,8 @@ from ...services.realtime_voice.vad_segmenter import SlidingVadSegmenter
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/ws/v1/realtime", tags=["Realtime Voice"])
+MAX_ASR_SEGMENT_MS = 60_000
+PCM_SAMPLE_BYTES = 2
 
 
 @dataclass
@@ -359,24 +361,84 @@ class RealtimeVoiceAsrTtsSession:
                     )
                 )
             for segment in segments:
-                await self._send_json(
-                    self._event(
-                        "asr.segment_committed",
-                        payload={
-                            "segment_id": segment.segment_id,
-                            "utterance_id": segment.utterance_id,
-                            "first_input_frame_index": segment.first_frame_seq,
-                            "last_input_frame_index": segment.last_frame_seq,
-                            "duration_ms": segment.duration_ms,
-                            "frame_count": segment.frame_count,
-                            "is_final": segment.is_final,
-                            "commit_reason": segment.commit_reason,
-                            "queue_ms": self.asr_queue.queued_ms,
-                        },
-                    )
+                for queue_segment in self._split_asr_segment_for_queue(segment):
+                    await self._queue_asr_segment(queue_segment)
+                if segment.is_final:
+                    self._utterance_index += 1
+
+    async def _queue_asr_segment(self, segment: AsrSegment) -> None:
+        await self._send_json(
+            self._event(
+                "asr.segment_committed",
+                payload={
+                    "segment_id": segment.segment_id,
+                    "utterance_id": segment.utterance_id,
+                    "first_input_frame_index": segment.first_frame_seq,
+                    "last_input_frame_index": segment.last_frame_seq,
+                    "duration_ms": segment.duration_ms,
+                    "frame_count": segment.frame_count,
+                    "is_final": segment.is_final,
+                    "commit_reason": segment.commit_reason,
+                    "queue_ms": self.asr_queue.queued_ms,
+                },
+            )
+        )
+        for event in await self.asr_queue.put(segment):
+            await self._send_backpressure_event("asr", event)
+
+    def _split_asr_segment_for_queue(self, segment: AsrSegment) -> list[AsrSegment]:
+        if (
+            segment.duration_ms <= MAX_ASR_SEGMENT_MS
+            or self.audio_format != "pcm"
+            or self.sample_rate <= 0
+            or not segment.payload
+        ):
+            return [segment]
+
+        max_payload_bytes = int(
+            self.sample_rate * MAX_ASR_SEGMENT_MS / 1000
+        ) * PCM_SAMPLE_BYTES
+        max_payload_bytes -= max_payload_bytes % PCM_SAMPLE_BYTES
+        if max_payload_bytes <= 0 or len(segment.payload) <= max_payload_bytes:
+            return [segment]
+
+        chunks = [
+            segment.payload[index : index + max_payload_bytes]
+            for index in range(0, len(segment.payload), max_payload_bytes)
+        ]
+        if len(chunks) <= 1:
+            return [segment]
+
+        split_segments: list[AsrSegment] = []
+        base_segment_id = segment.segment_id or f"{segment.utterance_id}_seg"
+        next_frame_seq = segment.first_frame_seq
+        for index, payload in enumerate(chunks, start=1):
+            duration_ms = self._estimate_duration_ms(payload)
+            frame_count = max(
+                1,
+                int(round(duration_ms / max(1, settings.REALTIME_VAD_FRAME_MS))),
+            )
+            last_frame_seq = (
+                segment.last_frame_seq
+                if index == len(chunks)
+                else next_frame_seq + frame_count - 1
+            )
+            split_segments.append(
+                AsrSegment(
+                    payload=payload,
+                    duration_ms=duration_ms,
+                    frame_count=frame_count,
+                    utterance_id=segment.utterance_id,
+                    first_frame_seq=next_frame_seq,
+                    last_frame_seq=last_frame_seq,
+                    segment_id=f"{base_segment_id}_part_{index}",
+                    is_final=segment.is_final,
+                    vad_source=segment.vad_source,
+                    commit_reason=f"{segment.commit_reason}_slice",
                 )
-                for event in await self.asr_queue.put(segment):
-                    await self._send_backpressure_event("asr", event)
+            )
+            next_frame_seq = last_frame_seq + 1
+        return split_segments
 
     async def _asr_worker(self) -> None:
         assert self._task_id is not None
@@ -401,18 +463,25 @@ class RealtimeVoiceAsrTtsSession:
                     )
                 self._speech_active = False
             for asr_event in events:
-                await self._handle_asr_hypothesis(asr_event)
+                await self._handle_asr_hypothesis(
+                    asr_event,
+                    utterance_id=segment.utterance_id,
+                )
 
-    async def _handle_asr_hypothesis(self, hypothesis: AsrHypothesis) -> None:
+    async def _handle_asr_hypothesis(
+        self,
+        hypothesis: AsrHypothesis,
+        *,
+        utterance_id: str | None = None,
+    ) -> None:
         assert self._task_id is not None
-        utterance_id = self._current_utterance_id()
+        utterance_id = utterance_id or self._current_utterance_id()
 
         if not hypothesis.is_final:
             return
 
         text = (hypothesis.text or "").strip()
         if not text:
-            self._utterance_index += 1
             return
 
         self._hypothesis_index += 1
@@ -510,7 +579,6 @@ class RealtimeVoiceAsrTtsSession:
                 payload={"utterance_id": utterance_id, "text": text},
             )
         )
-        self._utterance_index += 1
 
     async def _tts_worker(self) -> None:
         assert self._websocket is not None

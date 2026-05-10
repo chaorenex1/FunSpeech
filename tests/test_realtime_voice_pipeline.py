@@ -422,9 +422,70 @@ def test_realtime_voice_queues_one_tts_job_from_final_utterance_text():
         assert queued.text == "完整的一句话"
         assert queued.priority == "final"
         assert queued.revision_id == 1
-        assert session._utterance_index == 2
 
     asyncio.run(run())
+
+
+def test_realtime_voice_does_not_split_asr_segment_at_sixty_seconds():
+    session = realtime_voice_api.RealtimeVoiceAsrTtsSession.__new__(
+        realtime_voice_api.RealtimeVoiceAsrTtsSession
+    )
+    session.audio_format = "pcm"
+    session.sample_rate = 1000
+    payload = b"\x01\x00" * 60_000
+    segment = AsrSegment(
+        payload=payload,
+        duration_ms=60_000,
+        frame_count=3000,
+        utterance_id="utt_1",
+        first_frame_seq=1,
+        last_frame_seq=3000,
+        segment_id="seg_1",
+        is_final=True,
+        vad_source="test",
+        commit_reason="vad_end",
+    )
+
+    assert session._split_asr_segment_for_queue(segment) == [segment]
+
+
+def test_realtime_voice_splits_long_pcm_asr_segment_into_sixty_second_chunks():
+    session = realtime_voice_api.RealtimeVoiceAsrTtsSession.__new__(
+        realtime_voice_api.RealtimeVoiceAsrTtsSession
+    )
+    session.audio_format = "pcm"
+    session.sample_rate = 1000
+    payload = b"\x01\x00" * 130_000
+    segment = AsrSegment(
+        payload=payload,
+        duration_ms=130_000,
+        frame_count=6500,
+        utterance_id="utt_1",
+        first_frame_seq=1,
+        last_frame_seq=6500,
+        segment_id="seg_1",
+        is_final=True,
+        vad_source="test",
+        commit_reason="vad_end",
+    )
+
+    chunks = session._split_asr_segment_for_queue(segment)
+
+    assert [chunk.duration_ms for chunk in chunks] == [60_000, 60_000, 10_000]
+    assert [len(chunk.payload) for chunk in chunks] == [120_000, 120_000, 20_000]
+    assert [chunk.segment_id for chunk in chunks] == [
+        "seg_1_part_1",
+        "seg_1_part_2",
+        "seg_1_part_3",
+    ]
+    assert [(chunk.first_frame_seq, chunk.last_frame_seq) for chunk in chunks] == [
+        (1, 3000),
+        (3001, 6000),
+        (6001, 6500),
+    ]
+    assert all(chunk.is_final for chunk in chunks)
+    assert all(chunk.commit_reason == "vad_end_slice" for chunk in chunks)
+
 
 def test_bounded_audio_queue_drops_oldest_frame_when_over_budget():
     async def run():
