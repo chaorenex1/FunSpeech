@@ -110,6 +110,38 @@ _DISFLUENCY_PREFIX_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_ASR_CONTENT_TOKEN_PATTERN = re.compile(r"[\w\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+", re.UNICODE)
+_ASR_STANDALONE_NOISE_TERMS = {
+    "i",
+    "ok",
+    "okay",
+    "ye",
+    "yeah",
+}
+
+
+def is_low_content_asr_text(text: str) -> bool:
+    """判断ASR结果是否只有低信息量短token，常见于静音/远场误识别。"""
+    if not text or not text.strip():
+        return True
+
+    tokens = _ASR_CONTENT_TOKEN_PATTERN.findall(text)
+    if not tokens:
+        return True
+
+    return all(
+        len(token) <= 1 or token.casefold() in _ASR_STANDALONE_NOISE_TERMS
+        for token in tokens
+    )
+
+
+def filter_short_asr_noise(text: str) -> str:
+    """过滤仅包含单字符或常见短英文幻觉词的ASR文本。"""
+    if is_low_content_asr_text(text):
+        logger.debug("短ASR噪声过滤: '%s' -> ''", text)
+        return ""
+    return text
+
 
 def filter_disfluencies(text: str) -> str:
     """过滤常见语气词/口吃填充词，保留正常句子结构。"""
@@ -127,5 +159,6 @@ def filter_disfluencies(text: str) -> str:
     cleaned = re.sub(r"\s*([,，。.!！?？;；:：、])\s*", r"\1", cleaned)
     cleaned = re.sub(r"([,，。.!！?？;；:：、]){2,}", r"\1", cleaned)
     cleaned = cleaned.strip(" ,，。、")
+    cleaned = filter_short_asr_noise(cleaned)
     logger.debug("语气词过滤: '%s' -> '%s'", text, cleaned)
     return cleaned

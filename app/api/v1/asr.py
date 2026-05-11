@@ -55,7 +55,7 @@ from ...utils.audio import (
 )
 from ...services.asr.manager import get_model_manager
 from ...services.asr.hotwords import resolve_hotwords
-from ...utils.text_processing import filter_disfluencies
+from ...utils.text_processing import filter_disfluencies, filter_short_asr_noise
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -357,6 +357,7 @@ async def asr_transcribe(
         if params.disfluency:
             result_text = filter_disfluencies(result_text)
             logger.debug(f"[{task_id}] 语气词过滤完成: {result_text}")
+        result_text = filter_short_asr_noise(result_text)
 
         # 返回成功响应
         response_data = {

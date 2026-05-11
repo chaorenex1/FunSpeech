@@ -35,7 +35,7 @@ from ...utils.audio import (
     normalize_audio_for_asr,
     save_audio_to_temp_file,
 )
-from ...utils.text_processing import filter_disfluencies
+from ...utils.text_processing import filter_disfluencies, filter_short_asr_noise
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +124,7 @@ def _process_async_asr_tasks() -> None:
 
                     if task["disfluency"]:
                         result_text = filter_disfluencies(result_text)
+                    result_text = filter_short_asr_noise(result_text)
 
                     duration_ms = int(audio_duration * 1000)
                     db_manager.update_asr_task_status(

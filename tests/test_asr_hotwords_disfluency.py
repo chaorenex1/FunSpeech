@@ -8,7 +8,7 @@ from app.core.config import settings
 from app.core.exceptions import InvalidParameterException
 from app.models.asr import ASRQueryParams
 from app.services.asr.hotwords import resolve_hotwords
-from app.utils.text_processing import filter_disfluencies
+from app.utils.text_processing import filter_disfluencies, filter_short_asr_noise
 
 
 def test_asr_query_params_accept_inline_hotwords():
@@ -59,3 +59,12 @@ def test_filter_disfluencies_keeps_particle_inside_normal_words():
     text = "哈佛大学的项目很重要，先测试，然后发布。"
 
     assert filter_disfluencies(text) == text
+
+
+@pytest.mark.parametrize("text", ["그", "Ye", "Okay", "I", "그 Ye Okay I", "好"])
+def test_filter_short_asr_noise_removes_singletons_and_common_hallucinations(text):
+    assert filter_short_asr_noise(text) == ""
+
+
+def test_filter_short_asr_noise_keeps_meaningful_sentences():
+    assert filter_short_asr_noise("今天我们测试一下") == "今天我们测试一下"

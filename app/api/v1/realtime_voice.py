@@ -14,7 +14,7 @@ from ...core.config import settings
 from ...core.executor import run_sync
 from ...utils.common import convert_speech_rate_to_speed
 from ...utils.common import generate_task_id
-from ...utils.text_processing import filter_disfluencies
+from ...utils.text_processing import filter_disfluencies, filter_short_asr_noise
 from ...services.tts.engine import get_tts_engine
 from ...services.websocket_asr import get_aliyun_websocket_asr_service
 from ...services.websocket_tts import get_aliyun_websocket_tts_service
@@ -414,7 +414,7 @@ class RealtimeVoiceAsrTtsSession:
         if not hypothesis.is_final:
             return
 
-        text = filter_disfluencies((hypothesis.text or "").strip())
+        text = filter_short_asr_noise(filter_disfluencies((hypothesis.text or "").strip()))
         if not text:
             return
 
