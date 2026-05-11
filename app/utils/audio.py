@@ -234,17 +234,13 @@ def resample_audio_array(
     try:
         import librosa
 
-        # 确保是1D数组用于librosa重采样
+        # 确保是1D数组用于librosa重采样。CosyVoice通常返回(1, samples)，
+        # 这里要取长轴作为时间轴，否则会把单声道误判成长度为1的音频。
         if audio_array.ndim > 1:
-            # 如果是多声道，取第一个声道
-            if audio_array.shape[0] > audio_array.shape[1]:
+            if audio_array.shape[0] <= audio_array.shape[-1]:
                 audio_1d = audio_array[0, :]
             else:
-                audio_1d = (
-                    audio_array[:, 0]
-                    if audio_array.shape[1] > 1
-                    else audio_array.flatten()
-                )
+                audio_1d = audio_array[:, 0]
         else:
             audio_1d = audio_array
 

@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 
+import sys
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
 from app.core.database import DatabaseManager
 from app.models.async_asr import AsyncASRRequest
 from app.models.tts import TTSRequest
-from app.utils.audio import adjust_audio_pitch
+from app.utils.audio import adjust_audio_pitch, resample_audio_array
 from app.utils.common import validate_pitch_rate_parameter
 
 
@@ -31,6 +34,28 @@ def test_adjust_audio_pitch_zero_is_noop():
     audio = np.array([0.0, 0.1, -0.1], dtype=np.float32)
 
     assert adjust_audio_pitch(audio, 22050, 0) is audio
+
+
+def test_resample_audio_array_uses_long_axis_for_single_channel_model_output(
+    monkeypatch,
+):
+    captured = {}
+
+    def fake_resample(audio, orig_sr, target_sr):
+        captured["audio"] = audio
+        captured["orig_sr"] = orig_sr
+        captured["target_sr"] = target_sr
+        return audio
+
+    monkeypatch.setitem(sys.modules, "librosa", SimpleNamespace(resample=fake_resample))
+    audio = np.arange(8, dtype=np.float32).reshape(1, 8)
+
+    result = resample_audio_array(audio, 24000, 16000)
+
+    assert result.shape == (8,)
+    assert np.array_equal(captured["audio"], audio[0, :])
+    assert captured["orig_sr"] == 24000
+    assert captured["target_sr"] == 16000
 
 
 def test_async_asr_request_shape_matches_long_recording_api():
