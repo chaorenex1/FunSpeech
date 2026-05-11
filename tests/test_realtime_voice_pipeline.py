@@ -576,6 +576,47 @@ def test_realtime_voice_queues_one_tts_job_from_final_utterance_text():
     asyncio.run(run())
 
 
+def test_realtime_voice_filters_disfluencies_before_tts_job():
+    class FakeWebSocket:
+        def __init__(self):
+            self.json_messages = []
+
+        async def send_json(self, payload):
+            self.json_messages.append(payload)
+
+    async def run():
+        websocket = FakeWebSocket()
+        session = realtime_voice_api.RealtimeVoiceAsrTtsSession.__new__(
+            realtime_voice_api.RealtimeVoiceAsrTtsSession
+        )
+        session._task_id = "task-1"
+        session._event_builder = RealtimeVoiceEventBuilder("task-1")
+        session._websocket = websocket
+        session._send_lock = asyncio.Lock()
+        session._utterance_index = 1
+        session._hypothesis_index = 0
+        session._tts_revision_id = 0
+        session._speech_active = False
+        session.parameters = {}
+        session.voice_name = "voice-1"
+        session.config_version = 1
+        session.tts_jobs = TtsJobQueue(maxsize=3)
+
+        await session._handle_asr_hypothesis(
+            AsrHypothesis("嗯，今天呃我们测试一下，那个，FunSpeech。", is_final=True)
+        )
+
+        final_event = websocket.json_messages[0]
+        queued_event = websocket.json_messages[1]
+        queued = session.tts_jobs.get_nowait()
+        assert final_event["payload"]["text"] == "今天我们测试一下，FunSpeech"
+        assert final_event["text"] == "今天我们测试一下，FunSpeech"
+        assert queued_event["payload"]["text"] == "今天我们测试一下，FunSpeech"
+        assert queued.text == "今天我们测试一下，FunSpeech"
+
+    asyncio.run(run())
+
+
 def test_bounded_audio_queue_drops_oldest_frame_when_over_budget():
     async def run():
         frames = [

@@ -504,7 +504,7 @@ class CosyVoiceTTSEngine:
                 logger.debug(f"CosyVoice分句结果: {len(normalized_texts)} 个句子")
 
                 # 为每个句子生成音频并记录时间戳
-                for sentence_text in normalized_texts:
+                for sentence_index, sentence_text in enumerate(normalized_texts, start=1):
                     sentence_audio_segments = []
                     use_instruct = bool(effective_prompt)
                     if use_instruct:
@@ -523,6 +523,17 @@ class CosyVoiceTTSEngine:
                             inference_kwargs.pop("zero_shot_spk_id")
                         # CosyVoice3 指令模式必须传 prompt_wav，不带 zero_shot_spk_id，
                         # 否则官方 frontend 会复用 spk2info 中注册时的 prompt_text。
+                        logger.info(
+                            "CosyVoice保存音色推理路径: method=inference_instruct2 voice=%s clone_version=%s "
+                            "return_timestamps=True sentence_index=%s stream=False has_prompt=%s prompt_wav=%s "
+                            "zero_shot_spk_id=%s",
+                            voice,
+                            self._clone_model_version,
+                            sentence_index,
+                            bool(effective_prompt),
+                            bool(prompt_wav),
+                            inference_kwargs.get("zero_shot_spk_id"),
+                        )
                         inference_gen = self.inference_instruct2(
                             sentence_text,
                             formatted_prompt,  # instruct_text
@@ -531,6 +542,15 @@ class CosyVoiceTTSEngine:
                         )
                     else:
                         # 无 prompt 时使用 zero_shot
+                        logger.info(
+                            "CosyVoice保存音色推理路径: method=inference_zero_shot voice=%s clone_version=%s "
+                            "return_timestamps=True sentence_index=%s stream=False has_prompt=False "
+                            "prompt_wav=False zero_shot_spk_id=%s",
+                            voice,
+                            self._clone_model_version,
+                            sentence_index,
+                            voice,
+                        )
                         inference_gen = self.inference_zero_shot(
                             sentence_text,
                             "",
@@ -593,6 +613,15 @@ class CosyVoiceTTSEngine:
                         inference_kwargs.pop("zero_shot_spk_id")
                     # CosyVoice3 指令模式必须传 prompt_wav，不带 zero_shot_spk_id，
                     # 否则官方 frontend 会复用 spk2info 中注册时的 prompt_text。
+                    logger.info(
+                        "CosyVoice保存音色推理路径: method=inference_instruct2 voice=%s clone_version=%s "
+                        "return_timestamps=False stream=False has_prompt=%s prompt_wav=%s zero_shot_spk_id=%s",
+                        voice,
+                        self._clone_model_version,
+                        bool(effective_prompt),
+                        bool(prompt_wav),
+                        inference_kwargs.get("zero_shot_spk_id"),
+                    )
                     inference_gen = self.inference_instruct2(
                         text,
                         formatted_prompt,  # instruct_text
@@ -601,6 +630,13 @@ class CosyVoiceTTSEngine:
                     )
                 else:
                     # 无 prompt 时使用 zero_shot
+                    logger.info(
+                        "CosyVoice保存音色推理路径: method=inference_zero_shot voice=%s clone_version=%s "
+                        "return_timestamps=False stream=False has_prompt=False prompt_wav=False zero_shot_spk_id=%s",
+                        voice,
+                        self._clone_model_version,
+                        voice,
+                    )
                     inference_gen = self.inference_zero_shot(
                         text,
                         "",

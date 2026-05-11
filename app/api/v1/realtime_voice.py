@@ -14,6 +14,7 @@ from ...core.config import settings
 from ...core.executor import run_sync
 from ...utils.common import convert_speech_rate_to_speed
 from ...utils.common import generate_task_id
+from ...utils.text_processing import filter_disfluencies
 from ...services.tts.engine import get_tts_engine
 from ...services.websocket_asr import get_aliyun_websocket_asr_service
 from ...services.websocket_tts import get_aliyun_websocket_tts_service
@@ -320,22 +321,23 @@ class RealtimeVoiceAsrTtsSession:
         while not self._closed:
             frame = await self.audio_queue.get()
             frame = await self._classify_audio_frame(frame)
-            # await self._send_json(
-            #     self._event(
-            #         "input.audio_dequeued",
-            #         payload={
-            #             "queue_ms": self.audio_queue.queued_ms,
-            #             "duration_ms": frame.duration_ms,
-            #             "is_silence": frame.is_silence,
-            #             "input_frame_index": frame.sequence,
-            #             "pre_class": frame.pre_class,
-            #             "vad_state": frame.vad_state,
-            #             "speech_active": frame.speech_active,
-            #         },
-            #         stage="asr_receiving_audio",
-            #         queue_ms=self.audio_queue.queued_ms,
-            #     )
-            # )
+            if self.parameters.get("emit_input_audio_dequeued"):
+                await self._send_json(
+                    self._event(
+                        "input.audio_dequeued",
+                        payload={
+                            "queue_ms": self.audio_queue.queued_ms,
+                            "duration_ms": frame.duration_ms,
+                            "is_silence": frame.is_silence,
+                            "input_frame_index": frame.sequence,
+                            "pre_class": frame.pre_class,
+                            "vad_state": frame.vad_state,
+                            "speech_active": frame.speech_active,
+                        },
+                        stage="asr_receiving_audio",
+                        queue_ms=self.audio_queue.queued_ms,
+                    )
+                )
             segments = self.vad_segmenter.accept(frame, self._current_utterance_id())
             if self.vad_segmenter.consume_speech_started() and not self._speech_active:
                 self._speech_active = True
@@ -412,7 +414,7 @@ class RealtimeVoiceAsrTtsSession:
         if not hypothesis.is_final:
             return
 
-        text = (hypothesis.text or "").strip()
+        text = filter_disfluencies((hypothesis.text or "").strip())
         if not text:
             return
 
@@ -743,20 +745,20 @@ class RealtimeVoiceAsrTtsSession:
                 },
             )
         )
-        await self._send_json(
-            self._event(
-                "tts_completed",
-                payload={
-                    "protocol_event": "tts.job_completed",
-                    "tts_job_id": tts_job_id,
-                    "revision_id": job.revision_id,
-                    "text": job.text,
-                    "text_chars": len(job.text),
-                },
-                stage="tts_audio_sent",
-                revision_id=job.revision_id,
-            )
-        )
+        # await self._send_json(
+        #     self._event(
+        #         "tts_completed",
+        #         payload={
+        #             "protocol_event": "tts.job_completed",
+        #             "tts_job_id": tts_job_id,
+        #             "revision_id": job.revision_id,
+        #             "text": job.text,
+        #             "text_chars": len(job.text),
+        #         },
+        #         stage="tts_audio_sent",
+        #         revision_id=job.revision_id,
+        #     )
+        # )
 
     async def _transcribe(self, audio: bytes, task_id: str) -> str:
         events = await self._transcribe_events(audio, task_id)

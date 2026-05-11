@@ -37,6 +37,7 @@ from ..utils.audio import (
     validate_audio_format,
     validate_sample_rate,
     resample_audio_array,
+    adjust_audio_volume,
 )
 from ..utils.emotion import (
     compose_emotion_prompt,
@@ -477,7 +478,7 @@ class AliyunWebSocketTTSService:
                 yield wav_bytes
 
             # 添加小延迟以模拟真实流式效果
-            await asyncio.sleep(0.01)
+            # await asyncio.sleep(0.01)
 
     async def _stream_clone_voice_with_engine(
         self, text: str, voice: str, speed: float, format: str, target_sr: int,
@@ -519,6 +520,16 @@ class AliyunWebSocketTTSService:
             }
             if zero_shot_spk_id:
                 inference_kwargs["zero_shot_spk_id"] = zero_shot_spk_id
+            logger.info(
+                "[%s] CosyVoice克隆流式推理路径: method=inference_instruct2 voice=%s clone_version=%s "
+                "stream=True has_prompt=%s prompt_wav=%s zero_shot_spk_id=%s",
+                task_id,
+                voice,
+                clone_version,
+                bool(effective_prompt),
+                bool(prompt_wav),
+                zero_shot_spk_id or None,
+            )
         else:
             # 无 prompt 时使用 zero_shot
             inference_method = engine.inference_zero_shot
@@ -532,6 +543,14 @@ class AliyunWebSocketTTSService:
                 "stream": True,
                 "speed": speed,
             }
+            logger.info(
+                "[%s] CosyVoice克隆流式推理路径: method=inference_zero_shot voice=%s clone_version=%s "
+                "stream=True has_prompt=False prompt_wav=False zero_shot_spk_id=%s",
+                task_id,
+                voice,
+                clone_version,
+                voice,
+            )
 
         # 使用线程池执行流式推理，避免阻塞事件循环
         async for audio_data in run_sync_generator(
@@ -549,6 +568,7 @@ class AliyunWebSocketTTSService:
             audio_array = audio_data["tts_speech"].numpy()
             audio_array = resample_audio_array(audio_array, model_sr, target_sr)
             audio_array = adjust_audio_pitch(audio_array, target_sr, pitch_rate)
+            audio_array = adjust_audio_volume(audio_array, volume)
 
             # 根据格式转换音频数据
             if format.upper() == "PCM":
@@ -560,7 +580,7 @@ class AliyunWebSocketTTSService:
                 yield wav_bytes
 
             # 添加小延迟以模拟真实流式效果
-            await asyncio.sleep(0.01)
+            # await asyncio.sleep(0.01)
 
     def _convert_audio_to_pcm(self, audio_array: np.ndarray, sample_rate: int) -> bytes:
         """将音频数组转换为PCM字节流"""
