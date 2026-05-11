@@ -414,7 +414,9 @@ class RealtimeVoiceAsrTtsSession:
         if not hypothesis.is_final:
             return
 
-        text = filter_short_asr_noise(filter_disfluencies((hypothesis.text or "").strip()))
+        text = filter_short_asr_noise(
+            filter_disfluencies((hypothesis.text or "").strip())
+        )
         if not text:
             return
 

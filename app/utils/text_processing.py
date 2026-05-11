@@ -110,7 +110,10 @@ _DISFLUENCY_PREFIX_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-_ASR_CONTENT_TOKEN_PATTERN = re.compile(r"[\w\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+", re.UNICODE)
+_ASR_CONTENT_TOKEN_PATTERN = re.compile(
+    r"[\w\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+",
+    re.UNICODE,
+)
 _ASR_STANDALONE_NOISE_TERMS = {
     "i",
     "ok",
