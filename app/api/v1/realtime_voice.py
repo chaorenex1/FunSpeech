@@ -161,9 +161,6 @@ class RealtimeVoiceAsrTtsSession:
 
     def realtime_config_snapshot(self) -> dict:
         return {
-            "sensevoice_partial_decode_interval_ms": settings.SENSEVOICE_PARTIAL_DECODE_INTERVAL_MS,
-            "sensevoice_min_decode_window_ms": settings.SENSEVOICE_MIN_DECODE_WINDOW_MS,
-            "sensevoice_max_partial_window_ms": settings.SENSEVOICE_MAX_PARTIAL_WINDOW_MS,
             "preserve_speech_under_pressure": settings.REALTIME_PRESERVE_SPEECH_UNDER_PRESSURE,
             "tts_job_queue_size": settings.REALTIME_TTS_JOB_QUEUE_SIZE,
             "tts_prefetch_jobs": settings.REALTIME_TTS_PREFETCH_JOBS,

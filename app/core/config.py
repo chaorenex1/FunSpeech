@@ -1,102 +1,94 @@
 # -*- coding: utf-8 -*-
-"""
-统一配置管理
-整合ASR和TTS的配置选项
+"""网关进程的统一配置
+
+模型加载相关 env(MODELSCOPE_PATH / VAD_MODEL / SFT_MODEL_ID / TTS_LOAD_TRT 等)
+全部转移到对应的 services/* 子服务,本进程只持有网关与子服务之间的协作配置。
 """
 
 import os
-from typing import Optional, List
 from pathlib import Path
+from typing import List, Optional
 
 
 class Settings:
-    """统一应用配置类"""
+    """网关进程配置类"""
 
     # 应用信息
     APP_NAME: str = "FunSpeech API Server"
-    APP_VERSION: str = "1.0.0"
-    APP_DESCRIPTION: str = "基于FunASR的语音识别和CosyVoice的语音合成API服务"
+    APP_VERSION: str = "2.0.0"
+    APP_DESCRIPTION: str = "微服务化语音网关 (ASR + TTS),兼容阿里云/OpenAI API"
 
-    # 服务器配置
+    # 服务器
     HOST: str = "0.0.0.0"
     PORT: int = 8000
     DEBUG: bool = False
 
-    # 鉴权配置
-    APPTOKEN: Optional[str] = None  # 从环境变量APPTOKEN读取，如果为None则鉴权可选
-    APPKEY: Optional[str] = None  # 从环境变量APPKEY读取，如果为None则appkey可选
+    # 鉴权
+    APPTOKEN: Optional[str] = None
+    APPKEY: Optional[str] = None
 
-    # GPU配置
-    # 支持格式: "" (自动检测), "cpu" (使用CPU), "0" (单卡), "0,1,2" (多卡)
-    TTS_GPUS: str = ""  # TTS使用的GPU，空则自动检测
-    ASR_GPUS: str = ""  # ASR使用的GPU，空则自动检测
-
-    # 路径配置
+    # 路径
     BASE_DIR: Path = Path(__file__).parent.parent.parent
     TEMP_DIR: str = "temp"
-    DATA_DIR: str = "data"  # 数据持久化目录
-    MODELSCOPE_PATH: str = os.path.expanduser("~/.cache/modelscope/hub")
+    DATA_DIR: str = "data"
 
-    # 日志配置
+    # 日志
     LOG_LEVEL: str = "INFO"
     LOG_FILE: Optional[str] = BASE_DIR / "logs" / "funspeech.log"
-    LOG_MAX_BYTES: int = 20 * 1024 * 1024  # 20MB
-    LOG_BACKUP_COUNT: int = 50  # 保留50个备份文件
+    LOG_MAX_BYTES: int = 20 * 1024 * 1024
+    LOG_BACKUP_COUNT: int = 50
 
-    # ASR模型配置
-    FUNASR_AUTOMODEL_KWARGS = {
-        "trust_remote_code": False,
-        "disable_update": True,
-        "disable_pbar": True,
-        "disable_log": True,  # 禁用FunASR的tables输出
-    }
+    # ASR — 网关需要知道的: model 配置入口、模式、自定义预热列表
     ASR_MODELS_CONFIG: str = BASE_DIR / "app/services/asr/models.json"
-    ASR_MODEL_MODE: str = "all"  # ASR模型加载模式: realtime, offline, all
-    ASR_STREAMING_STRATEGY: str = "windowed_offline"  # realtime模型缺省时使用离线窗口伪流式
-    ASR_ENABLE_REALTIME_PUNC: bool = False  # 是否启用实时标点模型（用于中间结果展示）
-    AUTO_LOAD_CUSTOM_ASR_MODELS: str = (
-        ""  # 启动时自动加载的自定义ASR模型列表（逗号分隔，如: dolphin-small,sensevoice-small）
-    )
-    SENSEVOICE_LANGUAGE: str = "auto"
-    SENSEVOICE_PARTIAL_DECODE_INTERVAL_MS: int = 500
-    SENSEVOICE_MIN_DECODE_WINDOW_MS: int = 800
-    SENSEVOICE_MAX_PARTIAL_WINDOW_MS: int = 4000
-    SENSEVOICE_MAX_SENTENCE_MS: int = 30000
+    ASR_MODEL_MODE: str = "all"  # all / offline / realtime, 子服务也读这个 env
+    ASR_ENABLE_REALTIME_PUNC: bool = False  # 转发给 funasr 子服务的实时 PUNC 开关
+    AUTO_LOAD_CUSTOM_ASR_MODELS: str = ""  # 网关启动时预热的额外模型 id, 逗号分隔
+
+    # 流式 ASR 远场过滤(网关侧句子状态机用,与子服务无关)
+    ASR_ENABLE_NEARFIELD_FILTER: bool = True
+    ASR_NEARFIELD_RMS_THRESHOLD: float = 0.01
+    ASR_NEARFIELD_FILTER_LOG_ENABLED: bool = True
+
+    # 网关侧端点检测(RMS/RMS+FSMN 兜底; FSMN 模型不可用时自动降级)
     ASR_ENABLE_VAD_ENDPOINT: bool = True
     ASR_VAD_CHUNK_SIZE_MS: int = 200
     ASR_VAD_SPEECH_PAD_MS: int = 300
     ASR_VAD_END_FALLBACK_MS: int = 1200
     ASR_VAD_MIN_SPEECH_MS: int = 300
     ASR_VAD_MAX_SENTENCE_MS: int = 30000
-    VAD_MODEL: str = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
-    VAD_MODEL_REVISION: str = "v2.0.4"
-    PUNC_MODEL: str = "iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch"
-    PUNC_MODEL_REVISION: str = "v2.0.4"
-    PUNC_REALTIME_MODEL: str = (
-        "iic/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727"
-    )
 
-    # 流式ASR远场过滤配置
-    ASR_ENABLE_NEARFIELD_FILTER: bool = True  # 是否启用远场声音过滤
-    ASR_NEARFIELD_RMS_THRESHOLD: float = 0.01  # RMS能量阈值（宽松模式，适合大多数场景）
-    ASR_NEARFIELD_FILTER_LOG_ENABLED: bool = True  # 是否记录过滤日志（默认启用）
+    # 异步 ASR 与热词表
     ASR_HOTWORDS_DIR: str = DATA_DIR + "/asr_hotwords"  # ASR热词表目录
     MAX_ASYNC_ASR_AUDIO_SIZE: int = 500 * 1024 * 1024  # 异步长录音最大500MB
 
-    # TTS模型配置
-    SFT_MODEL_ID: str = "iic/CosyVoice-300M-SFT"  # 预训练音色模型（CosyVoice）
-    CLONE_MODEL_ID: str = "iic/CosyVoice2-0.5B"  # 零样本克隆模型（CosyVoice2）
-    COSYVOICE3_MODEL_ID: str = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"  # CosyVoice3 模型
-    TTS_MODEL_MODE: str = "all"  # TTS模型加载模式: all, sft, clone
-    CLONE_MODEL_VERSION: str = "cosyvoice3"  # Clone模型版本: cosyvoice2, cosyvoice3
-    TTS_LOAD_TRT: bool = False  # 是否启用 TensorRT 加速
-    TTS_ENABLE_FP16: bool = False  # 是否启用 FP16 推理（CosyVoice3 的 FP16 存在数值溢出问题）
+    # TTS — 网关只选择后端; 具体模型形态由对应子服务 env 控制。
+    # 可选:
+    #   cosyvoice                 legacy CosyVoice SFT/2/3 子服务
+    #   qwen3-tts                 legacy qwen-tts Python 包子服务
+    #   cosyvoice3-vllm-omni      CosyVoice3 via vLLM-Omni
+    #   qwen3-tts-vllm-omni       Qwen3-TTS via vLLM-Omni
+    TTS_ENGINE: str = "cosyvoice"
+    # legacy cosyvoice 用 all/sft/clone; qwen3 可用 all/base/custom/voicedesign
+    # 做 get_voices 过滤。模型加载模式不要再从网关推断, 以子服务 env 为准。
+    TTS_MODEL_MODE: str = "all"
 
-    # 音频处理配置
-    MAX_AUDIO_SIZE: int = 100 * 1024 * 1024  # 100MB
-    MAX_TEXT_LENGTH: int = 1000  # 最大文本长度
+    # 微服务 — 子服务 URL / 鉴权 / 超时
+    INTERNAL_SERVICE_TOKEN: Optional[str] = None
+    SERVICE_REQUEST_TIMEOUT: float = 60.0
+    SERVICE_HEALTHCHECK_INTERVAL: float = 5.0
+    FUNASR_SERVICE_URLS: str = ""
+    DOLPHIN_SERVICE_URLS: str = ""
+    QWEN3_ASR_SERVICE_URLS: str = ""
+    COSYVOICE_SERVICE_URLS: str = ""
+    QWEN3_TTS_SERVICE_URLS: str = ""
+    COSYVOICE3_VLLM_OMNI_SERVICE_URLS: str = ""
+    QWEN3_TTS_VLLM_OMNI_SERVICE_URLS: str = ""
 
-    # TTS预设音色列表
+    # 音频处理
+    MAX_AUDIO_SIZE: int = 100 * 1024 * 1024
+    MAX_TEXT_LENGTH: int = 1000
+
+    # TTS 预设音色(用于 get_voices_info 返回展示)
     PRESET_VOICES: List[str] = [
         "中文女",
         "中文男",
@@ -107,12 +99,10 @@ class Settings:
         "韩语女",
     ]
 
-    # TTS参数限制
+    # TTS 参数限制
     MIN_SPEED: float = 0.5
     MAX_SPEED: float = 2.0
     DEFAULT_SPEED: float = 1.0
-
-    # 阿里云speech_rate参数限制
     MIN_SPEECH_RATE: int = -500
     MAX_SPEECH_RATE: int = 500
     DEFAULT_SPEECH_RATE: int = 0
@@ -122,9 +112,9 @@ class Settings:
     MAX_PITCH_RATE: int = 500
     DEFAULT_PITCH_RATE: int = 0
 
-    # 参考音频配置
-    MAX_REFERENCE_AUDIO_DURATION: int = 30  # 秒
-    MIN_REFERENCE_AUDIO_DURATION: float = 1.0  # 秒
+    # 参考音频(网关上传校验用)
+    MAX_REFERENCE_AUDIO_DURATION: int = 30
+    MIN_REFERENCE_AUDIO_DURATION: float = 1.0
 
     # Realtime Voice 流水线配置
     REALTIME_AUDIO_INPUT_HIGH_WATERMARK_MS: int = 1200
@@ -149,18 +139,16 @@ class Settings:
     REALTIME_PLAYBACK_BACKPRESSURE_SLEEP_MS: int = 40
 
     def __init__(self):
-        """从环境变量读取配置"""
         self._load_from_env()
         self._ensure_directories()
 
     def _load_from_env(self):
-        """从环境变量加载配置"""
-        # 服务器配置
+        # 服务器
         self.HOST = os.getenv("HOST", self.HOST)
         self.PORT = int(os.getenv("PORT", str(self.PORT)))
         self.DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
-        # 日志配置
+        # 日志
         self.LOG_LEVEL = os.getenv("LOG_LEVEL", self.LOG_LEVEL)
         self.LOG_FILE = os.getenv("LOG_FILE", self.LOG_FILE)
         self.LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", str(self.LOG_MAX_BYTES)))
@@ -168,51 +156,17 @@ class Settings:
             os.getenv("LOG_BACKUP_COUNT", str(self.LOG_BACKUP_COUNT))
         )
 
-        # 鉴权配置
-        self.APPTOKEN = os.getenv("APPTOKEN", self.APPTOKEN)
-        self.APPKEY = os.getenv("APPKEY", self.APPKEY)
+        # 鉴权 — 空字符串视为未配置 (docker compose 的 ${APPTOKEN:-} 默认塞空串)
+        self.APPTOKEN = os.getenv("APPTOKEN", self.APPTOKEN) or None
+        self.APPKEY = os.getenv("APPKEY", self.APPKEY) or None
 
-        # GPU配置
-        self.TTS_GPUS = os.getenv("TTS_GPUS", self.TTS_GPUS)
-        self.ASR_GPUS = os.getenv("ASR_GPUS", self.ASR_GPUS)
-
-        # ASR模型配置
+        # ASR
         self.ASR_MODEL_MODE = os.getenv("ASR_MODEL_MODE", self.ASR_MODEL_MODE)
-        self.ASR_STREAMING_STRATEGY = os.getenv(
-            "ASR_STREAMING_STRATEGY", self.ASR_STREAMING_STRATEGY
-        )
         self.ASR_ENABLE_REALTIME_PUNC = (
             os.getenv("ASR_ENABLE_REALTIME_PUNC", "false").lower() == "true"
         )
         self.AUTO_LOAD_CUSTOM_ASR_MODELS = os.getenv(
             "AUTO_LOAD_CUSTOM_ASR_MODELS", self.AUTO_LOAD_CUSTOM_ASR_MODELS
-        )
-        self.SENSEVOICE_LANGUAGE = os.getenv(
-            "SENSEVOICE_LANGUAGE", self.SENSEVOICE_LANGUAGE
-        )
-        self.SENSEVOICE_PARTIAL_DECODE_INTERVAL_MS = int(
-            os.getenv(
-                "SENSEVOICE_PARTIAL_DECODE_INTERVAL_MS",
-                str(self.SENSEVOICE_PARTIAL_DECODE_INTERVAL_MS),
-            )
-        )
-        self.SENSEVOICE_MIN_DECODE_WINDOW_MS = int(
-            os.getenv(
-                "SENSEVOICE_MIN_DECODE_WINDOW_MS",
-                str(self.SENSEVOICE_MIN_DECODE_WINDOW_MS),
-            )
-        )
-        self.SENSEVOICE_MAX_PARTIAL_WINDOW_MS = int(
-            os.getenv(
-                "SENSEVOICE_MAX_PARTIAL_WINDOW_MS",
-                str(self.SENSEVOICE_MAX_PARTIAL_WINDOW_MS),
-            )
-        )
-        self.SENSEVOICE_MAX_SENTENCE_MS = int(
-            os.getenv(
-                "SENSEVOICE_MAX_SENTENCE_MS",
-                str(self.SENSEVOICE_MAX_SENTENCE_MS),
-            )
         )
         self.ASR_ENABLE_VAD_ENDPOINT = (
             os.getenv("ASR_ENABLE_VAD_ENDPOINT", "true").lower() == "true"
@@ -233,14 +187,47 @@ class Settings:
             os.getenv("ASR_VAD_MAX_SENTENCE_MS", str(self.ASR_VAD_MAX_SENTENCE_MS))
         )
 
-        # TTS模型配置
+        # TTS
+        self.TTS_ENGINE = os.getenv("TTS_ENGINE", self.TTS_ENGINE)
         self.TTS_MODEL_MODE = os.getenv("TTS_MODEL_MODE", self.TTS_MODEL_MODE)
-        self.CLONE_MODEL_VERSION = os.getenv("CLONE_MODEL_VERSION", self.CLONE_MODEL_VERSION)
-        self.COSYVOICE3_MODEL_ID = os.getenv("COSYVOICE3_MODEL_ID", self.COSYVOICE3_MODEL_ID)
-        self.TTS_LOAD_TRT = os.getenv("TTS_LOAD_TRT", "false").lower() == "true"
-        self.TTS_ENABLE_FP16 = os.getenv("TTS_ENABLE_FP16", "false").lower() == "true"
 
-        # 远场过滤配置
+        # 微服务
+        self.INTERNAL_SERVICE_TOKEN = os.getenv(
+            "INTERNAL_SERVICE_TOKEN", self.INTERNAL_SERVICE_TOKEN
+        )
+        self.SERVICE_REQUEST_TIMEOUT = float(
+            os.getenv("SERVICE_REQUEST_TIMEOUT", str(self.SERVICE_REQUEST_TIMEOUT))
+        )
+        self.SERVICE_HEALTHCHECK_INTERVAL = float(
+            os.getenv(
+                "SERVICE_HEALTHCHECK_INTERVAL", str(self.SERVICE_HEALTHCHECK_INTERVAL)
+            )
+        )
+        self.FUNASR_SERVICE_URLS = os.getenv(
+            "FUNASR_SERVICE_URLS", self.FUNASR_SERVICE_URLS
+        )
+        self.DOLPHIN_SERVICE_URLS = os.getenv(
+            "DOLPHIN_SERVICE_URLS", self.DOLPHIN_SERVICE_URLS
+        )
+        self.QWEN3_ASR_SERVICE_URLS = os.getenv(
+            "QWEN3_ASR_SERVICE_URLS", self.QWEN3_ASR_SERVICE_URLS
+        )
+        self.COSYVOICE_SERVICE_URLS = os.getenv(
+            "COSYVOICE_SERVICE_URLS", self.COSYVOICE_SERVICE_URLS
+        )
+        self.QWEN3_TTS_SERVICE_URLS = os.getenv(
+            "QWEN3_TTS_SERVICE_URLS", self.QWEN3_TTS_SERVICE_URLS
+        )
+        self.COSYVOICE3_VLLM_OMNI_SERVICE_URLS = os.getenv(
+            "COSYVOICE3_VLLM_OMNI_SERVICE_URLS",
+            self.COSYVOICE3_VLLM_OMNI_SERVICE_URLS,
+        )
+        self.QWEN3_TTS_VLLM_OMNI_SERVICE_URLS = os.getenv(
+            "QWEN3_TTS_VLLM_OMNI_SERVICE_URLS",
+            self.QWEN3_TTS_VLLM_OMNI_SERVICE_URLS,
+        )
+
+        # 远场过滤
         self.ASR_ENABLE_NEARFIELD_FILTER = (
             os.getenv("ASR_ENABLE_NEARFIELD_FILTER", "true").lower() == "true"
         )
@@ -370,26 +357,21 @@ class Settings:
         )
 
     def _ensure_directories(self):
-        """确保必需的目录存在"""
         os.makedirs(self.TEMP_DIR, exist_ok=True)
         os.makedirs(self.DATA_DIR, exist_ok=True)
         os.makedirs(self.ASR_HOTWORDS_DIR, exist_ok=True)
 
     @property
     def models_config_path(self) -> str:
-        """获取模型配置文件的完整路径"""
         return str(self.BASE_DIR / self.ASR_MODELS_CONFIG)
 
     @property
     def docs_url(self) -> Optional[str]:
-        """获取文档URL"""
         return "/docs" if self.DEBUG else None
 
     @property
     def redoc_url(self) -> Optional[str]:
-        """获取ReDoc URL"""
         return "/redoc" if self.DEBUG else None
 
 
-# 全局配置实例
 settings = Settings()

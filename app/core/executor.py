@@ -1,20 +1,10 @@
 # -*- coding: utf-8 -*-
-"""
-异步执行器模块
+"""异步执行器
 
-用于将同步的模型推理调用放入线程池执行，避免阻塞事件循环，
-实现真正的多路并发处理。
+把同步阻塞调用(主要是 HTTP 客户端 / 同步 WS session)派发到线程池,
+避免阻塞 FastAPI 的事件循环; 同时提供同步生成器 → 异步生成器的桥接。
 
-设计要点：
-1. 使用 ThreadPoolExecutor 而非 ProcessPoolExecutor
-   - 模型已加载在内存中，进程间无法共享
-   - GPU操作会自动释放GIL，线程池足以实现并发
-
-2. 对于流式生成器，使用 asyncio.Queue 实现异步迭代
-
-3. 线程池大小根据使用场景配置：
-   - CPU推理：受GIL限制，多线程并发收益有限，但可以让I/O不阻塞
-   - GPU推理：CUDA操作释放GIL，可以实现真正并发
+线程数由 INFERENCE_THREAD_POOL_SIZE 控制, 默认 max(32, CPU 核数 * 8)。
 """
 
 import os
@@ -32,8 +22,10 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 # 全局线程池执行器
-# 默认线程数：max(4, CPU核心数)，可通过环境变量覆盖
-_DEFAULT_WORKERS = max(4, os.cpu_count() or 4)
+# 线程大部分时间阻塞在同步 WS recv() 等网络 I/O 上 (I/O-bound),
+# 默认线程数从 cpu_count 调整为 cpu_count*8 (最低 32),
+# 避免多并发 ASR 连接时线程池被耗尽导致服务不可用。
+_DEFAULT_WORKERS = max(32, (os.cpu_count() or 4) * 8)
 _MAX_WORKERS = int(os.getenv("INFERENCE_THREAD_POOL_SIZE", str(_DEFAULT_WORKERS)))
 
 _executor: ThreadPoolExecutor = None

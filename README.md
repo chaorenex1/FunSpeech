@@ -2,654 +2,391 @@
 
 ![FunSpeech](./docs/images/banner.png)
 
-  <h3>开箱即用的本地私有化部署语音服务</h3>
+  <h3>开箱即用的本地私有化部署语音服务 — 微服务架构</h3>
 
-基于 FunASR 和 CosyVoice 的语音处理 API 服务,提供语音识别(ASR)和语音合成(TTS)功能,与阿里云语音 API 完全兼容,且支持 Websocket 流式 ASR/TTS 协议。
+ASR + TTS API 网关,兼容阿里云语音 API 与 OpenAI Audio API,支持 WebSocket 流式协议。
+模型推理由独立子服务承载(每个引擎独立 venv + 容器),通过 docker-compose 编排。
 
 ---
 
 ![Static Badge](https://img.shields.io/badge/Python-3.10+-blue?logo=python)
-![Static Badge](https://img.shields.io/badge/Torch-2.3.1-%23EE4C2C?logo=pytorch&logoColor=white)
 ![Static Badge](https://img.shields.io/badge/CUDA-12.1+-%2376B900?logo=nvidia&logoColor=white)
+![Static Badge](https://img.shields.io/badge/uv-0.11+-%23DE5F87)
 
-  <div style="margin: 30px 0;">
-    <h3>强劲动力来自</h3>
-    <a href="https://cnb.cool" target="_blank">
-      <img src="https://docs.cnb.cool/images/logo/svg/LogoCnColorfulIcon.svg" alt="云原生构建" width="120" height="40">
-    </a>
-  </div>
 </div>
 
-## ✨ 主要特性
+> [!IMPORTANT]
+> **从单体版升级? 先读** [`docs/migration_to_latest.md`](./docs/migration_to_latest.md)
+>
+> 本分支已重构为微服务架构 (gateway + 多个可选 GPU 子服务)。对外 HTTP/WS 协议**字节级兼容**, 客户端代码不用动; 但部署侧 docker-compose、模型缓存挂载路径、`.env` 变量都有变化。迁移文档覆盖:数据原地复用、必改的 mount 路径、`.env` 增删项、零停机切换、回滚步骤。
 
-- **🚀 多模型支持** - 集成 FunASR、Dolphin、CosyVoice 等多种高质量模型
-- **🌐 完全 API 兼容** - 支持阿里云语音 API 和 OpenAI TTS API 格式,及 Websocket 流式 ASR/TTS 协议
-- **🎭 智能音色管理** - 支持预训练音色和零样本克隆音色
-- **🧩 Voice Cloner 对接** - 提供音色设计、音色同步和实时 ASR->TTS 变声 WebSocket 接口
-- **🕒 异步任务** - 支持长文本异步 TTS 和长录音异步 ASR,可轮询结果或配置回调通知
-- **🔧 灵活配置** - 统一的配置系统,支持环境变量和文件配置
-- **🛡️ 安全鉴权** - 完善的身份认证和权限控制
-- **💾 性能优化** - 智能模型缓存和动态加载机制
-- **🎯 智能过滤与控制** - 支持 ASR 热词/语气词过滤/情感标签,以及 TTS 音量、语调、情感控制
+## 架构
 
-## 📦 快速部署
-
-### Docker 部署(推荐)
-
-```bash
-# 下载配置文件
-curl -sSL https://cnb.cool/nexa/FunSpeech/-/git/raw/main/docker-compose.yml -o docker-compose.yml
-
-# 启动服务
-docker-compose up -d
+```
+                       ┌─────────────────────────┐
+   外部客户端 ────────► │  gateway (CPU)          │
+   (HTTP/WS)           │  - Aliyun/OpenAI 协议   │
+                       │  - 句子状态机 + ITN     │
+                       │  - 采样率/格式转换      │
+                       └────────┬────────────────┘
+                                │ HTTP / WS (X-Internal-Token)
+                 ┌──────────────┴──────────────┐
+                 │                             │
+        ASR 后端(可多选)                 TTS 后端(同一网关单选)
+                 │                             │
+       ┌─────────┼─────────┐        ┌──────────┼──────────┬──────────────┐
+       ▼         ▼         ▼        ▼          ▼          ▼              ▼
+   funasr    dolphin   qwen3-asr  cosyvoice  qwen3-tts  qwen3-tts      cosyvoice3
+ Paraformer/ Dataocean Qwen3-ASR  CosyVoice2/ Qwen3-TTS  vLLM-Omni      vLLM-Omni
+ SenseVoice  Dolphin   (vLLM)     CosyVoice3  local      Speech API     Speech API
 ```
 
-服务将在 `http://localhost:8000` 启动
+子服务各自一个 `pyproject.toml` + `uv.lock` + Dockerfile,依赖完全隔离。
+例如 funasr 用 transformers 4.51.3,qwen3-asr 用 transformers 4.57.1 + vLLM 0.11+,
+Qwen3-TTS / CosyVoice3 vLLM-Omni 用独立镜像启动 `vllm serve --omni`,互不冲突。
 
-**GPU 部署**请将 docker-compose.yml 文件中的 image 替换为 **docker.cnb.cool/nexa/funspeech:gpu-latest**
+## 快速开始
 
-> 💡 详细部署说明(包括 CPU/GPU 版本区别、环境变量配置)请查看 [部署指南](./docs/deployment.md)
-
-### 服务器本地构建/打包
-
-在服务器源码目录中可直接用脚本构建镜像并导出 `tar.gz` 包:
+### 1. 准备环境
 
 ```bash
-# CPU 镜像: funspeech:latest -> dist/funspeech-latest.tar.gz
-bash scripts/build-docker.sh cpu
-
-# GPU 镜像: funspeech:gpu-latest -> dist/funspeech-gpu-latest.tar.gz
-bash scripts/build-docker.sh gpu
-
-# 同时构建 CPU + GPU
-bash scripts/build-docker.sh all
-```
-
-常用参数:
-
-```bash
-# 指定镜像名/版本并推送到镜像仓库
-bash scripts/build-docker.sh all --image docker.cnb.cool/nexa/funspeech --tag v1.0.0 --gpu-tag gpu-v1.0.0 --push
-
-# 只构建镜像,不导出 tar.gz
-bash scripts/build-docker.sh cpu --no-save
-```
-
-### 数据持久化
-
-FunSpeech 会在以下目录存储持久化数据:
-
-- **`./data`** - 数据库文件(异步 TTS 任务记录等)
-- **`./temp`** - 临时文件(音频缓存等)
-- **`./logs`** - 日志文件
-- **`./voices`** - 零样本音色文件
-
-Docker Compose 已自动配置数据卷映射,确保容器重启后数据不丢失。
-
-对于要使用和下载的模型,您可以在运行中动态下载,也可以提前从 ModelScope 下载后映射,需要的模型在 [支持的模型](#-支持的模型),同时注意提前规划好存储空间以免存储空间不足无法下载～
-
-### 并发配置
-
-FunSpeech 支持多路并发处理,通过以下环境变量配置:
-
-| 环境变量 | 默认值 | 说明 |
-|----------|--------|------|
-| `WORKERS` | `1` | Worker进程数,每个进程加载独立模型(内存×N) |
-| `INFERENCE_THREAD_POOL_SIZE` | `auto` | 推理线程池大小,确保事件循环不阻塞 |
-| `TTS_GPUS` | `""` | TTS GPU配置: `""` (自动), `cpu`, `0` (单卡), `0,1` (多卡) |
-| `ASR_GPUS` | `""` | ASR GPU配置: `""` (自动), `cpu`, `0` (单卡), `0,1` (多卡) |
-| `REALTIME_TTS_GLOBAL_MAX_INFLIGHT` | `2` | Realtime Voice 全局同时合成任务数 |
-| `REALTIME_TTS_GLOBAL_QUEUE_SIZE` | `16` | Realtime Voice 全局 TTS 排队长度 |
-| `REALTIME_AUDIO_INPUT_MAX_MS` | `1800` | Realtime Voice 单会话音频输入缓冲上限 |
-
-**配置示例:**
-
-```yaml
-# docker-compose.yml
-environment:
-  - WORKERS=2                        # 2个Worker进程
-  - INFERENCE_THREAD_POOL_SIZE=4     # 每个Worker 4个推理线程
-  - TTS_GPUS=0,1                     # TTS在GPU 0和1上各创建副本
-  - ASR_GPUS=0,1                     # ASR在GPU 0和1上各创建副本
-```
-
-> 💡 详细配置说明和资源规划请查看 [部署指南 - 并发配置](./docs/deployment.md#并发配置)
-
-### 本地开发
-
-**系统要求:**
-
-- Python 3.10+
-- CUDA 12.1+(可选,用于 GPU 加速)
-- FFmpeg(音频格式转换)
-
-**安装步骤:**
-
-```bash
-# 克隆项目
+git clone https://cnb.cool/nexa/FunSpeech.git
 cd FunSpeech
+
+# 必须: 拉 cosyvoice 上游源码 (git submodule)
+# 不做这一步, cosyvoice 镜像启动会 ModuleNotFoundError
 git submodule update --init --recursive
 
-# 安装依赖
-pip install -r dependencies/requirements.txt
-
-# 根据运行环境安装 CosyVoice 依赖
-pip install -r dependencies/CosyVoice/requirements-cpu.txt
-# 或 GPU 环境:
-# pip install -r dependencies/CosyVoice/requirements-gpu.txt
-
-# 启动服务
-python main.py
+cp .env.example .env  # 按需修改
 ```
 
-## 🛠️ 脚本工具
-
-脚本依赖可按需安装:
+如果机器在国内,把代理放进 `.env`:
 
 ```bash
-pip install numpy matplotlib soundfile websockets tqdm
+HTTP_PROXY=http://host.docker.internal:7890   # macOS/Windows Docker Desktop
+HTTPS_PROXY=http://host.docker.internal:7890
+# Linux 服务器: 改成宿主机 LAN IP, 例如 http://192.168.1.10:7890
 ```
 
-### Docker 构建脚本
+### 2. 构建 + 启动
 
-`scripts/build-docker.sh` 用于在服务器源码目录构建 CPU/GPU 镜像并可选导出离线包:
+Dockerfile 用了 `RUN --mount=type=cache` 给 apt / uv 双缓存,需要 BuildKit。Docker 23+ 默认开启;低版本手动启用:
 
 ```bash
-bash scripts/build-docker.sh cpu
-bash scripts/build-docker.sh gpu
-bash scripts/build-docker.sh all --image docker.cnb.cool/nexa/funspeech --tag v1.0.0 --gpu-tag gpu-v1.0.0 --push
+export DOCKER_BUILDKIT=1
+export COMPOSE_DOCKER_CLI_BUILD=1
 ```
 
-### RMS 音频分析
-
-`scripts/analyze_audio_rms.py` 用于分析录音 RMS 能量时序,辅助调优流式 ASR 远场过滤阈值:
-
 ```bash
-# 基础分析
-python scripts/analyze_audio_rms.py audio.wav
-
-# 指定声道、阈值并保存图表
-python scripts/analyze_audio_rms.py recording.wav \
-  --channel right \
-  --threshold 0.015 \
-  --output rms_analysis.png
-
-# 仅输出统计信息
-python scripts/analyze_audio_rms.py recording.wav --no-plot
+docker compose build                         # 重 build 时 apt/uv 走本机缓存,极快
+docker compose up -d                         # 默认: gateway + qwen3-asr + cosyvoice
+docker compose --profile funasr up -d        # 加上 funasr (paraformer/sensevoice)
+docker compose --profile dolphin up -d       # 加上 dolphin
+TTS_ENGINE=qwen3-tts docker compose up -d gateway qwen3-asr-0 qwen3-tts-0  # 改用 Qwen3-TTS Base Clone
+TTS_ENGINE=qwen3-tts-vllm-omni docker compose up -d gateway qwen3-asr-0 qwen3-tts-vllm-omni-0
+TTS_ENGINE=cosyvoice3-vllm-omni docker compose up -d gateway qwen3-asr-0 cosyvoice3-vllm-omni-0
+docker compose --profile funasr --profile dolphin up -d   # 全部 ASR 引擎
 ```
 
-常用参数: `--channel stereo|left|right`、`--threshold 0.01`、`--chunk-size 240`、`--output`、`--no-plot`。详细说明见 [scripts/README.md](./scripts/README.md)。
+非默认 TTS 后端请显式指定服务名,不要只加 profile;否则默认 `cosyvoice-0` 也会随默认服务启动。
 
-### ASR/TTS 并发基准测试
+服务暴露在 `http://localhost:${GATEWAY_PORT:-8000}`。
 
-`scripts.benchmark.run` 用于压测 `/ws/v1/asr` 和 `/ws/v1/tts` 的并发性能,生成 Markdown 报告和图表:
-
-```bash
-# 完整测试(ASR + TTS)
-python -m scripts.benchmark.run --audio-file test.wav
-
-# 仅测试 TTS
-python -m scripts.benchmark.run --test-type tts --voice 中文女
-
-# 自定义并发级别和远程地址
-python -m scripts.benchmark.run \
-  --host 192.168.1.100 \
-  --port 8000 \
-  --audio-file test.wav \
-  --concurrency 5 10 20 50 100
-```
-
-常用参数: `--host`、`--port`、`--audio-file`、`--test-type asr|tts|both`、`--concurrency`、`--output`、`--timeout`、`--voice`。详细说明见 [benchmark 文档](./scripts/benchmark/README.md)。
-
-### Realtime Voice 压测
-
-`scripts/benchmark/realtime_voice_pressure.py` 用于压测 `/ws/v1/realtime/voice`,输入本地 WAV 文件并输出每个并发档位的延迟、事件数、背压统计:
+### 3. 验证
 
 ```bash
-python scripts/benchmark/realtime_voice_pressure.py \
-  --base-url http://localhost:8000 \
-  --audio test.wav \
-  --voice desktop_voice \
-  --levels 1,2,4 \
-  --duration 12 \
-  --chunk-ms 100 \
-  --output benchmark_results/realtime_voice.json
-```
+# 健康
+curl http://localhost:8000/stream/v1/asr/health
+curl http://localhost:8000/stream/v1/tts/health
 
-输入音频会被脚本转换为 16kHz PCM16 mono。常用参数: `--base-url`、`--audio`、`--voice`、`--levels`、`--duration`、`--chunk-ms`、`--realtime-factor`、`--drain-seconds`、`--timeout`、`--output`。
-
-## 📚 API 接口
-
-### ASR(语音识别)
-
-| 端点                          | 方法      | 功能                             |
-| ----------------------------- | --------- | -------------------------------- |
-| `/stream/v1/asr`              | POST      | 一句话语音识别                   |
-| **`/rest/v1/asr/async`**      | **POST**  | **提交长录音异步识别任务** 🆕    |
-| **`/rest/v1/asr/async`**      | **GET**   | **查询长录音异步识别结果** 🆕    |
-| **`/ws/v1/asr`**              | WebSocket | **双向流式语音识别**             |
-| `/ws/v1/asr/test`             | GET       | WebSocket ASR 测试页面           |
-| `/stream/v1/asr/models`       | GET       | 模型列表                         |
-| `/stream/v1/asr/health`       | GET       | 健康检查                         |
-
-**完整接口文档:**
-
-- 一句话 ASR：[阿里云一句话语音识别 API](https://help.aliyun.com/zh/isi/developer-reference/restful-api-2)
-- 流式 ASR：[Websocket 协议说明](https://help.aliyun.com/zh/isi/developer-reference/websocket)
-
-**特殊说明:**
-
-- 一句话识别限制音频时长 60 秒
-- 一句话和异步 ASR 均支持 `hotwords` 临时热词、`vocabulary_id` 热词表、`disfluency` 语气词过滤
-- SenseVoice 可通过 `enable_emotion=true` 返回情感标签,通过 `return_rich_text=true` 返回模型原始 rich transcription 文本
-- 异步 ASR 支持 `audio_address`(HTTP/HTTPS) 或 `audio_bytes`(0-255 整数数组)作为输入,长录音默认启用 VAD
-
-**流式ASR高级功能:**
-
-- **远场声音过滤** 🆕 - 自动过滤远场声音和环境音，减少误触发
-  - 基于RMS能量阈值检测
-  - 零性能开销（<0.1ms），完全可配置
-  - 默认启用，详见 [远场过滤文档](./docs/nearfield_filter.md)
-- **Voice Cloner 字段** - WebSocket 识别结果会携带 `task_id`、`text`、`is_final`、`confidence`、`duration_ms` 等稳定字段,便于桌面端消费
-
-### TTS(语音合成)
-
-| 端点                            | 方法      | 功能                        |
-| ------------------------------- | --------- | --------------------------- |
-| `/stream/v1/tts`                | POST      | 语音合成                    |
-| `/openai/v1/audio/speech`       | POST      | OpenAI 兼容接口             |
-| **`/rest/v1/tts/async`**        | **POST**  | **提交异步语音合成任务** 🚀 |
-| **`/rest/v1/tts/async`**        | **GET**   | **查询异步语音合成结果** 🚀 |
-| `/stream/v1/tts/voices`         | GET       | 音色列表                    |
-| `/stream/v1/tts/voices/info`    | GET       | 音色详细信息                |
-| `/stream/v1/tts/voices/refresh` | POST      | 刷新音色配置                |
-| **`/stream/v1/tts/emotions`**   | **GET**   | **情感控制标签列表** 🆕     |
-| `/stream/v1/tts/health`         | GET       | 健康检查                    |
-| **`/ws/v1/tts`**                | WebSocket | **双向流式语音合成** 🚀     |
-| `/ws/v1/tts/test`               | GET       | WebSocket 测试页面          |
-
-**完整接口文档:**
-
-- 基础 TTS: [语音合成 RESTful API](https://help.aliyun.com/zh/isi/developer-reference/restful-api-3)
-- 流式 TTS: [Websocket 协议说明](https://help.aliyun.com/zh/isi/developer-reference/websocket-protocol-description)
-- 异步 TTS: [阿里云异步长文本语音合成 RESTful API](https://help.aliyun.com/zh/isi/developer-reference/restful-api)
-
-**特殊说明:**
-
-- 合成传入采样率中，CosyVoice1 采样率固定（默认）为 22050，CosyVoice2 采样率固定（默认）为 24000
-- `/stream/v1/tts` 支持 `volume`(0-100)、`pitch_rate`(-500~500)、`prompt`、`emotion`、`emotion_intensity` 等控制参数
-- `/openai/v1/audio/speech` 兼容 OpenAI 请求格式,`instructions` 会映射为本项目的音色指导 `prompt`
-
-### Voice Cloner / 实时变声
-
-| 端点                              | 方法      | 功能                                      |
-| --------------------------------- | --------- | ----------------------------------------- |
-| **`/voices/v1/voice-design`**     | **POST**  | **根据音色设计指令生成参考音频** 🆕       |
-| **`/voices/v1/list`**             | **GET**   | **首次启动全量同步 voice_manager 音色**   |
-| **`/voices/v1/register`**         | **POST**  | **增量注册桌面端自定义音色**              |
-| **`/voices/v1/update`**           | **POST**  | **增量更新桌面端自定义音色**              |
-| **`/voices/v1/delete`**           | **POST**  | **增量删除桌面端自定义音色**              |
-| **`/voices/v1/refresh`**          | **POST**  | **重新扫描并加载 voice_manager 音色**     |
-| **`/ws/v1/realtime/voice`**       | WebSocket | **实时 ASR->TTS 变声会话** 🆕             |
-
-**对接约定:**
-
-- 桌面端以唯一 `voice_name` 作为音色关联键;本项目不引入 `voice_id`
-- `/voices/v1/voice-design` 默认不静默降级,需要设置 `VOICE_DESIGN_PROVIDER=module.submodule:function` 注入 VoxCPM 参考音频生成函数
-- `register` / `update` 支持 JSON 的 `reference_audio_url`,也支持 multipart 的 `reference_audio` 文件上传
-- 预置音色名称不可被注册、覆盖或删除;找不到 `voice_name` 时会返回明确错误
-- Realtime Voice 连接后先收 `session_started`,再发送 `configure`,后续可发送 PCM 二进制音频块和 `update` 参数事件
-
-## 🎯 快速开始
-
-**ASR 语音识别:**
-
-```bash
+# ASR
 curl -X POST "http://localhost:8000/stream/v1/asr?format=wav&sample_rate=16000" \
-  -H "Content-Type: application/octet-stream" \
-  --data-binary @audio.wav
-```
+     -H "Content-Type: application/octet-stream" \
+     --data-binary @audio.wav
 
-**WebSocket 流式识别测试:** 访问 `http://localhost:8000/ws/v1/asr/test`
-
-**长录音异步识别:**
-
-```bash
-# 提交任务
-curl -X POST "http://localhost:8000/rest/v1/asr/async" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "payload": {
-      "asr_request": {
-        "audio_address": "https://example.com/long.wav",
-        "format": "wav",
-        "sample_rate": 16000,
-        "hotwords": "FunSpeech SenseVoice",
-        "disfluency": true
-      },
-      "enable_notify": false
-    },
-    "header": {"appkey": "your_appkey", "token": "your_token"}
-  }'
-
-# 查询结果
-curl "http://localhost:8000/rest/v1/asr/async?appkey=your_appkey&token=your_token&task_id=<task_id>"
-```
-
-**TTS 语音合成:**
-
-```bash
+# TTS (默认 CosyVoice 可直接用预设音色; Qwen3-TTS 需要先注册 clone voice)
 curl -X POST "http://localhost:8000/stream/v1/tts" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "你好，这是语音合成测试。",
-    "voice": "中文女",
-    "volume": 60,
-    "pitch_rate": 0,
-    "emotion": "happy",
-    "emotion_intensity": 0.8
-  }' \
-  --output speech.wav
+     -H "Content-Type: application/json" \
+     -d '{"text":"你好","voice":"中文女"}' \
+     --output speech.wav
 ```
 
-**WebSocket 流式合成测试:** 访问 `http://localhost:8000/ws/v1/tts/test`
+WebSocket 测试页:
 
-**异步 TTS:**
+- ASR: `http://localhost:8000/ws/v1/asr/test`
+- TTS: `http://localhost:8000/ws/v1/tts/test`
+
+## 服务列表
+
+| 服务 | 端口 | 镜像 | GPU | 默认启动 | profile |
+|---|---|---|---|---|---|
+| gateway | 8000 | funspeech/gateway | ❌ | ✅ | (默认) |
+| funasr-0 | 8001 | funspeech/funasr | ✅ | ❌ | `funasr` |
+| dolphin-0 | 8002 | funspeech/dolphin | ✅ | ❌ | `dolphin` |
+| qwen3-asr-0 | 8003 | funspeech/qwen3-asr | ✅ | ✅ | (默认, 默认 ASR 引擎) |
+| cosyvoice-0 | 8004 | funspeech/cosyvoice | ✅ | ✅ | (默认) |
+| qwen3-tts-0 | 8005 | funspeech/qwen3-tts | ✅ | ❌ | `qwen3-tts` |
+| qwen3-tts-vllm-omni-0 | 8006 | funspeech/qwen3-tts-vllm-omni | ✅ | ❌ | `qwen3-tts-vllm-omni` |
+| cosyvoice3-vllm-omni-0 | 8007 | funspeech/cosyvoice3-vllm-omni | ✅ | ❌ | `cosyvoice3-vllm-omni` |
+
+网关一次只选择一个 TTS 后端。默认是 `TTS_ENGINE=cosyvoice`;改用任一非默认 TTS 时显式启动 `gateway qwen3-asr-0 <tts-service>`，避免把默认 CosyVoice 一起拉起。legacy Qwen3-TTS 的 clone 音色持久化在 `./qwen3_voices`;vLLM-Omni Qwen3-TTS 和 CosyVoice3 分别使用 `./qwen3_omni_voices`、`./cosyvoice3_omni_voices`。4090 实测 Qwen3-TTS vLLM-Omni 能把 Base Clone 提到 2 req/s 以上,但约需 19-20 GiB 净显存;CosyVoice3 vLLM-Omni 当前吞吐接近默认 CosyVoice3,主要用于 vLLM-Omni 兼容验证和后续调优。
+
+每个子服务暴露 `GET /health` + 自有业务端点(详见各 `services/*/README.md`)。
+
+## 对外 API(网关)
+
+### ASR
+
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/stream/v1/asr` | POST | 一句话语音识别 |
+| `/v1/audio/transcriptions` | POST | OpenAI 兼容 ASR |
+| `/stream/v1/asr/models` | GET | 模型列表 |
+| `/stream/v1/asr/health` | GET | 健康检查 |
+| `/ws/v1/asr` | WS | 流式识别(Aliyun 协议) |
+
+可识别模型(`models.json`):`qwen3-asr-flash`(默认)、`paraformer-large`、`sensevoice-small`(后两者需 `--profile funasr`)、`dolphin-small`(需 `--profile dolphin`)。
+
+### TTS
+
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/stream/v1/tts` | POST | 语音合成(支持 `pitch_rate`、`emotion`) |
+| `/v1/audio/speech` | POST | OpenAI 兼容 TTS |
+| `/rest/v1/tts/async` | POST/GET | 异步长文本合成 |
+| `/stream/v1/tts/voices` | GET | 音色列表 |
+| `/stream/v1/tts/voices/info` | GET | 音色详细信息 |
+| `/stream/v1/tts/voices/refresh` | POST | 刷新网关音色列表缓存; 扫描目录请调对应子服务 `/voices/refresh` |
+| `/stream/v1/tts/emotions` | GET | 情感指令列表(emoji → instruct prompt) |
+| `/stream/v1/tts/health` | GET | 健康检查 |
+| `/ws/v1/tts` | WS | 双向流式合成(Aliyun 协议) |
+
+外部协议与之前的进程内版本完全兼容。
+
+### 扩展端点(桌面端 / Voice Cloner)
+
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/rest/v1/asr/async` | POST/GET | 异步长录音识别(音频 URL / 上传) |
+| `/ws/v1/realtime/voice` | WS | 实时语音流水线(ASR → TTS, 含回声/背压控制) |
+| `/voices/v1/list` | GET | 全量音色同步 |
+| `/voices/v1/register` | POST | 注册自定义音色(转发子服务 `/voices`) |
+| `/voices/v1/update` | POST | 更新自定义音色 |
+| `/voices/v1/delete` | POST | 删除自定义音色 |
+| `/voices/v1/refresh` | POST | 重新扫描/刷新音色 |
+| `/voices/v1/voice-design` | POST | 由 `VOICE_DESIGN_PROVIDER` 注入的后端生成参考音频 |
+
+`/ws/v1/realtime/voice` 的端点检测由网关侧 RMS/静音阈值(配置项 `ASR_VAD_*`)完成;
+本地 FSMN-VAD 模型已随进程内推理一并移除。
+
+## 配置(网关侧 env)
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `GATEWAY_PORT` | `8000` | 对外暴露端口 |
+| `APPTOKEN` / `APPKEY` | - | 外部鉴权(可选) |
+| `INTERNAL_SERVICE_TOKEN` | `funspeech-internal` | 网关→子服务鉴权头(`X-Internal-Token`) |
+| `ASR_MODEL_MODE` | `all` | `all` / `offline` / `realtime` |
+| `TTS_ENGINE` | `cosyvoice` | `cosyvoice` / `qwen3-tts` / `qwen3-tts-vllm-omni` / `cosyvoice3-vllm-omni`;选择 TTS 后端,同一网关只能选一个 |
+| `TTS_MODEL_MODE` | `all` | 网关音色列表过滤;legacy CosyVoice 用 `all` / `sft` / `clone`,Qwen3 系后端可用 `base` / `clone` / `customvoice` / `voicedesign` 过滤 preset/clone 返回,实际模型加载以子服务 env 为准 |
+| `ASR_ENABLE_REALTIME_PUNC` | `false` | 流式中间结果是否带标点 |
+| `AUTO_LOAD_CUSTOM_ASR_MODELS` | - | 启动时预热的额外 ASR 模型 id |
+| `FUNASR_SERVICE_URLS` | `http://funasr-0:8001` | 子服务 URL,逗号分隔多副本 |
+| `DOLPHIN_SERVICE_URLS` | `http://dolphin-0:8002` | |
+| `QWEN3_ASR_SERVICE_URLS` | `http://qwen3-asr-0:8003` | |
+| `COSYVOICE_SERVICE_URLS` | `http://cosyvoice-0:8004` | |
+| `QWEN3_TTS_SERVICE_URLS` | `http://qwen3-tts-0:8005` | `TTS_ENGINE=qwen3-tts` 时的本地开源 Qwen3-TTS Base Clone 子服务 |
+| `QWEN3_TTS_VLLM_OMNI_SERVICE_URLS` | `http://qwen3-tts-vllm-omni-0:8006` | `TTS_ENGINE=qwen3-tts-vllm-omni` 时的 vLLM-Omni Speech API 子服务 |
+| `COSYVOICE3_VLLM_OMNI_SERVICE_URLS` | `http://cosyvoice3-vllm-omni-0:8007` | `TTS_ENGINE=cosyvoice3-vllm-omni` 时的 vLLM-Omni Speech API 子服务 |
+| `SERVICE_REQUEST_TIMEOUT` | `60` | 子服务调用超时(秒) |
+| `INFERENCE_THREAD_POOL_SIZE` | `max(4, CPU 核数)` | 网关同步调用线程池大小;高 QPS 调大 |
+| `HTTPX_MAX_CONNECTIONS` | `200` | 网关→子服务 HTTP 连接池上限;>100 req/s 时调到 500+ |
+| `HTTPX_MAX_KEEPALIVE` | `50` | 保活连接数上限 |
+
+子服务专属 env(模型版本、TRT/FP16/vLLM 等)请见 `.env.example`、`docs/deployment.md §6` 和各 `services/*/README.md`。
+
+> 关于"GPU 并发数":子服务内部的 GPU 并发已在代码里硬编码 (funasr/dolphin=1, cosyvoice=2, qwen3-asr=Lock+vLLM 内部 batching), **不通过环境变量暴露**。横向扩展请用多副本, 见下文。
+
+## 开发
+
+### 单独跑某个子服务
 
 ```bash
-# 提交长文本合成任务
-curl -X POST "http://localhost:8000/rest/v1/tts/async" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "payload": {
-      "tts_request": {
-        "text": "这是一段需要异步合成的长文本。",
-        "voice": "中文女",
-        "format": "wav",
-        "sample_rate": 22050,
-        "enable_subtitle": true
-      },
-      "enable_notify": false
-    },
-    "header": {"appkey": "your_appkey", "token": "your_token"}
-  }'
-
-# 查询结果
-curl "http://localhost:8000/rest/v1/tts/async?appkey=your_appkey&token=your_token&task_id=<task_id>"
+cd services/funasr
+uv sync
+PORT=8001 INTERNAL_SERVICE_TOKEN=test uv run python server.py
 ```
 
-**音色设计与同步:**
+### 网关本地跑(连容器里的子服务)
 
 ```bash
-# 音色设计接口需要先注入 VoxCPM 生成函数
-export VOICE_DESIGN_PROVIDER="your_module.voice_design:generate_reference_audio"
-
-# 生成参考音频
-curl -X POST "http://localhost:8000/voices/v1/voice-design" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "voice_name": "desktop_voice",
-    "voice_instruction": "清亮、少年感、自然口语",
-    "reference_text": "今天的天气很好。",
-    "format": "wav",
-    "sample_rate": 24000
-  }'
-
-# 注册桌面端自定义音色
-curl -X POST "http://localhost:8000/voices/v1/register" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "voice_name": "desktop_voice",
-    "reference_text": "今天的天气很好。",
-    "voice_instruction": "清亮、少年感、自然口语",
-    "reference_audio_url": "https://example.com/desktop_voice.wav"
-  }'
+uv sync
+FUNASR_SERVICE_URLS=http://localhost:8001 \
+COSYVOICE_SERVICE_URLS=http://localhost:8004 \
+INTERNAL_SERVICE_TOKEN=funspeech-internal \
+uv run python start.py
 ```
 
-**Realtime Voice WebSocket 协议示例:**
+## 性能与副本规划
 
-```json
-{"event":"configure","voice_name":"desktop_voice","format":"pcm","sample_rate":16000,"pipeline":"asr_tts","parameters":{"volume":50,"speech_rate":0,"pitch_rate":0}}
-{"event":"update","parameters":{"pitch_rate":120,"emotion_control":"asr"}}
-```
+在 NVIDIA RTX 4090 24G 上的实测单副本容量 (完整数据见 [`benchmarks/`](./benchmarks/README.md)):
 
-发送 `configure` 后即可持续发送 16kHz PCM16 mono 二进制音频块;服务端会返回 `asr.hypothesis`、`asr.text_committed`、`tts.first_audio`、音频二进制帧、`session_completed` 等事件。
+| 子服务 | 单副本容量 | 单条延迟 | 显存 |
+|---|---|---|---|
+| funasr (all) | **~12 req/s** | ~80 ms | ~3 GiB |
+| dolphin | ~12 req/s | ~80 ms | ~1 GiB |
+| qwen3-asr | **~5 req/s** (vLLM 内部 batch 可吃 64 并发) | ~190 ms | **0.85 × 卡显存** (vLLM KV pool) |
+| cosyvoice (clone) | **2 路实时 TTS** (RTF ≈ 1.05) | ~3.5 s / 句 | ~4 GiB |
+| qwen3-tts | 不按实时容量规划 | ~10.3 s / 句 | ~3 GiB |
+| qwen3-tts-vllm-omni | **8 路实时 TTS** (N=8 mean RTF ≈ 0.81) | ~0.9 s / 句 | ~19-20 GiB |
+| cosyvoice3-vllm-omni | **2 路实时 TTS** | ~6.1 s / 句 | ~10-12 GiB |
 
-> 💡 更多示例请查看 `tests/` 目录或访问 `http://localhost:8000/docs`(开发模式)
+> ASR 看 req/s, TTS 看"几路实时" (RTF ≤ 1)。legacy Qwen3-TTS 本地后端单路已慢于实时;需要 Qwen3-TTS 性能时优先用 `qwen3-tts-vllm-omni`。
 
-## 🎵 音色系统
+扩容优先用多卡多副本。`qwen3-asr` 和 `qwen3-tts-vllm-omni` 这类 vLLM 后端通常独占 GPU;legacy CosyVoice 在显存足够时可以同卡多副本,但按约 0.85 折扣估算容量。具体用 `scripts/plan_deployment.py` 生成拓扑。
 
-### 智能音色列表
-
-音色列表 API (`/stream/v1/tts/voices`) 会根据当前的模型模式智能返回对应的音色:
-
-- **sft 模式**: 仅返回预设音色列表(7 个)
-- **clone 模式**: 仅返回零样本克隆音色列表(允许为空)
-- **all 模式**: 返回所有音色列表(预设+零样本克隆)
-
-### 预训练音色
-
-- **中文女** - 温柔甜美的女性音色
-- **中文男** - 深沉稳重的男性音色
-- **英文女** - 清晰自然的英文女性音色
-- **英文男** - 低沉磁性的英文男性音色
-- **日语男** - 标准的日语男性音色
-- **韩语女** - 清新可爱的韩语女性音色
-- **粤语女** - 地道的粤语女性音色
-
-### 零样本克隆音色
-
-**准备音色文件:**
-
-克隆音色需要准备一对文件:
-
-- **音频文件** (`*.wav`): 3-30 秒,清晰无噪音,建议 16kHz+ 采样率
-- **文本文件** (`*.txt`): 音频对应的文字内容,需完全匹配
-
-文件命名必须一致,例如: `张三.wav` 和 `张三.txt`
-
-**添加新音色:**
+用规划脚本一键算出应该开几副本 / 怎么绑卡, 并在当前目录生成完整 `docker-compose.generated.yml`:
 
 ```bash
-# 1. 将音频和文本文件放入 voices 目录
-mkdir -p ./voices
-cp 张三.wav 张三.txt ./voices/
-
-# 2. 运行音色管理工具添加
-python -m app.services.tts.clone.voice_manager --add
-
-# 3. 验证音色
-curl "http://localhost:8000/stream/v1/tts/voices"
+python3 scripts/plan_deployment.py                  # 交互式
+python3 scripts/plan_deployment.py --preset 4090-quad   # 看预设
+python3 scripts/plan_deployment.py --list-presets
 ```
 
-**音色管理命令:**
+详细说明见 [`docs/deployment.md §4.3`](./docs/deployment.md)。
 
-```bash
-python -m app.services.tts.clone.voice_manager --list           # 列出所有音色
-python -m app.services.tts.clone.voice_manager --remove <名称>  # 删除音色
-python -m app.services.tts.clone.voice_manager --info <名称>    # 查看音色信息
-python -m app.services.tts.clone.voice_manager --refresh        # 刷新音色列表
-```
+## 模型权重缓存
 
-**使用克隆音色:**
+GPU 子服务使用两类权重缓存:
 
-```bash
-curl -X POST "http://localhost:8000/stream/v1/tts" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "你好，这是使用克隆音色的测试。",
-    "voice": "张三"
-  }' \
-  --output cloned_voice.wav
-```
+| 缓存 | 默认宿主机路径 | 容器路径 | 主要使用者 |
+|---|---|---|---|
+| `MODELSCOPE_CACHE` | `~/.cache/modelscope/hub/models` | `/root/.cache/modelscope/hub` | FunASR / CosyVoice / Qwen3-ASR |
+| `HF_CACHE` | `~/.cache/huggingface` | `/root/.cache/huggingface` | Qwen3-TTS / vLLM-Omni TTS |
 
-**音色指导功能:**
+因此即便各子服务 transformers / qwen 包版本不同,权重文件也可以跨容器重用。
 
-对于零样本克隆音色,可以使用 `prompt` 参数进行音色指导:
-
-```bash
-curl -X POST "http://localhost:8000/stream/v1/tts" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "欢迎使用语音服务",
-    "voice": "张三",
-    "prompt": "说话温柔一些，像客服一样亲切"
-  }' \
-  --output guided_voice.wav
-```
-
-> ⚠️ 注意: 音色指导功能仅适用于零样本克隆音色(CosyVoice2 模型)
-
-## 🤖 支持的模型
-
-服务会在首次使用时自动从 ModelScope 下载模型,也可以提前手动下载以加快启动速度。
-
-### TTS 模型 (语音合成)
-
-通过环境变量 `TTS_MODEL_MODE` 控制加载模式。
-
-| 模型名称               | 加载模式             | 大小  | 说明                              | ModelScope 链接                                         |
-| ---------------------- | -------------------- | ----- | --------------------------------- | ------------------------------------------------------- |
-| **CosyVoice-300M-SFT** | `sft` / `all` | 5.4GB | 预训练音色模型,支持 7 种预设音色  | https://www.modelscope.cn/models/iic/CosyVoice-300M-SFT |
-| **CosyVoice2-0.5B**    | `clone` / `all` | 5.5GB | 零样本克隆模型,支持音色克隆和指导 | https://www.modelscope.cn/models/iic/CosyVoice2-0.5B    |
-| **Fun-CosyVoice3-0.5B** | `clone` / `all` | 5.5GB | CosyVoice3 零样本克隆模型 | https://www.modelscope.cn/models/FunAudioLLM/Fun-CosyVoice3-0.5B-2512 |
-
-**模式说明:**
-
-- `TTS_MODEL_MODE=sft` - 仅加载预设音色模型 (~5.4GB)
-- `TTS_MODEL_MODE=clone` - 仅加载音色克隆模型 (~5.5GB)
-- `TTS_MODEL_MODE=all` - 加载全部模型 (~11GB,默认)
-
-**克隆模型版本选择:**
-
-通过 `CLONE_MODEL_VERSION` 环境变量选择克隆模型版本:
-- `CLONE_MODEL_VERSION=cosyvoice3` - 使用 Fun-CosyVoice3-0.5B-2512 (默认)
-- `CLONE_MODEL_VERSION=cosyvoice2` - 使用 CosyVoice2-0.5B
-
-### ASR 模型 (语音识别)
-
-通过环境变量 `ASR_MODEL_MODE` 控制加载模式。
-
-| 模型名称                    | 加载模式           | 大小  | 说明                               | ModelScope 链接                                                                                         |
-| --------------------------- | ------------------ | ----- | ---------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| **SenseVoice Small**        | `offline` / `realtime` / `all` | 897MB | 默认模型；离线识别 + VAD 驱动窗口化伪流式实时识别 | https://www.modelscope.cn/models/iic/SenseVoiceSmall                                                    |
-| **Paraformer Large (离线)** | 按需加载  | 848MB | 兼容的中文离线识别模型        | https://www.modelscope.cn/models/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch |
-| **Paraformer Large (流式)** | 按需加载 | 848MB | 兼容的中文实时流式识别             | https://www.modelscope.cn/models/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online  |
-| **Dolphin Small**           | 按需加载           | 600MB | 轻量级多语言识别模型               | https://www.modelscope.cn/models/DataoceanAI/dolphin-small                                              |
-
-**模式说明:**
-
-- `ASR_MODEL_MODE=realtime` - 默认加载 SenseVoiceSmall 离线模型，并通过 `ASR_STREAMING_STRATEGY=windowed_offline` 提供 WebSocket 实时协议
-- `ASR_MODEL_MODE=offline` - 仅加载离线模型 (~897MB,默认 SenseVoiceSmall)
-- `ASR_MODEL_MODE=all` - 加载默认模型可用形态；SenseVoiceSmall 没有独立 realtime 权重
-
-**自定义模型预加载:**
-
-默认情况下，SenseVoiceSmall 会在启动时自动加载。如果需要在启动时预加载其他模型（如 Paraformer、Dolphin），可以使用 `AUTO_LOAD_CUSTOM_ASR_MODELS` 环境变量：
-
-```bash
-# 预加载单个自定义模型
-export AUTO_LOAD_CUSTOM_ASR_MODELS="paraformer-large"
-
-# 预加载多个自定义模型（逗号分隔）
-export AUTO_LOAD_CUSTOM_ASR_MODELS="sensevoice-small,dolphin-small"
-```
-
-这样在启动时就会自动下载并加载指定的模型，避免首次调用时的等待时间。模型配置详见 `app/services/asr/models.json`。
-
-### 辅助模型
-
-| 模型名称             | 类型       | 大小  | 说明                                                                    | ModelScope 链接                                                                                |
-| -------------------- | ---------- | ----- | ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| **PUNC Transformer** | 标点预测   | 283MB | 为离线识别结果添加标点符号                                              | https://www.modelscope.cn/models/iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch      |
-| **PUNC Realtime**    | 实时标点   | 279MB | 为实时识别中间结果添加标点(可选,需设置 `ASR_ENABLE_REALTIME_PUNC=true`) | https://www.modelscope.cn/models/iic/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727 |
-| **FSMN VAD**         | 语音检测   | 3.9MB | 检测语音片段,过滤静音和噪音                                             | https://www.modelscope.cn/models/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch                  |
-| **CAM++ Speaker**    | 说话人识别 | 28MB  | 说话人特征提取(未启用)                                                  | https://www.modelscope.cn/models/iic/speech_campplus_sv_zh-cn_16k-common                       |
-
-### 提前下载模型
-
-**安装 ModelScope CLI:**
+提前下载:
 
 ```bash
 pip install modelscope
-```
-
-**下载 TTS 模型:**
-
-```bash
-# 预设音色模型 (TTS_MODEL_MODE=sft 或 all)
 modelscope download --model iic/CosyVoice-300M-SFT
-
-# 音色克隆模型 - CosyVoice3 (CLONE_MODEL_VERSION=cosyvoice3,默认)
 modelscope download --model FunAudioLLM/Fun-CosyVoice3-0.5B-2512
-
-# 音色克隆模型 - CosyVoice2 (CLONE_MODEL_VERSION=cosyvoice2)
-modelscope download --model iic/CosyVoice2-0.5B
-```
-
-**下载 ASR 模型:**
-
-```bash
-# 默认离线/实时协议模型
-modelscope download --model iic/SenseVoiceSmall
-
-# 可选兼容模型
 modelscope download --model iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch
 modelscope download --model iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online
+modelscope download --model iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch
+modelscope download --model iic/speech_fsmn_vad_zh-cn-16k-common-pytorch
+# 按需:
+modelscope download --model DataoceanAI/dolphin-small
+modelscope download --model Qwen/Qwen3-ASR-1.7B
 ```
 
-**下载辅助模型(按需):**
+Qwen3-TTS / vLLM-Omni TTS 预下载:
 
 ```bash
-# 标点预测模型(离线识别使用)
-modelscope download --model iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch
-
-# 实时标点模型(实时识别使用,可选)
-modelscope download --model iic/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727
-
-# VAD 模型
-modelscope download --model iic/speech_fsmn_vad_zh-cn-16k-common-pytorch
+HF_ENDPOINT=https://hf-mirror.com huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-Base
+HF_ENDPOINT=https://hf-mirror.com huggingface-cli download FunAudioLLM/Fun-CosyVoice3-0.5B-2512
+# 如果切到 Qwen3-TTS CustomVoice / VoiceDesign,按 QWEN3_TTS_OMNI_MODEL_ID 下载对应仓库
 ```
 
-> 💡 **提示**: 模型默认下载到 `~/.cache/modelscope/hub`,Docker 部署时需映射此目录以复用模型文件。
+## 音色管理(克隆)
 
-### 存储空间规划
+CosyVoice 和 Qwen3-TTS 使用不同的音色目录,不要混用:
 
-根据使用场景规划所需存储空间:
+| TTS 后端 | 目录 | 模型语义 | 说明 |
+|---|---|---|---|
+| `cosyvoice` | `./voices` | 预设音色 + clone | `TTS_MODEL_MODE=all/clone` 时支持 clone |
+| `qwen3-tts` | `./qwen3_voices` | Base Clone only | 没有 `中文女` 这类预设音色,合成前必须先注册 clone voice |
+| `qwen3-tts-vllm-omni` | `./qwen3_omni_voices` | Base Clone / CustomVoice / VoiceDesign | Base 模型支持上传 clone;CustomVoice/VoiceDesign 走上游预置声线 |
+| `cosyvoice3-vllm-omni` | `./cosyvoice3_omni_voices` | Clone only | vLLM-Omni Speech API 模式没有内置 `中文女`,合成前必须先注册 clone voice |
 
-| 场景           | 环境变量配置                                             | 所需模型                   | 总大小 |
-| -------------- | -------------------------------------------------------- | -------------------------- | ------ |
-| **最小部署**   | `TTS_MODEL_MODE=sft`<br>`ASR_MODEL_MODE=offline`  | 1 个 TTS + SenseVoiceSmall + 辅助 | ~7GB   |
-| **实时流式**   | `TTS_MODEL_MODE=sft`<br>`ASR_MODEL_MODE=realtime` | 1 个 TTS + SenseVoiceSmall + FSMN VAD + 辅助 | ~7GB   |
-| **完整 TTS**   | `TTS_MODEL_MODE=all`<br>`ASR_MODEL_MODE=offline`         | 2 个 TTS + 离线 ASR + 辅助 | ~12GB  |
-| **全功能部署** | `TTS_MODEL_MODE=all`<br>`ASR_MODEL_MODE=all`             | 全部模型                   | ~14GB  |
+CosyVoice:把 `张三.wav` + `张三.txt` 放到 `./voices/` 卷,然后直接调用 cosyvoice 子服务扫描:
 
-### API 文档
+```bash
+curl -X POST \
+  -H "X-Internal-Token: ${INTERNAL_SERVICE_TOKEN:-funspeech-internal}" \
+  http://localhost:8004/voices/refresh
+```
 
-- **开发模式**: 访问 `http://localhost:8000/docs` 查看完整 API 文档
-- **生产模式**: API 文档自动隐藏
+Qwen3-TTS Base Clone:直接上传参考音频和准确参考文本到对应子服务:
 
-## 🌐 相关链接
+```bash
+curl -F name=zhangsan \
+  -F prompt_text='参考音频对应的准确文本' \
+  -F audio=@./ref.wav \
+  -H "X-Internal-Token: ${INTERNAL_SERVICE_TOKEN:-funspeech-internal}" \
+  http://localhost:8005/voices
+# vLLM-Omni Qwen3 Base 用 8006;CosyVoice3 vLLM-Omni 用 8007
+```
 
-- **部署指南**: [详细文档](./docs/deployment.md)
-- **远场过滤配置**: [配置指南](./docs/nearfield_filter.md)
-- **Voice Cloner 对接说明**: [一期功能增补清单](./docs/voice-cloner-api-additions.md)
-- **CosyVoice 模型**: [CosyVoice GitHub](https://github.com/FunAudioLLM/CosyVoice)
-- **Dolphin 模型**: [DataoceanAI/Dolphin](https://github.com/DataoceanAI/Dolphin)
-- **FunASR**: [FunASR GitHub](https://github.com/alibaba-damo-academy/FunASR)
+之后合成时使用注册名:
 
-## 📋 TODO
+```bash
+curl -X POST "http://localhost:8000/stream/v1/tts" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"你好","voice":"zhangsan"}' \
+  --output speech.wav
+```
 
-- [x] 实现 ASR 热词功能 (`vocabulary_id` / `hotwords`)
-- [x] 实现过滤语气词功能 (`disfluency`)
-- [x] 实现 TTS 语调控制 (`pitch_rate`)
-- [x] 实现长录音文件异步识别接口
-- [x] 实现 Voice Cloner 音色设计、音色同步与 Realtime Voice 对接接口
+所有音色状态会持久化到各自目录:CosyVoice 是 `spk2info.pt` + `voice_registry.json`,legacy Qwen3-TTS 是参考音频、`prompts/*.pt` 和 `voice_registry.json`,vLLM-Omni TTS 是参考音频、文本和 `voice_registry.json`。
 
-## 📄 许可证
+## 已知设计取舍
 
-本项目采用 MIT 许可证 - 查看 [LICENSE](LICENSE) 文件了解详情。
+- **legacy CosyVoice 进程内 vLLM 默认关闭**:`TTS_LOAD_VLLM` 只控制 `services/cosyvoice` 里的 LLM 段加速。vLLM 0.11+ 要求 transformers ≥4.55,
+  与 CosyVoice 主代码所需的 4.51.3 冲突。如果性能瓶颈明显,可拆出 `services/cosyvoice_vllm/`
+  独立 venv 启用,见 `services/cosyvoice/README.md` 的多副本注释。`qwen3-tts-vllm-omni` / `cosyvoice3-vllm-omni` 是独立 `vllm serve --omni` 子服务,不受 `TTS_LOAD_VLLM` 影响。
+- **Qwen3-ASR 流式不走 vLLM 通用 `/v1/realtime`**:vLLM 通用 realtime 端点对
+  Qwen3-ASR 质量明显劣化(无跨段上下文、无 token 修订,见 vllm Issue #35767)。
+  我们用官方 `qwen_asr.Qwen3ASRModel.streaming_transcribe` + `init_streaming_state`,
+  在子服务进程内跑,具备 unfixed_chunk / unfixed_token 修订能力。
+- **Qwen3-ASR 子服务进程内 GPU 串行**: vLLM 的 Python `LLM(...)` 入口
+  非线程安全, 子服务用 `asyncio.Lock` 保证只有一个调用进 vLLM。这**不影响** vLLM
+  自身的 continuous batching (batching 在 engine 内部), 但要靠多副本扩吞吐。
+- **音色 CRUD 多副本同步**: URL 列表第一个 = 写副本 (primary)。通过网关 TTS engine 的
+  `voice_manager` 写入时会自动路由到 primary,写后广播 `POST /voices/reload`。
+  直接调用子服务接口时请打到 primary。详见 [`docs/deployment.md §5.2`](./docs/deployment.md)。
 
-## 🤝 贡献
+## 目录结构
 
-欢迎提交 Issue 和 Pull Request 来改进项目!
+```
+.
+├── app/                       # 网关代码
+│   ├── api/v1/                # FastAPI 路由 (Aliyun + OpenAI)
+│   ├── services/asr/          # ASR 引擎抽象 + HTTP 客户端
+│   ├── services/tts/          # TTS 引擎抽象 + HTTP 客户端 (含 voice_manager)
+│   ├── services/websocket_*.py
+│   ├── core/config.py         # 网关 env
+│   └── utils/audio.py         # 重采样、PCM/WAV 转码、ITN
+├── services/                  # 各子服务(独立 venv + Dockerfile)
+│   ├── funasr/
+│   ├── dolphin/
+│   ├── qwen3_asr_vllm/
+│   ├── cosyvoice/             # third_party/CosyVoice 是官方 submodule
+│   ├── qwen3_tts/
+│   ├── qwen3_tts_vllm_omni/
+│   ├── cosyvoice3_vllm_omni/
+│   └── vllm_omni_tts_common/
+├── scripts/
+│   ├── plan_deployment.py     # 副本规划 (零依赖)
+│   └── analyze_audio_rms.py   # 远场过滤阈值分析
+├── benchmarks/                # 4090 实测数据 + 测试脚本 (git-lfs)
+│   ├── README.md
+│   ├── scripts/               # bench_tts.py / bench_asr.py / ...
+│   ├── audio/                 # TTS 生成的测试样本
+│   └── results/               # 结果 (json + log)
+├── docker-compose.yml
+├── .env.example
+└── pyproject.toml             # 网关 deps (CPU only, ~57 包)
+```
+
+## 相关链接
+
+- [CosyVoice (FunAudioLLM)](https://github.com/FunAudioLLM/CosyVoice)
+- [FunASR](https://github.com/alibaba-damo-academy/FunASR)
+- [Dolphin (DataoceanAI)](https://github.com/DataoceanAI/Dolphin)
+- [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR)
+- [vLLM](https://github.com/vllm-project/vllm)
+
+## 许可证
+
+MIT — 见 [LICENSE](LICENSE)。

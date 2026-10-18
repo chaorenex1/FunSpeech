@@ -7,6 +7,8 @@
 import os
 import tempfile
 import requests
+import librosa
+import soundfile as sf
 import numpy as np
 import subprocess
 import logging
@@ -142,8 +144,6 @@ def load_audio_file(audio_path: str, target_sr: int = 16000) -> Tuple[np.ndarray
         AudioProcessingException: 加载失败
     """
     try:
-        import librosa
-
         # 使用librosa加载音频
         audio_data, sr = librosa.load(audio_path, sr=target_sr)
         return audio_data, sr
@@ -164,8 +164,6 @@ def get_audio_duration(audio_path: str) -> float:
         AudioProcessingException: 获取时长失败
     """
     try:
-        import librosa
-
         # Load audio and get duration
         y, sr = librosa.load(audio_path, sr=None)
         duration = librosa.get_duration(y=y, sr=sr)
@@ -232,8 +230,6 @@ def resample_audio_array(
         return audio_array
 
     try:
-        import librosa
-
         # 确保是1D数组用于librosa重采样。CosyVoice通常返回(1, samples)，
         # 这里要取长轴作为时间轴，否则会把单声道误判成长度为1的音频。
         if audio_array.ndim > 1:
@@ -243,6 +239,10 @@ def resample_audio_array(
                 audio_1d = audio_array[:, 0]
         else:
             audio_1d = audio_array
+
+        # librosa.resample 有最小长度要求, 流式 chunk 末尾可能只有 1 个采样点
+        if len(audio_1d) < 16:
+            return audio_1d
 
         # 使用librosa进行重采样
         resampled = librosa.resample(audio_1d, orig_sr=original_sr, target_sr=target_sr)
@@ -302,8 +302,6 @@ def adjust_audio_pitch(
         return audio_array
 
     try:
-        import librosa
-
         n_steps = pitch_rate / 100.0
         original_ndim = audio_array.ndim
 
@@ -388,17 +386,14 @@ def save_audio_array(
                 audio_array = audio_array[np.newaxis, :]
 
         # 根据格式选择保存方法
+        # 统一用 soundfile 保存(单声道 mean,(N,) 形状); 网关不再依赖 torch/torchaudio
         if format.lower() == "wav":
-            import torch
-            import torchaudio
-
-            # 使用torchaudio保存WAV格式
-            audio_tensor = torch.from_numpy(audio_array)
-            torchaudio.save(output_path, audio_tensor, sample_rate)
+            if audio_array.shape[0] > 1:
+                mono = np.mean(audio_array, axis=0)
+            else:
+                mono = audio_array[0]
+            sf.write(output_path, mono, sample_rate, format=format.upper())
         else:
-            import soundfile as sf
-
-            # 使用soundfile保存其他格式
             # 确保音频数据是单声道
             if audio_array.shape[0] > 1:
                 audio_array = np.mean(audio_array, axis=0)
@@ -431,9 +426,6 @@ def convert_audio_to_wav(
         output_path = input_path.rsplit(".", 1)[0] + ".wav"
 
     try:
-        import librosa
-        import soundfile as sf
-
         # 使用librosa加载并重采样
         audio_data, sr = librosa.load(input_path, sr=target_sr)
         sf.write(output_path, audio_data, target_sr, format="WAV")
@@ -483,9 +475,7 @@ def normalize_audio_for_asr(audio_path: str, target_sr: int = 16000) -> str:
 
         # 如果已经是WAV格式且采样率正确，直接返回
         if file_ext == ".wav":
-            import librosa
-
-            # 检查采样率
+                # 检查采样率
             audio_data, sr = librosa.load(audio_path, sr=None)
             if sr == target_sr:
                 return audio_path

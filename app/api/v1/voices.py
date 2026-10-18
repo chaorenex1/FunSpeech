@@ -2,6 +2,7 @@
 """Voice Cloner音色设计与voice_manager同步接口。"""
 
 import os
+import tempfile
 from typing import Optional
 
 from fastapi import APIRouter, Body, Request
@@ -16,9 +17,14 @@ from ...core.exceptions import (
     InvalidParameterException,
 )
 from ...core.security import validate_token
+from ...core.executor import run_sync
 from ...models.common import AudioFormat, SampleRate
 from ...utils.common import generate_task_id
-from ...utils.audio import validate_audio_format, validate_sample_rate
+from ...utils.audio import (
+    download_audio_from_url,
+    validate_audio_format,
+    validate_sample_rate,
+)
 from ...services.tts.engine import get_tts_engine
 from ...services.tts.voice_design import generate_reference_audio
 
@@ -68,8 +74,12 @@ def _get_voice_manager():
     return tts_engine, voice_manager
 
 
-def _voice_exists(tts_engine, voice_name: str) -> bool:
-    voices = tts_engine.get_voices() if hasattr(tts_engine, "get_voices") else []
+async def _voice_exists(tts_engine, voice_name: str) -> bool:
+    voices = (
+        await run_sync(tts_engine.get_voices)
+        if hasattr(tts_engine, "get_voices")
+        else []
+    )
     return voice_name in voices
 
 
@@ -85,6 +95,49 @@ def _format_voice(voice_name: str, info: dict) -> dict:
     }
 
 
+async def _register_remote_voice(
+    *,
+    voice_name: str,
+    reference_text: str,
+    audio_bytes: Optional[bytes],
+    audio_filename: Optional[str],
+    reference_audio_url: Optional[str],
+    voice_manager,
+    task_id: str,
+) -> dict:
+    """把网关收到的音色资产转成临时文件, 交给子服务的 /voices 接口注册。"""
+    if not audio_bytes and reference_audio_url:
+        audio_bytes = await run_sync(
+            download_audio_from_url,
+            reference_audio_url,
+            max_size=settings.MAX_AUDIO_SIZE,
+        )
+    if not audio_bytes:
+        raise InvalidParameterException(
+            "缺少参考音频: 请上传 reference_audio 或提供 reference_audio_url", task_id
+        )
+
+    suffix = os.path.splitext(audio_filename or "")[1] or ".wav"
+    wav_fd, wav_path = tempfile.mkstemp(suffix=suffix)
+    txt_path = wav_path + ".txt"
+    try:
+        with os.fdopen(wav_fd, "wb") as fp:
+            fp.write(audio_bytes)
+        with open(txt_path, "w", encoding="utf-8") as fp:
+            fp.write(reference_text or "")
+
+        registered = await run_sync(voice_manager.add_voice, voice_name, txt_path, wav_path)
+        if not registered:
+            raise DefaultServerErrorException(f"注册音色失败: {voice_name}", task_id)
+        return await run_sync(voice_manager.get_voice_info, voice_name) or {}
+    finally:
+        for path in (wav_path, txt_path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
 @router.get("/list", summary="Voice Cloner首次启动全量同步")
 async def list_voices(request: Request):
     auth_error = _validate_auth(request, "voices_list")
@@ -93,7 +146,7 @@ async def list_voices(request: Request):
 
     try:
         tts_engine = get_tts_engine()
-        voices_info = tts_engine.get_voices_info()
+        voices_info = await run_sync(tts_engine.get_voices_info)
         voices = [_format_voice(name, info) for name, info in voices_info.items()]
         return {"voices": voices, "total": len(voices)}
     except APIException as exc:
@@ -145,20 +198,22 @@ async def _register_or_update(
             raise InvalidParameterException(f"voice_name与预置音色冲突: {voice_name}", task_id)
 
         tts_engine, voice_manager = _get_voice_manager()
-        exists = _voice_exists(tts_engine, voice_name)
+        exists = await _voice_exists(tts_engine, voice_name)
         if exists and not overwrite:
             raise InvalidParameterException(f"voice_name已存在: {voice_name}", task_id)
         if overwrite and not exists:
             raise InvalidParameterException(f"voice_name不存在，无法更新: {voice_name}", task_id)
+        if overwrite:
+            await run_sync(voice_manager.remove_voice, voice_name)
 
-        info = voice_manager.register_voice_asset(
+        info = await _register_remote_voice(
             voice_name=voice_name,
             reference_text=reference_text,
             audio_bytes=audio_bytes,
             audio_filename=audio_filename,
             reference_audio_url=reference_audio_url,
-            voice_instruction=voice_instruction,
-            overwrite=overwrite,
+            voice_manager=voice_manager,
+            task_id=task_id,
         )
         if hasattr(tts_engine, "refresh_voices"):
             tts_engine.refresh_voices()
@@ -222,11 +277,11 @@ async def delete_voice(request: Request, body: VoiceDeleteRequest = Body(...)):
             raise InvalidParameterException(f"不能删除预置音色: {body.voice_name}", task_id)
 
         tts_engine, voice_manager = _get_voice_manager()
-        removed = voice_manager.remove_voice(body.voice_name)
+        removed = await run_sync(voice_manager.remove_voice, body.voice_name)
         if not removed:
             raise InvalidParameterException(f"voice_name不存在: {body.voice_name}", task_id)
         if hasattr(tts_engine, "refresh_voices"):
-            tts_engine.refresh_voices()
+            await run_sync(tts_engine.refresh_voices)
 
         return JSONResponse(
             headers={"task_id": task_id},
@@ -251,10 +306,14 @@ async def refresh_voices(request: Request):
 
     try:
         tts_engine, voice_manager = _get_voice_manager()
-        success, total = voice_manager.refresh_voices()
+        success, total = await run_sync(voice_manager.refresh_voices)
         if hasattr(tts_engine, "refresh_voices"):
-            tts_engine.refresh_voices()
-        voices = tts_engine.get_voices() if hasattr(tts_engine, "get_voices") else []
+            await run_sync(tts_engine.refresh_voices)
+        voices = (
+            await run_sync(tts_engine.get_voices)
+            if hasattr(tts_engine, "get_voices")
+            else []
+        )
 
         return JSONResponse(
             headers={"task_id": task_id},

@@ -2,6 +2,9 @@
 ref/
 *.db
 benchmark_results/
+qwen3_voices/
+qwen3_omni_voices/
+cosyvoice3_omni_voices/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -115,6 +118,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# 本机特定的 docker-compose 覆盖 (GPU 选卡等), 生产 / 不同机器值不一样
+docker-compose.override.yml
+
 # Spyder project settings
 .spyderproject
 .spyproject
@@ -137,9 +143,11 @@ dmypy.json
 temp/
 logs/
 *.log
+!benchmarks/results/**/*.log
 test_audio.*
 *.wav
 !tests/assets/*.wav
+!benchmarks/audio/*.wav
 *.mp3
 *.pcm
 *.aac

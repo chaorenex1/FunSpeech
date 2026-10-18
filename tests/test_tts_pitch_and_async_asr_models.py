@@ -47,12 +47,16 @@ def test_resample_audio_array_uses_long_axis_for_single_channel_model_output(
         captured["target_sr"] = target_sr
         return audio
 
-    monkeypatch.setitem(sys.modules, "librosa", SimpleNamespace(resample=fake_resample))
-    audio = np.arange(8, dtype=np.float32).reshape(1, 8)
+    import app.utils.audio as audio_utils
+
+    monkeypatch.setattr(
+        audio_utils, "librosa", SimpleNamespace(resample=fake_resample)
+    )
+    audio = np.arange(32, dtype=np.float32).reshape(1, 32)
 
     result = resample_audio_array(audio, 24000, 16000)
 
-    assert result.shape == (8,)
+    assert result.shape == (32,)
     assert np.array_equal(captured["audio"], audio[0, :])
     assert captured["orig_sr"] == 24000
     assert captured["target_sr"] == 16000

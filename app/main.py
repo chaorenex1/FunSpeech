@@ -57,6 +57,14 @@ async def lifespan(app: FastAPI):
 
     logger.info(f"Worker [{worker_id}] 已就绪")
 
+    # 启动 ASR session GC 后台线程
+    try:
+        from .services.asr.http_engine import _RealtimeASRSession
+
+        _RealtimeASRSession.start_gc()
+    except Exception as exc:
+        logger.warning(f"Worker [{worker_id}] ASR session GC 启动失败: {exc}")
+
     yield
 
     # 关闭时
@@ -112,15 +120,17 @@ def create_app() -> FastAPI:
                 "async_asr_query": "/rest/v1/asr/async",
                 "asr_models": "/stream/v1/asr/models",
                 "asr_health": "/stream/v1/asr/health",
+                "ws_asr": "/ws/v1/asr",
+                "ws_asr_test": "/ws/v1/asr/test",
                 "tts": "/stream/v1/tts",
-                "tts_clone": "/stream/v1/tts/clone",
-                "tts_clone_eq": "/stream/v1/tts/clone_eq",
-                "tts_openai": "/openai/v1/audio/speech",
+                "tts_openai": "/v1/audio/speech",
+                "asr_openai": "/v1/audio/transcriptions",
                 "tts_voices": "/stream/v1/tts/voices",
+                "tts_voices_info": "/stream/v1/tts/voices/info",
+                "tts_voices_refresh": "/stream/v1/tts/voices/refresh",
                 "tts_emotions": "/stream/v1/tts/emotions",
                 "tts_health": "/stream/v1/tts/health",
-                "async_tts_submit": "/rest/v1/tts/async",
-                "async_tts_query": "/rest/v1/tts/async",
+                "async_tts": "/rest/v1/tts/async",
                 "ws_tts": "/ws/v1/tts",
                 "ws_tts_test": "/ws/v1/tts/test",
                 "ws_realtime_voice": "/ws/v1/realtime/voice",

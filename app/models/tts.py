@@ -4,7 +4,7 @@ TTS数据模型
 定义语音合成相关的请求和响应模型
 """
 
-from typing import Optional, List, Any, Union, Dict
+from typing import Optional, List, Union, Dict
 from pydantic import BaseModel, Field, field_validator
 from enum import Enum
 
@@ -128,6 +128,11 @@ class TTSRequest(BaseModel):
         max_length=32,
     )
 
+    @field_validator("emotion")
+    @classmethod
+    def validate_emotion(cls, v: Optional[str]) -> Optional[str]:
+        return normalize_emotion(v)
+
     @field_validator("text")
     @classmethod
     def validate_text(cls, v: str) -> str:
@@ -146,17 +151,12 @@ class TTSRequest(BaseModel):
             raise ValueError("音色参数不能为空")
         return v.strip()
 
-    @field_validator("emotion")
-    @classmethod
-    def validate_emotion(cls, v: Optional[str]) -> Optional[str]:
-        return normalize_emotion(v)
-
 
 class OpenAITTSRequest(BaseModel):
     """OpenAI兼容TTS请求模型"""
 
-    model: TTSModelType = Field(
-        TTSModelType.TTS_1,
+    model: str = Field(
+        "tts-1",
         description="使用的模型",
         example="tts-1",
     )
@@ -166,29 +166,27 @@ class OpenAITTSRequest(BaseModel):
         description="待合成的文本",
         example="Hello, this is a test of the speech synthesis system.",
         min_length=1,
-        max_length=1000,
+        max_length=4096,
     )
 
-    voice: str = Field(
+    voice: Union[str, Dict[str, str]] = Field(
         ...,
-        description="音色名称或参考音频文件路径",
+        description="音色名称，或 OpenAI custom voice object: {\"id\":\"voice_1234\"}",
         example="中文女",
-        min_length=1,
-        max_length=256,
     )
 
-    response_format: AudioFormat = Field(
-        AudioFormat.WAV,
+    response_format: str = Field(
+        "mp3",
         description="响应音频格式",
-        example="wav",
+        example="mp3",
     )
 
     speed: float = Field(
         1.0,
         description="语速倍率",
         example=1.0,
-        ge=0.5,
-        le=2.0,
+        ge=0.25,
+        le=4.0,
     )
 
     instructions: Optional[str] = Field(
@@ -198,25 +196,11 @@ class OpenAITTSRequest(BaseModel):
         max_length=500,
     )
 
-    emotion: Optional[str] = Field(
+    stream_format: Optional[str] = Field(
         None,
-        description="结构化情感控制标签，如 happy/sad/angry/neutral",
-        example="happy",
-        max_length=32,
+        description="流式响应格式，支持 audio 或 sse",
+        example="audio",
     )
-
-    emotion_intensity: Optional[float] = Field(
-        None,
-        description="情感强度，范围0.0~1.0",
-        example=0.8,
-        ge=0.0,
-        le=1.0,
-    )
-
-    @field_validator("emotion")
-    @classmethod
-    def validate_emotion(cls, v: Optional[str]) -> Optional[str]:
-        return normalize_emotion(v)
 
 
 # ============= 响应模型 =============

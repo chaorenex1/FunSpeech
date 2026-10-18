@@ -31,6 +31,7 @@ WebSocket ASR 服务 - 阿里云实时语音识别协议实现
 import json
 import logging
 import numpy as np
+import soundfile as sf
 import io
 from typing import Optional, Dict
 from enum import IntEnum
@@ -48,18 +49,7 @@ from ..models.websocket_asr import (
     AliyunASRMessageName,
     AliyunASRStatus,
 )
-
 logger = logging.getLogger(__name__)
-
-
-def _is_multi_gpu_asr_engine(asr_engine) -> bool:
-    """延迟识别多GPU引擎，避免API导入时强制加载模型依赖。"""
-    try:
-        from .asr.engine import MultiGPUASREngine
-
-        return isinstance(asr_engine, MultiGPUASREngine)
-    except ImportError:
-        return False
 
 
 class ConnectionState(IntEnum):
@@ -91,17 +81,19 @@ class AliyunWebSocketASRService:
         return self.asr_engine
 
     def _initialize_engine(self):
-        """初始化ASR引擎"""
+        """初始化ASR引擎(默认模型 + 强制 supports_realtime)"""
         try:
             from .asr.manager import get_model_manager
 
             model_manager = get_model_manager()
-            self.asr_engine = model_manager.get_asr_engine()
-
-            if not self.asr_engine.supports_realtime:
-                raise Exception("当前ASR引擎不支持实时识别")
-
-            logger.info("WebSocket ASR引擎加载完成")
+            # 用 get_realtime_asr_engine 而非 get_asr_engine + 后置检查:
+            # 后者拿到不支持流式的引擎(如 dolphin)后才报错,错误归因更含糊;
+            # 前者基于 models.json 的 supports_realtime 字段提前拒绝。
+            self.asr_engine = model_manager.get_realtime_asr_engine()
+            logger.info(
+                "WebSocket ASR引擎加载完成: %s",
+                type(self.asr_engine).__name__,
+            )
         except Exception as e:
             logger.error(f"WebSocket ASR引擎加载失败: {e}")
             raise e
@@ -122,12 +114,7 @@ class AliyunWebSocketASRService:
         sentence_texts_raw = []
         empty_result_count = 0
         audio_buffer = np.array([], dtype=np.float32)  # 音频缓冲区，用于累积到完整chunk
-        streaming_session = None
-        streaming_active_index = None
-
-        # 多GPU会话级负载均衡
-        session_engine = None
-        session_engine_index = None
+        _is_qwen3 = None  # 懒初始化，首次使用时判断引擎类型
 
         logger.info(f"[{task_id}] WebSocket ASR连接开始")
 
@@ -175,22 +162,9 @@ class AliyunWebSocketASRService:
                                 if transcription_params:
                                     task_id = message_task_id or task_id
 
-                                    # 多GPU会话级负载均衡：在会话开始时选择引擎
-                                    asr_engine = self._ensure_asr_engine()
-                                    if _is_multi_gpu_asr_engine(asr_engine):
-                                        session_engine_index, session_engine = asr_engine.get_engine_for_session()
-                                        logger.info(f"[{task_id}] 分配会话引擎 {session_engine_index} ({asr_engine._devices[session_engine_index]})")
-                                    else:
-                                        session_engine = asr_engine
-
-                                    if (
-                                        hasattr(session_engine, "create_streaming_session")
-                                        and getattr(session_engine, "streaming_strategy", "")
-                                        == "windowed_offline"
-                                    ):
-                                        streaming_session = session_engine.create_streaming_session(
-                                            transcription_params
-                                        )
+                                    # HTTP 客户端引擎在每次调用内部用副本池调度,
+                                    # 网关层这里只持引擎引用即可,无需 session 级绑定。
+                                    self._ensure_asr_engine()
 
                                     await self._send_transcription_started(
                                         websocket, task_id, session_id
@@ -223,41 +197,6 @@ class AliyunWebSocketASRService:
                                     )
                                     continue
 
-                                if streaming_session is not None:
-                                    if len(audio_buffer) > 0:
-                                        events = await streaming_session.accept_audio(
-                                            audio_buffer,
-                                            is_final=False,
-                                        )
-                                        audio_buffer = np.array([], dtype=np.float32)
-                                        sentence_index, streaming_active_index = (
-                                            await self._handle_streaming_events(
-                                                websocket,
-                                                task_id,
-                                                events,
-                                                sentence_index,
-                                                streaming_active_index,
-                                                transcription_params,
-                                            )
-                                        )
-                                    events = await streaming_session.flush()
-                                    sentence_index, streaming_active_index = (
-                                        await self._handle_streaming_events(
-                                            websocket,
-                                            task_id,
-                                            events,
-                                            sentence_index,
-                                            streaming_active_index,
-                                            transcription_params,
-                                        )
-                                    )
-                                    await self._send_transcription_completed(
-                                        websocket, task_id
-                                    )
-                                    state = ConnectionState.COMPLETED
-                                    logger.info(f"[{task_id}] 识别完成")
-                                    break
-
                                 # 如果有未完成的句子，直接结束
                                 if sentence_active and sentence_texts_raw:
                                     sentence_index += 1
@@ -267,7 +206,7 @@ class AliyunWebSocketASRService:
                                         "enable_punctuation_prediction", True
                                     ):
                                         full_sentence_text = await self._apply_final_punctuation_to_sentence(
-                                            full_sentence_text, task_id, session_engine=session_engine
+                                            full_sentence_text, task_id
                                         )
 
                                     await self._send_sentence_end(
@@ -366,25 +305,6 @@ class AliyunWebSocketASRService:
                                 audio_chunk = audio_buffer[:selected_chunk_size]
                                 audio_buffer = audio_buffer[selected_chunk_size:]
 
-                                if streaming_session is not None:
-                                    events = await streaming_session.accept_audio(
-                                        audio_chunk,
-                                        is_final=False,
-                                    )
-                                    sentence_index, streaming_active_index = (
-                                        await self._handle_streaming_events(
-                                            websocket,
-                                            task_id,
-                                            events,
-                                            sentence_index,
-                                            streaming_active_index,
-                                            transcription_params,
-                                        )
-                                    )
-                                    if hasattr(streaming_session, "audio_time_ms"):
-                                        audio_time = streaming_session.audio_time_ms
-                                    continue
-
                                 # ========== 远场声音过滤 ==========
                                 # 动态阈值：句子活跃时降低阈值，避免句子中间音量波动导致丢帧
                                 effective_rms_threshold = settings.ASR_NEARFIELD_RMS_THRESHOLD
@@ -450,7 +370,6 @@ class AliyunWebSocketASRService:
                                         audio_time,
                                         task_id,
                                         is_final=False,
-                                        session_engine=session_engine,
                                     )
                                 # ========== 远场过滤结束 ==========
 
@@ -503,11 +422,19 @@ class AliyunWebSocketASRService:
                                         audio_time,
                                         task_id,
                                         is_final=True,
-                                        session_engine=session_engine,
                                     )
 
                                     if flush_result_text_raw:
-                                        if (
+                                        if _is_qwen3 is None:
+                                            from .asr.http_engine import Qwen3AsrVllmHttpEngine
+
+                                            _is_qwen3 = isinstance(
+                                                self.asr_engine, Qwen3AsrVllmHttpEngine
+                                            )
+
+                                        if _is_qwen3:
+                                            sentence_texts_raw = [flush_result_text_raw]
+                                        elif (
                                             not sentence_texts_raw
                                             or flush_result_text_raw
                                             != sentence_texts_raw[-1]
@@ -523,7 +450,7 @@ class AliyunWebSocketASRService:
                                     ):
                                         full_sentence_text = (
                                             await self._apply_final_punctuation_to_sentence(
-                                                full_sentence_text, task_id, session_engine=session_engine
+                                                full_sentence_text, task_id
                                             )
                                         )
 
@@ -548,21 +475,36 @@ class AliyunWebSocketASRService:
                                     sentence_texts = []
                                     sentence_texts_raw = []
                                     empty_result_count = 0
+                                    self._close_http_session_in_cache(audio_cache)
                                     audio_cache = {}
                                     punc_cache = {}
                                 elif result_text:
                                     if result_text != last_sentence_text:
                                         last_sentence_text = result_text
-                                        if (
-                                            not sentence_texts
-                                            or result_text != sentence_texts[-1]
-                                        ):
-                                            sentence_texts.append(result_text)
-                                        if (
-                                            not sentence_texts_raw
-                                            or result_text_raw != sentence_texts_raw[-1]
-                                        ):
-                                            sentence_texts_raw.append(result_text_raw)
+
+                                        if _is_qwen3 is None:
+                                            from .asr.http_engine import Qwen3AsrVllmHttpEngine
+
+                                            _is_qwen3 = isinstance(
+                                                self.asr_engine, Qwen3AsrVllmHttpEngine
+                                            )
+
+                                        if _is_qwen3:
+                                            # Qwen3-ASR 每次返回全量修正文本，直接替换
+                                            sentence_texts = [result_text]
+                                            sentence_texts_raw = [result_text_raw]
+                                        else:
+                                            # FunASR 返回增量文本，追加拼接
+                                            if (
+                                                not sentence_texts
+                                                or result_text != sentence_texts[-1]
+                                            ):
+                                                sentence_texts.append(result_text)
+                                            if (
+                                                not sentence_texts_raw
+                                                or result_text_raw != sentence_texts_raw[-1]
+                                            ):
+                                                sentence_texts_raw.append(result_text_raw)
 
                                         if not sentence_active:
                                             sentence_active = True
@@ -602,6 +544,10 @@ class AliyunWebSocketASRService:
                             await self._send_task_failed(
                                 websocket, task_id, f"Audio processing failed: {str(e)}"
                             )
+                            self._close_http_session_in_cache(audio_cache)
+                            audio_cache = {}
+                            punc_cache = {}
+                            break
                     else:
                         await self._send_task_failed(
                             websocket, task_id, "Connection not started"
@@ -625,12 +571,8 @@ class AliyunWebSocketASRService:
                 except:
                     pass
         finally:
-            # 释放会话级引擎（多GPU负载均衡）
-            if session_engine_index is not None:
-                asr_engine = self._ensure_asr_engine()
-                if _is_multi_gpu_asr_engine(asr_engine):
-                    asr_engine.release_session_engine(session_engine_index)
-                    logger.debug(f"[{task_id}] 释放会话引擎 {session_engine_index}")
+            # 关闭 HTTP 子服务的内部 WS session(若有)
+            self._close_http_session_in_cache(audio_cache)
 
     def _parse_start_transcription(self, data: dict, task_id: str) -> Optional[dict]:
         """解析StartTranscription消息参数"""
@@ -649,11 +591,8 @@ class AliyunWebSocketASRService:
                 "enable_inverse_text_normalization": payload.get(
                     "enable_inverse_text_normalization", True
                 ),
-                "enable_voice_detection": payload.get("enable_voice_detection", True),
                 "max_sentence_silence": payload.get("max_sentence_silence", 800),
                 "enable_words": payload.get("enable_words", False),
-                "enable_emotion": payload.get("enable_emotion", False),
-                "return_rich_text": payload.get("return_rich_text", False),
             }
 
             logger.info(f"[{task_id}] StartTranscription参数解析成功: {params}")
@@ -662,62 +601,6 @@ class AliyunWebSocketASRService:
         except Exception as e:
             logger.error(f"[{task_id}] 解析StartTranscription失败: {e}")
             return None
-
-    async def _handle_streaming_events(
-        self,
-        websocket,
-        task_id: str,
-        events,
-        sentence_index: int,
-        active_index: Optional[int],
-        transcription_params: dict,
-    ) -> tuple[int, Optional[int]]:
-        """Map model-agnostic streaming events onto the Aliyun-compatible protocol."""
-        for event in events:
-            if event.kind == "begin":
-                active_index = sentence_index + 1
-                await self._send_sentence_begin(
-                    websocket,
-                    task_id,
-                    active_index,
-                    event.time_ms,
-                )
-            elif event.kind == "partial":
-                if not transcription_params.get("enable_intermediate_result", True):
-                    continue
-                current_index = active_index or sentence_index + 1
-                await self._send_transcription_result_changed(
-                    websocket,
-                    task_id,
-                    current_index,
-                    event.time_ms,
-                    event.text,
-                    emotion=getattr(event, "emotion", None),
-                    emotion_confidence=getattr(event, "emotion_confidence", None),
-                    raw_rich_text=getattr(event, "raw_rich_text", None),
-                )
-            elif event.kind == "end":
-                current_index = active_index or sentence_index + 1
-                result_text = event.text
-                enable_itn = transcription_params.get(
-                    "enable_inverse_text_normalization", True
-                )
-                await self._send_sentence_end(
-                    websocket,
-                    task_id,
-                    current_index,
-                    event.time_ms,
-                    result_text,
-                    begin_time=event.begin_time_ms,
-                    enable_itn=enable_itn and not getattr(event, "itn_applied", False),
-                    emotion=getattr(event, "emotion", None),
-                    emotion_confidence=getattr(event, "emotion_confidence", None),
-                    raw_rich_text=getattr(event, "raw_rich_text", None),
-                )
-                sentence_index = max(sentence_index, current_index)
-                active_index = None
-
-        return sentence_index, active_index
 
     def _is_silence_frame(
         self, audio_array: np.ndarray, threshold: float = 0.001
@@ -749,15 +632,11 @@ class AliyunWebSocketASRService:
         current_audio_time: int,
         task_id: str,
         is_final: bool = False,
-        session_engine=None,  # 会话级引擎（多GPU负载均衡）
+        session_engine=None,  # 兼容 realtime pipeline 的会话级引擎调用; 纯 HTTP 引擎忽略
     ) -> tuple[str, str, bool, bool, Dict, int]:
         """处理音频块，返回带标点文本、无标点文本、是否句子结束、是否静音帧、缓存、音频时长"""
         try:
-            # 使用会话级引擎（如果提供），否则使用全局引擎
-            if session_engine is not None:
-                asr_engine = session_engine
-            else:
-                asr_engine = self._ensure_asr_engine()
+            asr_engine = self._ensure_asr_engine()
 
             audio_format = params.get("format", "pcm").lower()
             sample_rate_value = params.get("sample_rate", 16000)
@@ -780,8 +659,6 @@ class AliyunWebSocketASRService:
                     / 32768.0
                 )
             elif audio_format == "wav":
-                import soundfile as sf
-
                 audio_io = io.BytesIO(audio_bytes)
                 audio_array, sr = sf.read(audio_io)
                 if sr != sample_rate:
@@ -834,6 +711,8 @@ class AliyunWebSocketASRService:
             )
 
             # 使用线程池执行模型推理，避免阻塞事件循环
+            # 透传 sample_rate / format, 避免 _HttpRealtimeModel 硬编码 16000/pcm
+            # 否则客户端送 8kHz 时, 子服务会按 16kHz 解析得到错乱采样
             result = await run_sync(
                 asr_engine.realtime_model.generate,
                 input=audio_array,
@@ -842,6 +721,8 @@ class AliyunWebSocketASRService:
                 chunk_size=chunk_size,
                 encoder_chunk_look_back=encoder_chunk_look_back,
                 decoder_chunk_look_back=decoder_chunk_look_back,
+                sample_rate=sample_rate,
+                format=audio_format,
             )
 
             logger.debug(f"[{task_id}] ASR模型返回结果: {result}")
@@ -854,38 +735,13 @@ class AliyunWebSocketASRService:
                 result_text_raw = result[0].get("text", "").strip()
                 result_text_with_punc = result_text_raw
 
-                # 如果启用实时标点且用户要求标点，则应用实时标点恢复（仅用于中间结果展示）
+                # 实时标点: HTTP 引擎返回 _text_punc(子服务侧已应用 settings.ASR_ENABLE_REALTIME_PUNC)
+                punc_from_http = (result[0].get("_text_punc") or "").strip()
                 if (
-                    result_text_raw
-                    and settings.ASR_ENABLE_REALTIME_PUNC
+                    punc_from_http
                     and params.get("enable_punctuation_prediction", True)
                 ):
-                    try:
-                        from .asr.engine import get_global_punc_realtime_model
-
-                        # 使用全局实时PUNC模型
-                        punc_realtime_model = get_global_punc_realtime_model(
-                            asr_engine.device
-                        )
-                        if punc_realtime_model:
-                            # 使用线程池执行标点模型推理
-                            punc_result = await run_sync(
-                                punc_realtime_model.generate,
-                                input=result_text_raw,
-                                cache=punc_cache,
-                            )
-                            if punc_result and len(punc_result) > 0:
-                                result_text_with_punc = (
-                                    punc_result[0].get("text", result_text_raw).strip()
-                                )
-                    except Exception as e:
-                        logger.warning(f"[{task_id}] 实时标点恢复失败: {e}")
-
-                # 注释掉句末标点符号触发句子结束的逻辑，避免与静音帧检测冲突
-                # if result_text_with_punc and self._is_sentence_boundary(
-                #     result_text_with_punc
-                # ):
-                #     is_sentence_end = True
+                    result_text_with_punc = punc_from_http
 
             if result_text_with_punc:
                 logger.debug(f"[{task_id}] 识别: '{result_text_with_punc}'")
@@ -904,41 +760,32 @@ class AliyunWebSocketASRService:
             raise e
 
     async def _apply_final_punctuation_to_sentence(
-        self, text: str, task_id: str, session_engine=None
+        self, text: str, task_id: str
     ) -> str:
-        """对完整句子应用最终标点恢复（使用离线标点模型添加完整标点包括句末标点）"""
+        """对完整句子应用离线标点恢复
+
+        全部走子服务: FunASRHttpEngine.punc_offline 调子服务 /asr/punc;
+        Qwen3AsrVllmHttpEngine 模型自带标点直接返回;其余引擎退化为原文。
+        """
         if not text:
             return text
 
         try:
-            from .asr.engine import get_global_punc_model
+            from .asr.http_engine import FunASRHttpEngine, Qwen3AsrVllmHttpEngine
 
-            # 使用会话级引擎（如果提供），否则使用全局引擎
-            if session_engine is not None:
-                asr_engine = session_engine
-            else:
-                asr_engine = self._ensure_asr_engine()
+            asr_engine = self._ensure_asr_engine()
 
-            # 使用全局PUNC模型
-            punc_model = get_global_punc_model(asr_engine.device)
-
-            if punc_model is None:
-                logger.info(f"[{task_id}] 标点模型未加载，返回原文本")
+            if isinstance(asr_engine, Qwen3AsrVllmHttpEngine):
                 return text
 
-            logger.debug(f"[{task_id}] 应用标点恢复: '{text}'")
-            # 使用线程池执行标点模型推理
-            result = await run_sync(punc_model.generate, input=text)
+            if isinstance(asr_engine, FunASRHttpEngine):
+                logger.debug(f"[{task_id}] 通过 HTTP 子服务应用标点: '{text}'")
+                return await run_sync(asr_engine.punc_offline, text) or text
 
-            if result and len(result) > 0:
-                punctuated_text = result[0].get("text", text).strip()
-                logger.debug(f"[{task_id}] 标点恢复结果: '{punctuated_text}'")
-                return punctuated_text
-            else:
-                return text
-
-        except Exception as e:
-            logger.warning(f"[{task_id}] 标点恢复失败: {e}")
+            logger.debug(f"[{task_id}] 当前引擎类型不支持离线 PUNC,返回原文")
+            return text
+        except Exception as exc:
+            logger.warning(f"[{task_id}] 标点恢复失败: {exc}")
             return text
 
     def _is_sentence_boundary(self, text: str) -> bool:
@@ -947,6 +794,23 @@ class AliyunWebSocketASRService:
             return False
         sentence_endings = ["。", "！", "？", ".", "!", "?", "…"]
         return any(text.endswith(ending) for ending in sentence_endings)
+
+    def _close_http_session_in_cache(self, cache: Dict) -> None:
+        """若 cache 中存在 HTTP 子服务 session,关闭它并移除。
+
+        FunASRHttpEngine 用 __funasr_http_session__,Qwen3AsrVllmHttpEngine
+        用 __qwen3_asr_http_session__。每次 SentenceEnd 后网关会重置
+        audio_cache,所以这里需要在重置前显式 close,避免内部 WS 泄漏。
+        """
+        if not cache:
+            return
+        for key in ("__funasr_http_session__", "__qwen3_asr_http_session__"):
+            session = cache.pop(key, None)
+            if session is not None:
+                try:
+                    session.close()
+                except Exception as exc:
+                    logger.debug(f"关闭 HTTP session 异常 ({key}): {exc}")
 
     def _convert_audio_bytes_to_array(
         self, audio_bytes: bytes, audio_format: str, sample_rate: int, task_id: str
@@ -968,8 +832,6 @@ class AliyunWebSocketASRService:
                 / 32768.0
             )
         elif audio_format == "wav":
-            import soundfile as sf
-
             audio_io = io.BytesIO(audio_bytes)
             audio_array, sr = sf.read(audio_io)
             if sr != sample_rate:
@@ -1051,6 +913,7 @@ class AliyunWebSocketASRService:
                 "index": index,
                 "time": time,
                 "result": result,
+                # 桌面端 / Voice Cloner 依赖的扩展字段(向后兼容 Aliyun 原生字段)
                 "task_id": task_id,
                 "text": result,
                 "is_final": False,
@@ -1100,6 +963,7 @@ class AliyunWebSocketASRService:
                 "time": time,
                 "result": result,
                 "begin_time": begin_time,
+                # 桌面端 / Voice Cloner 依赖的扩展字段(向后兼容 Aliyun 原生字段)
                 "task_id": task_id,
                 "text": result,
                 "is_final": True,

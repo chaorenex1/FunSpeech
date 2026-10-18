@@ -155,10 +155,10 @@ async def get_asr_params(request: Request) -> ASRQueryParams:
                 "schema": {
                     "type": "string",
                     "maxLength": 64,
-                    "default": "paraformer-large",
-                    "example": "paraformer-large",
+                    "default": "qwen3-asr-flash",
+                    "example": "qwen3-asr-flash",
                 },
-                "description": "自定义模型ID，指定使用的ASR模型",
+                "description": "自定义模型ID，指定使用的ASR模型；不传时使用 models.json 中标记 default=true 的模型",
             },
             {
                 "name": "enable_punctuation_prediction",
@@ -431,10 +431,10 @@ async def health_check(request: Request):
     try:
         model_manager = get_model_manager()
 
-        # 尝试获取默认模型的引擎
+        # 尝试获取默认模型的引擎; is_model_loaded 内部走同步 httpx, 放线程池
         try:
             asr_engine = model_manager.get_asr_engine()
-            model_loaded = asr_engine.is_model_loaded()
+            model_loaded = await run_sync(asr_engine.is_model_loaded)
             device = asr_engine.device
         except Exception:
             model_loaded = False
@@ -453,7 +453,6 @@ async def health_check(request: Request):
                 else "ASR model not loaded"
             ),
             "loaded_models": memory_info["model_list"],
-            "memory_usage": memory_info.get("gpu_memory"),
             "asr_model_mode": memory_info.get(
                 "asr_model_mode", settings.ASR_MODEL_MODE
             ),
